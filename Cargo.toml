@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/takekit-core", "crates/takekit-cli"]
+# mouseshow is a submodule with its own release profile; it is a path dependency
+# rather than a member.
+exclude = ["mouseshow"]
 
 [workspace.package]
 version = "0.1.0"

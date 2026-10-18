@@ -72,6 +72,26 @@ pub fn duration(probe: &Path, file: &Path) -> Option<f64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// Can Desktop Duplication be opened right now?
+///
+/// Cheaper to ask than to discover mid-recording: a failed session truncates the
+/// file to under a second.
+pub fn dda_available(ffmpeg: &Path, r: crate::source::ScreenRect) -> bool {
+    let out = Command::new(ffmpeg)
+        .args([
+            "-hide_banner", "-v", "error",
+            "-f", "lavfi", "-i",
+            &format!(
+                "ddagrab=output_idx=0:framerate=1:draw_mouse=0:offset_x={}:offset_y={}:video_size={}x{}",
+                r.x, r.y, r.w, r.h
+            ),
+            "-frames:v", "1", "-vf", "hwdownload,format=bgra", "-f", "null", "-",
+        ])
+        .stdin(Stdio::null())
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
 /// Devices that ffmpeg can capture from (DirectShow on Windows).
 ///
 /// Parsing this is less obvious than it looks: ffmpeg builds differ. Some print

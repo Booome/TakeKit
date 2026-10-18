@@ -1,0 +1,3 @@
+[submodule "mouseshow"]
+	path = mouseshow
+	url = git@github.com:Booome/MouseShow.git

@@ -32,6 +32,18 @@ pub enum Capture {
     Camera { device: String, crop: Crop },
 }
 
+/// How the desktop is captured.
+///
+/// Desktop Duplication (ddagrab) is faster and cannot tear, but it can fail to
+/// open: the session is invalidated by display changes, exclusive full-screen
+/// apps, or a driver hiccup, and Windows then refuses new sessions until the
+/// desktop is rebuilt. GDI (gdigrab) always works, so it is the fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Engine {
+    Dda,
+    Gdi,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenRect {
     pub x: i32,
@@ -57,20 +69,31 @@ impl Source {
         }
     }
 
+    /// The screen rectangle this source will capture, if it captures the screen
+    /// at all. Needed because Desktop Duplication can succeed at one size and
+    /// fail at another, so the probe has to use the real geometry.
+    pub fn screen_rect(&self) -> Option<ScreenRect> {
+        match &self.capture {
+            Capture::Desktop { rect } => Some(rect.unwrap_or_else(virtual_screen_rect)),
+            Capture::Window { title, crop } => find_window(title).ok().map(|w| crop.cropped(w.rect)),
+            Capture::Camera { .. } => None,
+        }
+    }
+
     /// The ffmpeg input arguments for this source, plus an optional scaling /
     /// cropping filter that runs before encoding.
-    pub fn input_args(&self) -> Result<(Vec<String>, Option<String>), String> {
+    pub fn input_args(&self, engine: Engine) -> Result<(Vec<String>, Option<String>), String> {
         match &self.capture {
             Capture::Desktop { rect } => {
                 let r = rect.unwrap_or_else(virtual_screen_rect);
-                let mut args = ddagrab_args(r, self.fps);
+                let mut args = screen_args(engine, r, self.fps);
                 args.extend(["-vf".into(), "hwdownload,format=bgra".into()]);
                 Ok((args, None))
             }
             Capture::Window { title, crop } => {
                 let win = find_window(title)?;
                 let r = crop.cropped(win.rect);
-                let mut args = ddagrab_args(r, self.fps);
+                let mut args = screen_args(engine, r, self.fps);
                 let mut filters = vec!["hwdownload,format=bgra".to_string()];
                 if !crop.is_zero() {
                     filters.push(format!(
@@ -111,16 +134,34 @@ impl Source {
     }
 }
 
-fn ddagrab_args(r: ScreenRect, fps: u32) -> Vec<String> {
-    vec![
-        "-f".into(),
-        "lavfi".into(),
-        "-i".into(),
-        format!(
-            "ddagrab=output_idx=0:framerate={fps}:draw_mouse=1:offset_x={}:offset_y={}:video_size={}x{}",
-            r.x, r.y, r.w, r.h
-        ),
-    ]
+fn screen_args(engine: Engine, r: ScreenRect, fps: u32) -> Vec<String> {
+    match engine {
+        Engine::Dda => vec![
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            format!(
+                "ddagrab=output_idx=0:framerate={fps}:draw_mouse=1:offset_x={}:offset_y={}:video_size={}x{}",
+                r.x, r.y, r.w, r.h
+            ),
+        ],
+        Engine::Gdi => vec![
+            "-f".into(),
+            "gdigrab".into(),
+            "-framerate".into(),
+            fps.to_string(),
+            "-draw_mouse".into(),
+            "1".into(),
+            "-offset_x".into(),
+            r.x.to_string(),
+            "-offset_y".into(),
+            r.y.to_string(),
+            "-video_size".into(),
+            format!("{}x{}", r.w, r.h),
+            "-i".into(),
+            "desktop".into(),
+        ],
+    }
 }
 
 impl Crop {

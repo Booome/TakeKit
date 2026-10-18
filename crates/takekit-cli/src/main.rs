@@ -10,8 +10,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use takekit_core::encoder::{self, Encoder};
 use takekit_core::ffmpeg;
-use takekit_core::source::{Capture, Crop, Source};
+use takekit_core::source::{Capture, Crop, Engine, Source};
 use takekit_core::take::Take;
+use takekit_core::marks;
 
 #[derive(Parser)]
 #[command(name = "takekit", version, about = "Record several sources at once into one take")]
@@ -67,6 +68,10 @@ struct RecordArgs {
     /// Quality: roughly CRF for x264, CQ for hardware encoders
     #[arg(long, default_value_t = 20)]
     quality: u8,
+
+    /// Draw click ripples and drag trails into the recording (MouseShow)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    marks: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -157,13 +162,33 @@ fn record(args: RecordArgs) -> Result<(), String> {
         ));
     }
 
+    let probe_rect = sources
+        .iter()
+        .find_map(|s| s.screen_rect())
+        .unwrap_or_else(takekit_core::source::virtual_screen_rect);
+    let engine = if ffmpeg::dda_available(&ff, probe_rect) {
+        Engine::Dda
+    } else {
+        println!("note: Desktop Duplication is unavailable, falling back to gdigrab");
+        Engine::Gdi
+    };
+
     let mut take = Take::create(&args.out, enc, args.fps, &sources).map_err(|e| e.to_string())?;
     println!("take   : {}", take.dir.display());
     println!("encoder: {}{}", enc.name(), if enc.is_hardware() { " (hardware)" } else { "" });
 
+    // Start the overlay *before* the capture. Creating a new topmost window while a
+    // Desktop Duplication session is live invalidates it (DXGI_ERROR_ACCESS_LOST),
+    // which truncates the recording to under a second.
+    let marks = if args.marks {
+        Some(marks::start().map_err(|e| format!("cannot start MouseShow: {e}"))?)
+    } else {
+        None
+    };
+
     let mut children = Vec::new();
     for src in &sources {
-        let (input, extra_filter) = src.input_args()?;
+        let (input, extra_filter) = src.input_args(engine)?;
         let out = take.path_for(&src.id);
 
         let mut cmd: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
@@ -187,6 +212,8 @@ fn record(args: RecordArgs) -> Result<(), String> {
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
     }
+
+    drop(marks);
 
     for (id, mut child, log) in children {
         ffmpeg::stop(&mut child);

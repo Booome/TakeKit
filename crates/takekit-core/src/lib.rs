@@ -6,5 +6,6 @@
 
 pub mod encoder;
 pub mod ffmpeg;
+pub mod marks;
 pub mod source;
 pub mod take;

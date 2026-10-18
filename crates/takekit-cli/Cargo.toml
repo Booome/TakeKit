@@ -1,0 +1,17 @@
+[package]
+name = "takekit"
+description = "Command-line front end for TakeKit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "takekit"
+path = "src/main.rs"
+
+[dependencies]
+takekit-core = { path = "../takekit-core" }
+clap = { version = "4", features = ["derive"] }

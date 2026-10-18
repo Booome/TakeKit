@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/takekit-core", "crates/takekit-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/Booome/TakeKit"
+authors = ["Booome"]
+
+[workspace.dependencies]
+mouseshow = { path = "mouseshow" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true

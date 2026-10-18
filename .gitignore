@@ -1,0 +1,5 @@
+/target
+takes/
+*.mkv
+*.mp4
+*.mov

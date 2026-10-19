@@ -14,4 +14,5 @@ path = "src/main.rs"
 
 [dependencies]
 takekit-core = { path = "../takekit-core" }
+takekit-media = { path = "../takekit-media" }
 clap = { version = "4", features = ["derive"] }

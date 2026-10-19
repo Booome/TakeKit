@@ -418,6 +418,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\tools\ui-probe.ps1 -Act
 | 磁盘性能分析（历史） | `docs/perf-review.md` |
 | 音频同步待办（历史） | `docs/sync-audio-backlog.md` |
 | **沙箱与 WebView2（必读，含启动配方）** | `docs/webview2-agent-sandbox.md` |
+| **API 录制试探（分支 `feat/api-recording`）** | `docs/api-recording.md`（WGC + Media Foundation，含"静止画面没有帧"这条硬约束） |
 | C1 的设计稿 | `docs/ui/history-mockup.html`（三方案对比）、`docs/ui/history-c.html`（定稿 100%） |
 | 面板自动化脚本 | `docs/tools/ui-probe.ps1`（**本地 scratch，默认不入库**） |
 | B3 端到端验证脚本 | `docs/tools/tk-verify-b3.ps1`（**本地 scratch，默认不入库**；自包含：清场+启动+F9/Esc/开关全流程） |

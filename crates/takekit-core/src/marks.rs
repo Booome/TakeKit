@@ -4,7 +4,7 @@
 
 pub use mouseshow::{Marks, MarksError};
 
-/// Start the overlay with the user's MouseShow config.
+/// Start the overlay with MouseShow's defaults.
 pub fn start() -> Result<Marks, MarksError> {
     Marks::start(mouseshow::Config::default())
 }

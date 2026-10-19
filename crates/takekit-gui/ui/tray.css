@@ -1,0 +1,238 @@
+/* TakeKit tray popover — the panel's neutral ramp in a 220px card.
+   Only the shared variables are copied from style.css: that file's layout is
+   built for the main window and would fight this one. */
+
+:root {
+  --tk-canvas: #f4f4f4;
+  --tk-surface: #ffffff;
+  --tk-sunken: #ececec;
+  --tk-border: #d6d6d6;
+  --tk-border-strong: #b0b0b0;
+  --tk-text: #16161a;
+  --tk-text-2: #5c5c5c;
+  --tk-text-3: #767676;
+  --tk-accent: #0b62c4;
+  --tk-accent-fg: #ffffff;
+  --tk-accent-soft: rgba(11, 98, 196, 0.12);
+  --tk-rec: #ce1f1f;
+  --tk-rec-fg: #ffffff;
+  --tk-ok: #0e700e;
+  --tk-warn: #8a5300;
+  --tk-radius-sm: 4px;
+  --tk-radius-md: 6px;
+  --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    system-ui, sans-serif;
+  --tk-font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --tk-dur: 160ms;
+  --tk-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* `auto` follows the system; an explicit choice is an attribute on <html>.
+   Same values in both blocks: CSS cannot share a declaration block between a
+   media query and an attribute selector (see style.css for the long version). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tk-canvas: #191919;
+    --tk-surface: #232323;
+    --tk-sunken: #2c2c2c;
+    --tk-border: #3a3a3a;
+    --tk-border-strong: #5a5a5a;
+    --tk-text: #f2f2f2;
+    --tk-text-2: #a6a6a6;
+    --tk-text-3: #8f8f8f;
+    --tk-accent: #4c9dff;
+    --tk-accent-fg: #0a0a0a;
+    --tk-accent-soft: rgba(76, 157, 255, 0.16);
+    --tk-rec: #ff5f52;
+    --tk-rec-fg: #1a0503;
+    --tk-ok: #6ccb5f;
+    --tk-warn: #e8b339;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tk-canvas: #191919;
+  --tk-surface: #232323;
+  --tk-sunken: #2c2c2c;
+  --tk-border: #3a3a3a;
+  --tk-border-strong: #5a5a5a;
+  --tk-text: #f2f2f2;
+  --tk-text-2: #a6a6a6;
+  --tk-text-3: #8f8f8f;
+  --tk-accent: #4c9dff;
+  --tk-accent-fg: #0a0a0a;
+  --tk-accent-soft: rgba(76, 157, 255, 0.16);
+  --tk-rec: #ff5f52;
+  --tk-rec-fg: #1a0503;
+  --tk-ok: #6ccb5f;
+  --tk-warn: #e8b339;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  /* Transparent: the card carries the radius and the native shadow. */
+  background: transparent;
+  color: var(--tk-text);
+  font-family: var(--tk-font-ui);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow: hidden;
+  user-select: none;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 10px 12px;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: 12px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tk-text-3);
+}
+
+body.live .dot {
+  background: var(--tk-rec);
+}
+
+.mono {
+  font-family: var(--tk-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.clock {
+  font-size: 15px;
+}
+
+.state {
+  margin-left: auto;
+  color: var(--tk-text-2);
+}
+
+.rows {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.row .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--tk-text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row .size {
+  flex: none;
+  color: var(--tk-text-3);
+  font-family: var(--tk-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.row .note {
+  flex: none;
+  color: var(--tk-warn);
+}
+
+/* Shape first, colour second: a source that stopped is a diamond, not just a
+   differently coloured circle (§4.1). */
+.point {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tk-ok);
+}
+
+.point.stopped {
+  border-radius: 1px;
+  background: var(--tk-warn);
+  transform: rotate(45deg);
+}
+
+.empty {
+  margin: 0;
+  color: var(--tk-text-3);
+}
+
+.empty.hidden {
+  display: none;
+}
+
+.acts {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--tk-dur) var(--tk-ease), border-color var(--tk-dur) var(--tk-ease);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--tk-accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.stop {
+  flex: 1;
+  background: var(--tk-rec);
+  border-color: var(--tk-rec);
+  color: var(--tk-rec-fg);
+}
+
+.ghost {
+  flex: 1;
+  background: transparent;
+  border-color: var(--tk-border);
+  color: var(--tk-text);
+}
+
+.ghost:hover {
+  border-color: var(--tk-border-strong);
+}

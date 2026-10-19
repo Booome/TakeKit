@@ -1,0 +1,318 @@
+//! Panel settings that outlive a run: the global hotkey, the two
+//! recording-feedback switches, and the capture setup from last time.
+//!
+//! Stored as JSON under `%APPDATA%\TakeKit\config.json`. A missing or corrupt
+//! file is not an error: the panel comes up on defaults rather than refusing to
+//! start.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use takekit_core::encoder::Encoder;
+use takekit_core::source::Source;
+
+/// Every writer takes this, so a drag and a source edit cannot lose each
+/// other's field to a read-modify-write race on the shared file.
+static LOCK: Mutex<()> = Mutex::new(());
+
+/// Where the panel was last time, in physical pixels — the units
+/// `outer_position` reports and the monitor list is measured in.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowPos {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Global shortcut that starts/stops a take, e.g. `"F9"`.
+    pub hotkey: String,
+    /// Full-screen countdown before the take starts; `0` turns it off.
+    pub countdown_secs: u8,
+    /// Show the full-screen summary while a take is being finalised.
+    pub finalize_panel: bool,
+    /// Capture setup from the last run, restored at startup so a repeated take
+    /// needs no re-picking.
+    pub sources: Vec<Source>,
+    pub out_root: Option<String>,
+    /// `None` keeps the automatic pick.
+    pub encoder: Option<Encoder>,
+    pub marks: bool,
+    /// UI language: `"zh"` or `"en"`. Anything else reads as Chinese.
+    pub language: String,
+    /// Palette: `"auto"` (follow the system), `"light"` or `"dark"`.
+    pub theme: String,
+    /// `None` lets the window manager place the panel.
+    pub window_pos: Option<WindowPos>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hotkey: "F9".to_string(),
+            countdown_secs: 3,
+            finalize_panel: true,
+            sources: Vec::new(),
+            out_root: None,
+            encoder: None,
+            marks: true,
+            language: "zh".to_string(),
+            theme: "auto".to_string(),
+            window_pos: None,
+        }
+    }
+}
+
+impl Config {
+    /// `%APPDATA%\TakeKit\config.json`, falling back to the temp dir when
+    /// `APPDATA` is unset (a stripped environment still gets persistence).
+    pub fn path() -> PathBuf {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("TakeKit").join("config.json")
+    }
+
+    pub fn load() -> Config {
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &Path) -> Config {
+        // Read as bytes: a file written as UTF-16 fails `read_to_string`,
+        // and returning defaults there would skip the backup below and let
+        // the next save erase what was there.
+        let Ok(bytes) = std::fs::read(path) else {
+            return Config::default();
+        };
+        // A hand-edited file can carry a UTF-8 BOM — PS `Set-Content -Encoding
+        // UTF8` writes one — and it is not JSON.
+        let text = String::from_utf8_lossy(&bytes);
+        let body = text.trim_start_matches('\u{feff}');
+        match serde_json::from_str(body) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                // Keep the unparseable file before the next save replaces it
+                // with defaults: the alternative is losing the hotkey and the
+                // source list because one byte was wrong.
+                takekit_core::fsx::backup_corrupt(path);
+                Config::default()
+            }
+        }
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        // Written beside the target and renamed over it, like the journal:
+        // window drags rewrite this file every 400ms, and a crash mid-write
+        // would leave truncated JSON that loads as "all defaults" — the hotkey,
+        // the source list and the window position would vanish silently.
+        takekit_core::fsx::write_atomic(path, &body).map_err(|e| e.to_string())
+    }
+
+    /// Load, change and write back in one step.
+    ///
+    /// Nothing is written when `f` left the settings alone, which is what makes
+    /// it cheap enough to call from a window drag.
+    pub fn update_at(path: &Path, f: impl FnOnce(&mut Config)) -> Result<(), String> {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Self::load_from(path);
+        let before = cfg.clone();
+        f(&mut cfg);
+        if cfg == before {
+            return Ok(());
+        }
+        cfg.save_to(path)
+    }
+
+    pub fn update(f: impl FnOnce(&mut Config)) -> Result<(), String> {
+        Self::update_at(&Self::path(), f)
+    }
+
+    /// The configured hotkey in the form the registrar accepts, falling back to
+    /// the built-in default when the file holds something unparseable — it is
+    /// plain JSON, editable by hand.
+    pub fn effective_hotkey(&self) -> String {
+        crate::shortcut::normalize(&self.hotkey).unwrap_or_else(|| Config::default().hotkey)
+    }
+
+    /// A language this build can actually draw in.
+    ///
+    /// The file is hand-editable and outlives a version that adds a third
+    /// language, so an unknown value must land on something the panel has
+    /// strings for rather than render the raw key.
+    pub fn effective_language(&self) -> String {
+        match self.language.as_str() {
+            "en" => "en".to_string(),
+            _ => "zh".to_string(),
+        }
+    }
+
+    /// Same for the palette: only the three named choices exist, and anything
+    /// else (a typo, a future value) follows the system.
+    pub fn effective_theme(&self) -> String {
+        match self.theme.as_str() {
+            "light" => "light".to_string(),
+            "dark" => "dark".to_string(),
+            _ => "auto".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use takekit_core::source::{Capture, Crop};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("takekit-cfg-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("config.json")
+    }
+
+    #[test]
+    fn round_trip() {
+        let path = scratch("rt");
+        let cfg = Config {
+            hotkey: "Ctrl+Alt+R".to_string(),
+            countdown_secs: 5,
+            finalize_panel: false,
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path), cfg);
+    }
+
+    #[test]
+    fn a_session_survives_a_restart() {
+        let path = scratch("session");
+        let cfg = Config {
+            sources: vec![
+                Source::new("screen", Capture::Desktop { rect: None }, 60),
+                Source::new(
+                    "win",
+                    Capture::Window {
+                        hwnd: 133890,
+                        title: "TakeKit - TRAE CN".to_string(),
+                        crop: Crop::default(),
+                    },
+                    30,
+                ),
+            ],
+            out_root: Some(r"D:\takes".to_string()),
+            encoder: Some(Encoder::X264),
+            marks: false,
+            window_pos: Some(WindowPos { x: 240.0, y: 260.0 }),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        let back = Config::load_from(&path);
+        assert_eq!(back, cfg);
+        assert_eq!(back.sources.len(), 2);
+        assert_eq!(back.window_pos, Some(WindowPos { x: 240.0, y: 260.0 }));
+    }
+
+    #[test]
+    fn update_keeps_the_fields_it_does_not_touch() {
+        let path = scratch("update");
+        let cfg = Config {
+            hotkey: "F8".to_string(),
+            out_root: Some("D:\\keep".to_string()),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        Config::update_at(&path, |c| c.marks = false).unwrap();
+
+        let back = Config::load_from(&path);
+        assert_eq!(back.hotkey, "F8");
+        assert_eq!(back.out_root.as_deref(), Some("D:\\keep"));
+        assert!(!back.marks);
+    }
+
+    #[test]
+    fn missing_file_is_default() {
+        let path = scratch("none");
+        assert_eq!(Config::load_from(&path), Config::default());
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_settings() {
+        let path = scratch("bom");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "\u{feff}{\"hotkey\":\"F7\"}").unwrap();
+        assert_eq!(Config::load_from(&path).hotkey, "F7");
+    }
+
+    #[test]
+    fn corrupt_file_is_default() {
+        let path = scratch("bad");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(Config::load_from(&path), Config::default());
+    }
+
+    #[test]
+    fn partial_file_fills_in_defaults() {
+        let path = scratch("part");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"hotkey":"F8"}"#).unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.hotkey, "F8");
+        assert_eq!(cfg.countdown_secs, 3);
+        assert!(cfg.finalize_panel);
+    }
+
+    #[test]
+    fn bad_hotkey_falls_back_to_default() {
+        let cfg = Config {
+            hotkey: "Ctrl+NotAKey".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_hotkey(), Config::default().hotkey);
+    }
+
+    #[test]
+    fn good_hotkey_comes_back_normalised() {
+        let cfg = Config {
+            hotkey: "ctrl+alt+r".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.effective_hotkey(),
+            crate::shortcut::normalize("ctrl+alt+r").unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_ui_values_fall_back_instead_of_rendering_raw() {
+        // The file is hand-editable: a value this build does not know must not
+        // reach the panel as a key with no strings behind it.
+        let cfg = Config {
+            language: "fr".to_string(),
+            theme: "neon".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_language(), "zh");
+        assert_eq!(cfg.effective_theme(), "auto");
+    }
+
+    #[test]
+    fn known_ui_values_survive_a_round_trip() {
+        let path = scratch("ui");
+        let cfg = Config {
+            language: "en".to_string(),
+            theme: "dark".to_string(),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let back = Config::load_from(&path);
+        assert_eq!(back.effective_language(), "en");
+        assert_eq!(back.effective_theme(), "dark");
+    }
+}

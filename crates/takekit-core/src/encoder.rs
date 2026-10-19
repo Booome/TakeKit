@@ -1,11 +1,16 @@
 //! Encoder selection: prefer the GPU, fall back to the CPU.
 //!
-//! Probing is done once per run with a one-frame encode at 64x64, which costs a
-//! few milliseconds and is far more reliable than guessing from driver versions
+//! Probing is done once per run with a one-frame encode at 256x256, which costs
+//! a few milliseconds and is far more reliable than guessing from driver versions
 //! (NVENC in particular reports "available" and then fails at encode time).
+//!
+//! 256x256 rather than a token 64x64 is deliberate: current NVENC builds enforce
+//! a minimum frame dimension and reject anything smaller, which would report a
+//! working GPU encoder as unavailable and silently fall back to the CPU.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -89,7 +94,7 @@ impl Encoder {
 
 /// Returns true if `ffmpeg` can actually encode with this encoder.
 pub fn works(ffmpeg: &Path, enc: Encoder) -> bool {
-    let out = Command::new(ffmpeg)
+    let out = crate::ffmpeg::command(ffmpeg)
         .args([
             "-hide_banner",
             "-v",
@@ -97,7 +102,7 @@ pub fn works(ffmpeg: &Path, enc: Encoder) -> bool {
             "-f",
             "lavfi",
             "-i",
-            "color=c=black:s=64x64:d=0.1",
+            "color=c=black:s=256x256:d=0.1",
             "-frames:v",
             "1",
             "-c:v",
@@ -117,13 +122,31 @@ pub fn works(ffmpeg: &Path, enc: Encoder) -> bool {
 ///
 /// Order is deliberate: NVENC, then QSV, then AMF — the encoders people who
 /// record their desktop actually have — and x264 last.
+///
+/// The result is cached for the process: hardware does not change at runtime,
+/// and `prepare` and the frontend both ask (a quarter second each).
 pub fn pick(ffmpeg: &Path) -> Encoder {
-    for enc in [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf] {
-        if works(ffmpeg, enc) {
-            return enc;
+    static PICKED: Mutex<Option<(PathBuf, Encoder)>> = Mutex::new(None);
+    let mut slot = PICKED.lock().unwrap_or_else(|e| e.into_inner());
+    cached_pick(&mut slot, ffmpeg, works)
+}
+
+fn cached_pick(
+    slot: &mut Option<(PathBuf, Encoder)>,
+    ffmpeg: &Path,
+    probe: impl Fn(&Path, Encoder) -> bool,
+) -> Encoder {
+    if let Some((p, e)) = slot {
+        if p == ffmpeg {
+            return *e;
         }
     }
-    Encoder::X264
+    let picked = [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf]
+        .into_iter()
+        .find(|e| probe(ffmpeg, *e))
+        .unwrap_or(Encoder::X264);
+    *slot = Some((ffmpeg.to_path_buf(), picked));
+    picked
 }
 
 #[cfg(test)]
@@ -141,5 +164,35 @@ mod tests {
     fn hardware_flag_is_right() {
         assert!(Encoder::Nvenc.is_hardware());
         assert!(!Encoder::X264.is_hardware());
+    }
+
+    #[test]
+    fn pick_probes_each_encoder_once_then_hits_the_cache() {
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &Path, _: Encoder| {
+            calls.set(calls.get() + 1);
+            false
+        };
+        let mut slot = None;
+        let a = cached_pick(&mut slot, Path::new("ffmpeg-a"), probe);
+        let second = calls.get();
+        let b = cached_pick(&mut slot, Path::new("ffmpeg-a"), probe);
+        assert_eq!(a, Encoder::X264);
+        assert_eq!(a, b);
+        assert_eq!(second, 3, "one probe per hardware candidate");
+        assert_eq!(calls.get(), 3, "a cached path must not re-probe");
+    }
+
+    #[test]
+    fn pick_reprobes_when_the_binary_path_changes() {
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &Path, _: Encoder| {
+            calls.set(calls.get() + 1);
+            false
+        };
+        let mut slot = None;
+        let _ = cached_pick(&mut slot, Path::new("ffmpeg-a"), probe);
+        let _ = cached_pick(&mut slot, Path::new("ffmpeg-b"), probe);
+        assert_eq!(calls.get(), 6, "a different binary must be probed again");
     }
 }

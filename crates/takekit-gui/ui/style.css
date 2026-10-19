@@ -1,0 +1,1137 @@
+/* TakeKit panel — Minimalism & Swiss Style.
+   Neutral ramp + a single accent, strong type hierarchy, geometric spacing on
+   a 4/8 grid, restrained 160ms state transitions. Both themes are authored,
+   not derived. */
+
+:root {
+  --tk-canvas: #f4f4f4;
+  --tk-surface: #ffffff;
+  --tk-sunken: #ececec;
+  --tk-border: #d6d6d6;
+  --tk-border-strong: #b0b0b0;
+  --tk-text: #16161a;
+  /* 4.5:1 on white: the old #8a8a8a was ~3.5:1, which reads as grey fuzz at
+     13px (row meta, empty-state hints, log detail lines). */
+  --tk-text-2: #5c5c5c;
+  --tk-text-3: #767676;
+  --tk-accent: #0b62c4;
+  --tk-accent-fg: #ffffff;
+  --tk-accent-soft: rgba(11, 98, 196, 0.12);
+  --tk-rec: #ce1f1f;
+  --tk-rec-fg: #ffffff;
+  --tk-ok: #0e700e;
+  --tk-ok-soft: rgba(14, 112, 14, 0.12);
+  --tk-warn: #8a5300;
+  --tk-radius-sm: 4px;
+  --tk-radius-md: 6px;
+  --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    system-ui, sans-serif;
+  --tk-font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --tk-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23808080' stroke-width='1.5'/%3E%3C/svg%3E");
+  --tk-dur: 160ms;
+  --tk-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* `auto` follows the system; an explicit choice is an attribute on <html>
+   (see shared.js applyTheme). The two blocks hold the same values because CSS
+   has no way to share a declaration block between a media query and an
+   attribute selector, and a `light-dark()` rewrite would take the entire
+   palette down on a WebView2 runtime that predates it. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tk-canvas: #191919;
+    --tk-surface: #232323;
+    --tk-sunken: #2c2c2c;
+    --tk-border: #3a3a3a;
+    --tk-border-strong: #5a5a5a;
+    --tk-text: #f2f2f2;
+    --tk-text-2: #a6a6a6;
+    /* Same reason as the light theme, on the dark surfaces. */
+    --tk-text-3: #8f8f8f;
+    --tk-accent: #4c9dff;
+    --tk-accent-fg: #0a0a0a;
+    --tk-accent-soft: rgba(76, 157, 255, 0.16);
+    --tk-rec: #ff5f52;
+    --tk-rec-fg: #1a0503;
+    --tk-ok: #6ccb5f;
+    --tk-ok-soft: rgba(108, 203, 95, 0.18);
+    --tk-warn: #e8b339;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tk-canvas: #191919;
+  --tk-surface: #232323;
+  --tk-sunken: #2c2c2c;
+  --tk-border: #3a3a3a;
+  --tk-border-strong: #5a5a5a;
+  --tk-text: #f2f2f2;
+  --tk-text-2: #a6a6a6;
+  --tk-text-3: #8f8f8f;
+  --tk-accent: #4c9dff;
+  --tk-accent-fg: #0a0a0a;
+  --tk-accent-soft: rgba(76, 157, 255, 0.16);
+  --tk-rec: #ff5f52;
+  --tk-rec-fg: #1a0503;
+  --tk-ok: #6ccb5f;
+  --tk-ok-soft: rgba(108, 203, 95, 0.18);
+  --tk-warn: #e8b339;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--tk-canvas);
+  color: var(--tk-text);
+  font-family: var(--tk-font-ui);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: hidden;
+  user-select: none;
+  position: relative;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
+}
+
+.mono {
+  font-family: var(--tk-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ellipsis {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+  font-size: 13px;
+  color: inherit;
+}
+
+/* One visible-focus style for everything the keyboard can reach. */
+:focus-visible {
+  outline: 2px solid var(--tk-accent);
+  outline-offset: 1px;
+}
+
+/* ── Type scale (Swiss: small caps labels against readable body) ────────── */
+
+.section-title,
+.field label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--tk-text-2);
+}
+
+/* ── Tabs ───────────────────────────────────────────────────────────────── */
+
+.tabs {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 6px 12px 0;
+  background: var(--tk-surface);
+  border-bottom: 1px solid var(--tk-border);
+}
+
+.tab {
+  position: relative;
+  height: 32px;
+  padding: 0 14px;
+  margin-bottom: -1px;
+  font-size: 13px;
+  color: var(--tk-text-2);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color var(--tk-dur) var(--tk-ease);
+}
+
+.tab:hover {
+  color: var(--tk-text);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--tk-text);
+  font-weight: 600;
+  border-bottom-color: var(--tk-accent);
+}
+
+.tab .count {
+  margin-left: 6px;
+}
+
+/* Something in that pane has not been looked at yet. Drawn as a dot rather
+   than a badge: the count is already beside it. */
+.tab.unread::after {
+  content: "";
+  position: absolute;
+  top: 7px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tk-ok);
+}
+
+.tab.unread.warn::after {
+  background: var(--tk-warn);
+}
+
+.tab.unread.error::after {
+  background: var(--tk-rec);
+}
+
+/* ── Notice ─────────────────────────────────────────────────────────────── */
+/* Pinned over everything, including the picker popover: it is a report, not
+   part of the layout, and it never moves what is underneath it. */
+
+.notice {
+  position: fixed;
+  top: 46px;
+  right: 16px;
+  z-index: 50;
+  width: 440px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 8px 10px 12px;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border-strong);
+  border-left: 3px solid var(--tk-warn);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  animation: notice-in var(--tk-dur) var(--tk-ease);
+}
+
+.notice.error {
+  border-left-color: var(--tk-rec);
+}
+
+.notice p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.notice .dot {
+  margin-top: 4px;
+}
+
+.notice-x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--tk-text-3);
+  background: none;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+}
+
+.notice-x:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+@keyframes notice-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+/* ── Sources ────────────────────────────────────────────────────────────── */
+
+.pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 16px 0;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  margin-bottom: 10px;
+}
+
+.section-head .section-title {
+  margin: 0;
+}
+
+.count {
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-3);
+}
+
+.ghost {
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--tk-text-2);
+  background: transparent;
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease);
+}
+
+.ghost:hover {
+  border-color: var(--tk-text-2);
+  color: var(--tk-text);
+}
+
+.ghost:active {
+  background: var(--tk-sunken);
+}
+
+.source-list,
+.take-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 16px;
+}
+
+.row {
+  flex: none;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-md);
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease);
+}
+
+.row:hover {
+  border-color: var(--tk-border-strong);
+}
+
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tk-text-3);
+}
+
+.dot.ok {
+  background: var(--tk-ok);
+}
+
+.dot.warn {
+  background: var(--tk-warn);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 62%, 0 100%);
+}
+
+.dot.err {
+  background: var(--tk-rec);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 62%, 0 100%);
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.row-meta {
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.row-remove {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--tk-text-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.row-remove:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+.row-param {
+  flex: none;
+  height: 24px;
+  padding: 0 20px 0 6px;
+  font-size: 12px;
+  color: var(--tk-text-2);
+  background: var(--tk-canvas) var(--tk-chevron) no-repeat right 5px center;
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-sm);
+  appearance: none;
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.row-param:hover {
+  border-color: var(--tk-border-strong);
+  color: var(--tk-text);
+}
+
+.row-param:focus-visible {
+  outline-offset: -1px;
+}
+
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding-bottom: 32px;
+  text-align: center;
+}
+
+.empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--tk-text-2);
+}
+
+.empty-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--tk-text-3);
+}
+
+/* ── History rows ───────────────────────────────────────────────────────── */
+/* The whole row is the button: the folder is what a click is for, and a row
+   with one small target in it would not say so. */
+
+.day {
+  flex: none;
+  margin: 8px 0 0;
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--tk-text-3);
+}
+
+.take-list .day:first-child {
+  margin-top: 0;
+}
+
+.take {
+  flex: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--tk-text);
+  text-align: left;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-md);
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease);
+}
+
+.take:hover {
+  border-color: var(--tk-border-strong);
+}
+
+.take:active {
+  background: var(--tk-sunken);
+}
+
+.take:focus-visible {
+  outline-offset: 1px;
+}
+
+.take.fresh {
+  border-color: var(--tk-ok);
+  box-shadow: 0 0 0 3px var(--tk-ok-soft);
+}
+
+.take .when,
+.entry .when {
+  flex: none;
+  width: 44px;
+  font-family: var(--tk-font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tk-text-2);
+}
+
+.take .stats {
+  flex: none;
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-2);
+  white-space: nowrap;
+}
+
+.take .path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-2);
+}
+
+.take .open {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--tk-text-3);
+  border-radius: var(--tk-radius-sm);
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.take:hover .open {
+  background: var(--tk-accent-soft);
+  color: var(--tk-accent);
+}
+
+.take .badge {
+  flex: none;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--tk-ok);
+  background: var(--tk-ok-soft);
+  border-radius: 3px;
+}
+
+/* ── Log rows ───────────────────────────────────────────────────────────── */
+
+.entry {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-md);
+  /* The reason is the part worth copying into a bug report. */
+  user-select: text;
+}
+
+.entry .dot {
+  margin-top: 5px;
+}
+
+.entry .body {
+  flex: 1;
+  min-width: 0;
+}
+
+.entry .what {
+  font-size: 13px;
+}
+
+.entry .why {
+  margin-top: 2px;
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-2);
+  overflow-wrap: anywhere;
+}
+
+.entry .why a {
+  margin-left: 6px;
+  color: var(--tk-accent);
+  text-decoration: none;
+}
+
+.entry .why a:hover {
+  text-decoration: underline;
+}
+
+/* Shared disabled treatment: clearly non-interactive, never ambiguous. */
+:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── Params ─────────────────────────────────────────────────────────────── */
+
+.params {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+  padding: 12px 16px 14px;
+  background: var(--tk-sunken);
+  border-top: 1px solid var(--tk-border);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.field.grow {
+  flex: 1;
+}
+
+.field input.value,
+.field select.value {
+  height: 28px;
+  padding: 0 8px;
+  color: var(--tk-text);
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-sm);
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease);
+}
+
+.field input.value.mono {
+  font-family: var(--tk-font-mono);
+  font-size: 12px;
+}
+
+.field input.value:hover,
+.field select.value:hover {
+  border-color: var(--tk-border-strong);
+}
+
+.field input.value:focus,
+.field select.value:focus {
+  outline-offset: -1px;
+  border-color: transparent;
+}
+
+.field select.value {
+  padding-right: 24px;
+  appearance: none;
+  background: var(--tk-surface) var(--tk-chevron) no-repeat right 7px center;
+  cursor: pointer;
+}
+
+/* A label and its control narrower than it: centring the pair reads as one
+   unit, where left-aligning leaves the control hanging off the label's left. */
+.field.centered {
+  align-items: center;
+}
+
+.field .switch {
+  margin-top: 3px;
+}
+
+.path-row {
+  display: flex;
+  gap: 6px;
+}
+
+.path-row .value {
+  flex: 1;
+  min-width: 0;
+}
+
+.field button.browse {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--tk-text-2);
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.field button.browse:hover {
+  border-color: var(--tk-border-strong);
+  color: var(--tk-text);
+}
+
+/* ── Switch (click marks) ───────────────────────────────────────────────── */
+
+.switch {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 22px;
+  margin: 0;
+  background: var(--tk-sunken);
+  border: 1px solid var(--tk-border-strong);
+  border-radius: 11px;
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    border-color var(--tk-dur) var(--tk-ease);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: var(--tk-text-2);
+  border-radius: 50%;
+  transition:
+    transform var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease);
+}
+
+.switch:checked {
+  background: var(--tk-accent);
+  border-color: var(--tk-accent);
+}
+
+.switch:checked::after {
+  background: var(--tk-accent-fg);
+  transform: translateX(18px);
+}
+
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+
+.bar {
+  flex: none;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  background: var(--tk-surface);
+  border-top: 1px solid var(--tk-border);
+}
+
+.clock {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--tk-text);
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--tk-text-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  height: 40px;
+  min-width: 132px;
+  justify-content: center;
+  padding: 0 18px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--tk-rec-fg);
+  background: var(--tk-rec);
+  border: none;
+  border-radius: var(--tk-radius-md);
+  cursor: pointer;
+  transition: background var(--tk-dur) var(--tk-ease);
+}
+
+.rec::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  background: currentColor;
+  border-radius: 50%;
+}
+
+.rec:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--tk-rec) 88%, var(--tk-text));
+}
+
+.rec:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.rec.live::before {
+  animation: rec-pulse 1.6s var(--tk-ease) infinite;
+}
+
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ── Picker popover ─────────────────────────────────────────────────────── */
+
+.popover {
+  position: absolute;
+  top: 56px;
+  right: 16px;
+  width: 420px;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-md);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+  z-index: 10;
+}
+
+.search {
+  flex: none;
+  height: 36px;
+  margin: 10px;
+  padding: 0 10px;
+  color: var(--tk-text);
+  background: var(--tk-canvas);
+  border: 1px solid var(--tk-border);
+  border-radius: var(--tk-radius-sm);
+}
+
+.search:focus {
+  outline-offset: -1px;
+  border-color: transparent;
+}
+
+.picker-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+}
+
+.group-label {
+  padding: 8px 4px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--tk-text-3);
+}
+
+.pick {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  font-size: 13px;
+  color: var(--tk-text);
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition: background var(--tk-dur) var(--tk-ease);
+}
+
+.pick:hover {
+  background: var(--tk-canvas);
+}
+
+.pick:active {
+  background: var(--tk-accent-soft);
+}
+
+.pick .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pick .meta {
+  flex: none;
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  color: var(--tk-text-3);
+}
+
+.pick.empty-row {
+  color: var(--tk-text-3);
+  cursor: default;
+}
+
+.pick.empty-row:hover {
+  background: transparent;
+}
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────── */
+
+.source-list::-webkit-scrollbar,
+.picker-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.source-list::-webkit-scrollbar-thumb,
+.picker-body::-webkit-scrollbar-thumb {
+  background: var(--tk-border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 5px;
+}
+
+/* ── Settings entry (tab bar) ───────────────────────────────────────────── */
+
+.gear {
+  flex: none;
+  align-self: center;
+  width: 30px;
+  height: 30px;
+  margin: 0 0 3px auto;
+  display: grid;
+  place-items: center;
+  color: var(--tk-text-2);
+  background: none;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.gear:hover {
+  color: var(--tk-text);
+}
+
+.gear[aria-expanded="true"] {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+.gear svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* ── Hotkey chip (params row) ───────────────────────────────────────────── */
+/* Reads as a value, not a button: the only affordance is the cursor and the
+   border, because the thing it holds is the point. */
+
+.chip {
+  height: 28px;
+  min-width: 84px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--tk-font-mono);
+  font-size: 12px;
+  color: var(--tk-text);
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.chip:hover {
+  border-color: var(--tk-text-2);
+}
+
+.chip.capturing,
+.chip.capturing:hover {
+  border: 1px dashed var(--tk-accent);
+  background: var(--tk-accent-soft);
+  color: var(--tk-accent);
+}
+
+.chip.error {
+  border-color: var(--tk-rec);
+  color: var(--tk-rec);
+}
+
+.chip.ok {
+  border-color: var(--tk-ok);
+  color: var(--tk-ok);
+}
+
+/* Reserved even when empty: the params row keeps its height in every state. */
+.field-note {
+  height: 14px;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--tk-text-3);
+  white-space: nowrap;
+}
+
+/* ── Settings popover ───────────────────────────────────────────────────── */
+
+.settings {
+  display: block;
+  top: 48px;
+  right: 12px;
+  width: 268px;
+  max-height: none;
+  padding: 14px;
+}
+
+.settings-group + .settings-group {
+  margin-top: 14px;
+}
+
+.settings-label {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--tk-text-3);
+}
+
+.seg {
+  display: flex;
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-sm);
+  overflow: hidden;
+}
+
+.seg button {
+  flex: 1;
+  height: 28px;
+  font-size: 12px;
+  color: var(--tk-text-2);
+  background: var(--tk-surface);
+  border: none;
+  border-right: 1px solid var(--tk-border);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.seg button:last-child {
+  border-right: 0;
+}
+
+.seg button:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--tk-accent);
+  color: var(--tk-accent-fg);
+}
+
+.settings-note {
+  margin: 12px 0 0;
+  font-size: 11px;
+  color: var(--tk-text-3);
+}

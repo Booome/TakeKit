@@ -3,3 +3,7 @@ takes/
 *.mkv
 *.mp4
 *.mov
+.superpowers/
+# Platform-specific probe/verification scripts stay local (see HANDOFF §8):
+# they drive Win32/UIA and are not part of the product.
+docs/tools/*.ps1

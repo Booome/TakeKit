@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>TakeKit 录制</title>
+    <script>
+      // Rust seeds the palette before the page loads (see index.html for why).
+      if (window.__TAKEKIT_THEME__) {
+        document.documentElement.dataset.theme = window.__TAKEKIT_THEME__;
+      }
+    </script>
+    <link rel="stylesheet" href="tray.css" />
+  </head>
+  <body>
+    <div class="card">
+      <header class="head">
+        <span class="dot" id="dot"></span>
+        <span class="clock mono" id="clock">00:00:00</span>
+        <span class="state" id="state">未在录制</span>
+      </header>
+
+      <div class="rows" id="rows"></div>
+      <p class="empty" id="empty" data-i18n="tray.empty">没有正在录制的源</p>
+
+      <footer class="acts">
+        <button class="stop" id="stop" type="button" disabled data-i18n="tray.stop">停止</button>
+        <button class="ghost" id="show" type="button" data-i18n="tray.show">显示主窗口</button>
+      </footer>
+    </div>
+
+    <script src="shared.js"></script>
+    <script src="i18n.js"></script>
+    <script src="tray.js"></script>
+  </body>
+</html>

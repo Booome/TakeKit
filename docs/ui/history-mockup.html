@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>TakeKit — 录制历史：三个布局方案</title>
+    <style>
+      /* The real palette from crates/takekit-gui/ui/style.css, so the mockups
+         read exactly like the shipping panel. */
+      :root {
+        --tk-canvas: #f4f4f4;
+        --tk-surface: #ffffff;
+        --tk-sunken: #ececec;
+        --tk-border: #d6d6d6;
+        --tk-border-strong: #b0b0b0;
+        --tk-text: #16161a;
+        --tk-text-2: #5c5c5c;
+        --tk-text-3: #8a8a8a;
+        --tk-accent: #0b62c4;
+        --tk-accent-fg: #ffffff;
+        --tk-accent-soft: rgba(11, 98, 196, 0.12);
+        --tk-rec: #ce1f1f;
+        --tk-rec-fg: #ffffff;
+        --tk-ok: #0e700e;
+        --tk-warn: #8a5300;
+        --tk-radius-sm: 4px;
+        --tk-radius-md: 6px;
+        --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+        --tk-font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+        --tk-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23808080' stroke-width='1.5'/%3E%3C/svg%3E");
+        --tk-dur: 160ms;
+        --tk-ease: cubic-bezier(0.2, 0, 0, 1);
+      }
+
+      body {
+        margin: 0;
+        padding: 28px 32px 64px;
+        background: #e9e9ea;
+        color: var(--tk-text);
+        font: 14px/1.5 var(--tk-font-ui);
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0 0 6px;
+      }
+      .lede {
+        margin: 0 0 8px;
+        max-width: 78ch;
+        color: var(--tk-text-2);
+      }
+      .lede code {
+        font: 12px var(--tk-font-mono);
+        background: #fff;
+        border: 1px solid var(--tk-border);
+        border-radius: 3px;
+        padding: 1px 4px;
+      }
+      .rules {
+        margin: 0 0 26px;
+        padding: 0;
+        list-style: none;
+        max-width: 100ch;
+        color: var(--tk-text-2);
+        font-size: 13px;
+      }
+      .rules li {
+        margin: 2px 0;
+      }
+      .rules b {
+        color: var(--tk-text);
+        font-weight: 600;
+      }
+
+      .deck {
+        display: flex;
+        gap: 22px;
+        align-items: flex-start;
+      }
+      .option {
+        width: 588px;
+      }
+      .option > h2 {
+        font-size: 15px;
+        margin: 0 0 4px;
+      }
+      .option > .who {
+        margin: 0 0 10px;
+        min-height: 76px;
+        font-size: 12.5px;
+        color: var(--tk-text-2);
+      }
+      .option .verdict {
+        margin-top: 10px;
+        font-size: 12.5px;
+        color: var(--tk-text-2);
+      }
+      .option .verdict b {
+        color: var(--tk-text);
+      }
+      /* Each mockup is the real 900x640 panel, shrunk to fit three side by
+         side; nothing inside is re-laid-out for the deck. */
+      .frame {
+        width: 558px;
+        height: 396.8px;
+        overflow: hidden;
+        border: 1px solid #b9b9bb;
+        border-radius: 8px;
+        background: var(--tk-canvas);
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+      }
+      .panel {
+        width: 900px;
+        height: 640px;
+        transform: scale(0.62);
+        transform-origin: top left;
+        background: var(--tk-canvas);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* ── the panel itself ───────────────────────────────────────────── */
+      .sources,
+      .history {
+        display: flex;
+        flex-direction: column;
+        padding: 16px 16px 0;
+        min-height: 0;
+      }
+      .sources {
+        flex: 1;
+      }
+      .section-head {
+        flex: none;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .section-title {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .count {
+        font: 11px var(--tk-font-mono);
+        color: var(--tk-text-3);
+      }
+      .ghost {
+        margin-left: auto;
+        height: 26px;
+        padding: 0 10px;
+        font: inherit;
+        font-size: 12px;
+        color: var(--tk-text-2);
+        background: transparent;
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-sm);
+        cursor: pointer;
+        transition: border-color var(--tk-dur) var(--tk-ease), color var(--tk-dur) var(--tk-ease);
+      }
+      .ghost:hover {
+        border-color: var(--tk-border-strong);
+        color: var(--tk-text);
+      }
+      .list {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .row {
+        flex: none;
+        height: 56px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 12px;
+        background: var(--tk-surface);
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-md);
+      }
+      .dot {
+        flex: none;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--tk-ok);
+      }
+      .dot.warn {
+        background: var(--tk-warn);
+        clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 62%, 0 100%);
+      }
+      .row-main {
+        flex: 1;
+        min-width: 0;
+      }
+      .row-name {
+        font-size: 14px;
+        font-weight: 500;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .row-meta {
+        font: 11px var(--tk-font-mono);
+        color: var(--tk-text-2);
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .row-param {
+        flex: none;
+        height: 24px;
+        padding: 0 20px 0 6px;
+        font-size: 12px;
+        color: var(--tk-text-2);
+        background: var(--tk-canvas) var(--tk-chevron) no-repeat right 5px center;
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-sm);
+        appearance: none;
+        cursor: pointer;
+      }
+
+      /* ── a take record ──────────────────────────────────────────────── */
+      /* Whole row opens the folder. Path keeps its tail visible: the take
+         folder name is the useful end, the user profile is not. */
+      .take {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 7px 10px 7px 12px;
+        background: var(--tk-surface);
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-md);
+        cursor: pointer;
+        transition: border-color var(--tk-dur) var(--tk-ease), background var(--tk-dur) var(--tk-ease);
+      }
+      .take:hover {
+        border-color: var(--tk-border-strong);
+        background: #fbfbfb;
+      }
+      .take:active {
+        background: var(--tk-sunken);
+      }
+      .take:focus-visible {
+        outline: 2px solid var(--tk-accent);
+        outline-offset: 1px;
+      }
+      .take .when {
+        flex: none;
+        width: 58px;
+        font: 12px var(--tk-font-mono);
+        font-variant-numeric: tabular-nums;
+      }
+      .take .stats {
+        flex: none;
+        font: 11px var(--tk-font-mono);
+        color: var(--tk-text-2);
+        white-space: nowrap;
+      }
+      .take .path {
+        flex: 1;
+        min-width: 0;
+        direction: rtl;
+        text-align: left;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font: 11px var(--tk-font-mono);
+        color: var(--tk-text-3);
+      }
+      .take .path > span {
+        direction: ltr;
+        unicode-bidi: embed;
+      }
+      .take .open {
+        flex: none;
+        width: 24px;
+        height: 24px;
+        display: grid;
+        place-items: center;
+        font-size: 13px;
+        color: var(--tk-text-3);
+        border-radius: var(--tk-radius-sm);
+        transition: background var(--tk-dur) var(--tk-ease), color var(--tk-dur) var(--tk-ease);
+      }
+      .take:hover .open {
+        background: var(--tk-accent-soft);
+        color: var(--tk-accent);
+      }
+      .take.just {
+        border-color: var(--tk-ok);
+        box-shadow: 0 0 0 3px rgba(14, 112, 14, 0.12);
+      }
+      .take.just .when {
+        font-weight: 700;
+      }
+      .badge-new {
+        flex: none;
+        padding: 1px 5px;
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--tk-ok);
+        background: rgba(14, 112, 14, 0.1);
+        border-radius: 3px;
+      }
+
+      /* ── A: one strip above the footer ─────────────────────────────── */
+      .recent {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 16px;
+        background: var(--tk-surface);
+        border-top: 1px solid var(--tk-border);
+      }
+      .recent .take {
+        flex: 1;
+        min-width: 0;
+        border: none;
+        padding: 5px 8px 5px 6px;
+      }
+      .recent .take:hover {
+        background: var(--tk-sunken);
+      }
+      .recent-label {
+        flex: none;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--tk-text-2);
+      }
+      .link {
+        flex: none;
+        padding: 0;
+        font: inherit;
+        font-size: 12px;
+        color: var(--tk-accent);
+        background: none;
+        border: none;
+        cursor: pointer;
+      }
+      .link:hover {
+        text-decoration: underline;
+      }
+
+      /* ── B: history owns the lower half ────────────────────────────── */
+      .half {
+        flex: none;
+        height: 150px;
+      }
+      .history.b {
+        flex: 1;
+        border-top: 1px solid var(--tk-border);
+        padding-bottom: 14px;
+      }
+      .divider {
+        flex: none;
+        height: 1px;
+        background: var(--tk-border);
+        margin: 12px 0 0;
+      }
+
+      /* ── C: tabs ───────────────────────────────────────────────────── */
+      .tabs {
+        flex: none;
+        display: flex;
+        gap: 2px;
+        padding: 10px 16px 0;
+      }
+      .tab {
+        position: relative;
+        height: 30px;
+        padding: 0 12px;
+        font: inherit;
+        font-size: 13px;
+        color: var(--tk-text-2);
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        cursor: pointer;
+      }
+      .tab[aria-selected="true"] {
+        color: var(--tk-text);
+        font-weight: 600;
+        border-bottom-color: var(--tk-accent);
+      }
+      .tab .count {
+        margin-left: 5px;
+      }
+      .tab.hasnew::after {
+        content: "";
+        position: absolute;
+        top: 6px;
+        right: 3px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--tk-accent);
+      }
+      .tab-main {
+        margin-left: auto;
+        align-self: center;
+      }
+
+      /* ── params + footer (identical in all three) ──────────────────── */
+      .params {
+        flex: none;
+        display: flex;
+        align-items: flex-start;
+        gap: 24px;
+        padding: 12px 16px 14px;
+        background: var(--tk-sunken);
+        border-top: 1px solid var(--tk-border);
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        min-width: 0;
+      }
+      .field.grow {
+        flex: 1;
+      }
+      .field > label {
+        font-size: 12px;
+        color: var(--tk-text-2);
+      }
+      .field .value {
+        height: 28px;
+        padding: 0 8px;
+        display: flex;
+        align-items: center;
+        color: var(--tk-text);
+        background: var(--tk-surface);
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-sm);
+      }
+      .field input.value.mono {
+        font: 12px var(--tk-font-mono);
+      }
+      .path-row {
+        display: flex;
+        gap: 6px;
+      }
+      .path-row .value {
+        flex: 1;
+        min-width: 0;
+        font: 12px var(--tk-font-mono);
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        display: block;
+        line-height: 26px;
+      }
+      .browse {
+        flex: none;
+        width: 28px;
+        height: 28px;
+        font-size: 14px;
+        color: var(--tk-text-2);
+        background: var(--tk-surface);
+        border: 1px solid var(--tk-border);
+        border-radius: var(--tk-radius-sm);
+        cursor: pointer;
+      }
+      .field.centered {
+        align-items: center;
+      }
+      .switch {
+        appearance: none;
+        position: relative;
+        width: 40px;
+        height: 22px;
+        margin: 3px 0 0;
+        background: var(--tk-sunken);
+        border: 1px solid var(--tk-border-strong);
+        border-radius: 11px;
+        cursor: pointer;
+      }
+      .switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--tk-surface);
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+        transition: left var(--tk-dur) var(--tk-ease);
+      }
+      .switch:checked {
+        background: var(--tk-accent);
+        border-color: var(--tk-accent);
+      }
+      .switch:checked::after {
+        left: 20px;
+      }
+      .bar {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 16px;
+        background: var(--tk-surface);
+        border-top: 1px solid var(--tk-border);
+      }
+      .clock {
+        font: 20px var(--tk-font-mono);
+        font-variant-numeric: tabular-nums;
+      }
+      .hint {
+        font-size: 12px;
+        color: var(--tk-text-3);
+      }
+      .rec {
+        margin-left: auto;
+        height: 34px;
+        padding: 0 18px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--tk-rec-fg);
+        background: var(--tk-rec);
+        border: none;
+        border-radius: var(--tk-radius-sm);
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>录制历史：三个布局方案</h1>
+    <p class="lede">
+      三张图是同一个 <code>900 × 640</code> 面板（缩放 62%），内容、配色、字号全部相同 —— 只有历史的<strong>位置</strong>不同。
+      录完的那一刻，三张图都处在「刚刚保存」的状态，所以你能看到各自的<b>完成后反馈</b>长什么样。
+    </p>
+    <ul class="rules">
+      <li><b>整行可点 = 打开目录</b>（含键盘 Enter），hover / 按下 / <code>focus-visible</code> 三种反馈都有；<code>⟶</code> 只是提示，不是唯一热区。</li>
+      <li>路径<b>省略左边、保留结尾</b>：真正有用的是 take 目录名（<code>2026-10-19-15-23-37</code>），不是 <code>C:\Users\…</code>。悬停给完整路径。</li>
+      <li>失败的那次也进历史，用橙色三角标记 —— 否则「录了但没成功」会变成一条你找不到的出入口。</li>
+      <li>空状态给一句引导，不留白。</li>
+    </ul>
+
+    <div class="deck">
+      <section class="option">
+        <h2>A · 底栏上方的「最近一次」</h2>
+        <p class="who">
+          参数区下面常驻一条 44px 的细条，只放最近一次录制；右侧「全部历史」开浮层看更早的。
+          源列表的空间<b>一点没动</b>，和今天完全一样。
+        </p>
+        <div class="frame" id="frame-a"></div>
+        <p class="verdict"><b>适合</b>：绝大多数时候你只关心「刚录的那条」。<b>代价</b>：更早的记录藏在浮层里。</p>
+      </section>
+
+      <section class="option">
+        <h2>B · 历史占下半屏</h2>
+        <p class="who">
+          源区缩到上面一小块（1–2 行，多了自己滚），下面整块是历史，能一眼扫到最近五六次。
+          源和历史<b>同屏</b>，都不用点。
+        </p>
+        <div class="frame" id="frame-b"></div>
+        <p class="verdict"><b>适合</b>：你会连着录几段、回头挨个找。<b>代价</b>：源多时两边都紧张。</p>
+      </section>
+
+      <section class="option">
+        <h2>C · 顶部标签「源 / 历史」</h2>
+        <p class="who">
+          标题栏下加两个页签，历史独占整个内容区，可以按今天 / 昨天 / 更早分组、放很多条。
+          录完在「历史」上点一个小蓝点，提示有新记录。
+        </p>
+        <div class="frame" id="frame-c"></div>
+        <p class="verdict"><b>适合</b>：你想把历史当正经列表翻。<b>代价</b>：源和历史不能同时看到。</p>
+      </section>
+    </div>
+
+    <script>
+      const TAKES = [
+        { when: "15:23", stats: "5.2s · 5.6 MB", path: "C:\\Users\\…\\AppData\\Local\\Temp\\2026-10-19-15-23-37", ok: true, just: true },
+        { when: "14:02", stats: "12.4s · 15.1 MB", path: "C:\\Users\\…\\AppData\\Local\\Temp\\2026-10-19-14-02-11", ok: true },
+        { when: "12:41", stats: "3.8s · 4.2 MB", path: "C:\\Users\\…\\AppData\\Local\\Temp\\2026-10-19-12-41-05", ok: false },
+        { when: "昨天", stats: "47.9s · 58.3 MB", path: "C:\\Users\\…\\AppData\\Local\\Temp\\2026-10-18-18-30-22", ok: true },
+        { when: "10-17", stats: "6.0s · 7.1 MB", path: "C:\\Users\\…\\AppData\\Local\\Temp\\2026-10-17-09-14-48", ok: true },
+      ];
+
+      const take = (t, withNew) => `
+        <div class="take${t.just ? " just" : ""}" tabindex="0" role="button"
+             title="在文件资源管理器中打开 ${t.path}">
+          <span class="dot${t.ok ? "" : " warn"}"></span>
+          <span class="when">${t.when}</span>
+          <span class="stats">${t.stats}</span>
+          ${withNew && t.just ? '<span class="badge-new">新</span>' : ""}
+          <span class="path"><span>${t.path}</span></span>
+          <span class="open">⟶</span>
+        </div>`;
+
+      const sourceRow = `
+        <div class="row">
+          <span class="dot"></span>
+          <span class="row-main">
+            <div class="row-name">整个桌面</div>
+            <div class="row-meta">desktop · 30fps · 20</div>
+          </span>
+          <select class="row-param"><option>30 fps</option></select>
+          <select class="row-param"><option>20</option></select>
+        </div>`;
+
+      const params = `
+        <section class="params">
+          <div class="field grow">
+            <label>输出目录</label>
+            <div class="path-row">
+              <input class="value mono" value="C:\\Users\\…\\AppData\\Local\\Temp" readonly />
+              <button class="browse">…</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>视频编码</label>
+            <select class="value"><option>自动</option></select>
+          </div>
+          <div class="field centered">
+            <label>鼠标效果</label>
+            <input class="switch" type="checkbox" checked />
+          </div>
+        </section>`;
+
+      const footer = `
+        <footer class="bar">
+          <span class="clock">00:05</span>
+          <span class="hint">1 个源</span>
+          <button class="rec">开始录制</button>
+        </footer>`;
+
+      const sourcesHead = `
+        <div class="section-head">
+          <h2 class="section-title">源</h2><span class="count">1</span>
+          <button class="ghost">添加源</button>
+        </div>`;
+
+      document.getElementById("frame-a").innerHTML = `
+        <div class="panel">
+          <section class="sources">${sourcesHead}<div class="list">${sourceRow}</div></section>
+          <div class="recent">
+            <span class="recent-label">最近</span>
+            ${take(TAKES[0])}
+            <button class="link">全部历史</button>
+          </div>
+          ${params}${footer}
+        </div>`;
+
+      document.getElementById("frame-b").innerHTML = `
+        <div class="panel">
+          <section class="sources half">${sourcesHead}<div class="list">${sourceRow}</div></section>
+          <section class="history b">
+            <div class="section-head">
+              <h2 class="section-title">历史</h2><span class="count">5</span>
+              <button class="ghost">在文件夹中打开</button>
+            </div>
+            <div class="list">${TAKES.map((t) => take(t, true)).join("")}</div>
+          </section>
+          ${params}${footer}
+        </div>`;
+
+      document.getElementById("frame-c").innerHTML = `
+        <div class="panel">
+          <div class="tabs">
+            <button class="tab" aria-selected="false">源<span class="count">1</span></button>
+            <button class="tab hasnew" aria-selected="true">历史<span class="count">5</span></button>
+            <button class="ghost tab-main">添加源</button>
+          </div>
+          <section class="history">
+            <div class="list">${TAKES.map((t) => take(t, true)).join("")}</div>
+          </section>
+          ${params}${footer}
+        </div>`;
+
+      // The mockups are pictures, not a working app: clicks explain instead.
+      document.querySelectorAll(".take").forEach((el) => {
+        el.addEventListener("click", () =>
+          alert("真程序里这一下会打开目录：\n" + el.getAttribute("title"))
+        );
+      });
+    </script>
+  </body>
+</html>

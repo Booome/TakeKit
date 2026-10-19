@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>TakeKit</title>
+    <script>
+      // Rust seeds the chosen palette before the page loads, so an explicit
+      // light/dark does not paint the other one for a frame first. "auto" is
+      // left to the stylesheets' media query.
+      if (window.__TAKEKIT_THEME__) {
+        document.documentElement.dataset.theme = window.__TAKEKIT_THEME__;
+      }
+    </script>
+    <link rel="stylesheet" href="style.css" />
+    <script>
+      // PROBE-ONLY: proves the HTML asset itself was served and parsed.
+      (function () {
+        var send = function (stage) {
+          try {
+            if (window.__TAURI__ && window.__TAURI__.core) {
+              window.__TAURI__.core.invoke("ui_ping", { stage: stage });
+            }
+          } catch (e) {}
+        };
+        send("html-head");
+        window.addEventListener("DOMContentLoaded", function () {
+          send("dom-ready");
+        });
+        window.addEventListener("error", function (ev) {
+          send("js-error:" + (ev.message || "?").slice(0, 120));
+        });
+      })();
+    </script>
+  </head>
+  <body>
+    <!-- The Chinese text in this file is the fallback: it is what a page shows
+         if i18n.js never runs, and what `data-i18n` replaces on load. -->
+    <nav class="tabs" role="tablist" aria-label="面板" data-i18n-aria="tabs.aria">
+      <button
+        class="tab"
+        id="tab-sources"
+        type="button"
+        role="tab"
+        aria-selected="true"
+        aria-controls="pane-sources"
+      >
+        <span data-i18n="tab.sources">源</span><span class="count" id="count"></span>
+      </button>
+      <button
+        class="tab"
+        id="tab-history"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="pane-history"
+        data-i18n="tab.history"
+      >
+        历史
+      </button>
+      <button
+        class="tab"
+        id="tab-log"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="pane-log"
+        data-i18n="tab.log"
+      >
+        日志
+      </button>
+      <button
+        class="gear"
+        id="settings-btn"
+        type="button"
+        aria-haspopup="true"
+        aria-expanded="false"
+        aria-controls="settings"
+        title="设置"
+        data-i18n-title="settings.open"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+          <path d="M2 5h6.5M12.5 5H14M2 11h1.5M7.5 11H14" />
+          <circle cx="10.5" cy="5" r="1.7" />
+          <circle cx="5.5" cy="11" r="1.7" />
+        </svg>
+      </button>
+    </nav>
+
+    <section class="pane" id="pane-sources" role="tabpanel" aria-labelledby="tab-sources">
+      <div class="section-head">
+        <h2 class="section-title" id="sources-title" data-i18n="section.sources">源</h2>
+        <button class="ghost" id="add-btn" type="button" data-i18n="sources.add">添加源</button>
+      </div>
+      <div id="source-list" class="source-list"></div>
+      <div id="empty" class="empty">
+        <p class="empty-title" data-i18n="sources.emptyTitle">还没有源</p>
+        <p class="empty-hint" data-i18n="sources.emptyHint">
+          添加一个窗口、桌面或摄像头开始录制。
+        </p>
+      </div>
+    </section>
+
+    <section class="pane hidden" id="pane-history" role="tabpanel" aria-labelledby="tab-history">
+      <div class="section-head">
+        <h2 class="section-title" data-i18n="section.history">历史</h2>
+        <button class="ghost" id="history-clear" type="button" data-i18n="history.clear">
+          清空…
+        </button>
+      </div>
+      <div id="history-list" class="take-list"></div>
+      <div id="history-empty" class="empty">
+        <p class="empty-title" data-i18n="history.emptyTitle">还没有录制过</p>
+        <p class="empty-hint" data-i18n="history.emptyHint">
+          按 F9 或点「开始录制」，录完的那一段会出现在这里。
+        </p>
+      </div>
+    </section>
+
+    <section class="pane hidden" id="pane-log" role="tabpanel" aria-labelledby="tab-log">
+      <div class="section-head">
+        <h2 class="section-title" data-i18n="section.log">日志</h2>
+        <button class="ghost" id="log-clear" type="button" data-i18n="history.clear">
+          清空…
+        </button>
+      </div>
+      <div id="log-list" class="take-list"></div>
+      <div id="log-empty" class="empty">
+        <p class="empty-title" data-i18n="log.emptyTitle">没有需要处理的事</p>
+        <p class="empty-hint" data-i18n="log.emptyHint">
+          源失效、编码失败这类问题会记在这里。
+        </p>
+      </div>
+    </section>
+
+    <section class="params" aria-labelledby="params-title">
+      <h2 class="sr-only" id="params-title">参数</h2>
+
+      <div class="field grow">
+        <label for="out-path" data-i18n="params.out">输出目录</label>
+        <div class="path-row">
+          <input class="value mono" id="out-path" type="text" value="takes" spellcheck="false" />
+          <button
+            class="browse"
+            id="out-browse"
+            type="button"
+            aria-label="选择输出目录"
+            title="选择输出目录"
+            data-i18n-aria="params.outPick"
+            data-i18n-title="params.outPick"
+          >
+            …
+          </button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="encoder" data-i18n="params.encoder">视频编码</label>
+        <select class="value" id="encoder">
+          <option value="" data-i18n="params.encoderAuto">自动</option>
+          <option value="nvenc">NVENC</option>
+          <option value="qsv">QSV</option>
+          <option value="amf">AMF</option>
+          <option value="x264">libx264</option>
+        </select>
+      </div>
+
+      <div class="field centered">
+        <label
+          for="marks-value"
+          title="点击涟漪与拖动轨迹叠加到录制画面上"
+          data-i18n-title="params.marksHint"
+          data-i18n="params.marks"
+          >鼠标效果</label
+        >
+        <input class="switch" id="marks-value" type="checkbox" role="switch" checked />
+      </div>
+
+      <div class="field centered">
+        <label
+          for="countdown-value"
+          title="开始录制前的全屏倒计时。关掉后按 F9 直接开录，但开头 0.3–0.5 秒的动作不会进画面。"
+          data-i18n-title="params.countdownHint"
+          data-i18n="params.countdown"
+          >倒计时</label
+        >
+        <input class="switch" id="countdown-value" type="checkbox" role="switch" checked />
+      </div>
+
+      <div class="field">
+        <label for="hotkey-btn" data-i18n="params.hotkey">快捷键</label>
+        <button
+          class="chip"
+          id="hotkey-btn"
+          type="button"
+          title="点击后按新的组合键"
+          data-i18n-title="params.hotkeyHint"
+        >
+          F9
+        </button>
+        <!-- Reserved height in every state: the params row must not jump when
+             the capture hint comes and goes. -->
+        <span class="field-note" id="hotkey-note"></span>
+      </div>
+    </section>
+
+    <footer class="bar">
+      <span class="clock mono" id="clock">00:00:00</span>
+      <span class="hint" id="hint">0 个源</span>
+      <button class="rec" id="rec-btn" type="button" disabled data-i18n="bar.rec">开始录制</button>
+    </footer>
+
+    <div class="notice hidden" id="notice" role="status">
+      <span class="dot warn" id="notice-dot"></span>
+      <p id="notice-text"></p>
+      <button
+        class="notice-x"
+        id="notice-x"
+        type="button"
+        title="关闭"
+        data-i18n-title="notice.close"
+      >
+        ✕
+      </button>
+    </div>
+
+    <div class="popover hidden" id="picker">
+      <input
+        class="search"
+        id="picker-search"
+        placeholder="搜索窗口或摄像头…"
+        data-i18n-ph="picker.search"
+        autocomplete="off"
+      />
+      <div class="picker-body" id="picker-body"></div>
+    </div>
+
+    <div class="popover settings hidden" id="settings" role="dialog" aria-label="设置"
+         data-i18n-aria="settings.open">
+      <div class="settings-group">
+        <p class="settings-label" data-i18n="settings.language">语言</p>
+        <div class="seg">
+          <button type="button" data-lang="zh" aria-pressed="true">中文</button>
+          <button type="button" data-lang="en" aria-pressed="false">English</button>
+        </div>
+      </div>
+      <div class="settings-group">
+        <p class="settings-label" data-i18n="settings.theme">主题</p>
+        <div class="seg">
+          <button type="button" data-theme-opt="auto" aria-pressed="true" data-i18n="settings.themeAuto">
+            跟随系统
+          </button>
+          <button type="button" data-theme-opt="light" aria-pressed="false" data-i18n="settings.themeLight">
+            浅色
+          </button>
+          <button type="button" data-theme-opt="dark" aria-pressed="false" data-i18n="settings.themeDark">
+            深色
+          </button>
+        </div>
+      </div>
+      <p class="settings-note" data-i18n="settings.note">语言与主题立即生效，并记住到下次启动。</p>
+    </div>
+
+    <script src="shared.js"></script>
+    <script src="i18n.js"></script>
+    <script src="beep.js"></script>
+    <script src="main.js"></script>
+  </body>
+</html>

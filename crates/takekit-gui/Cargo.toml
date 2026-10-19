@@ -1,0 +1,23 @@
+[package]
+name = "takekit-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Desktop control panel for TakeKit"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+takekit-core = { path = "../takekit-core" }
+serde.workspace = true
+serde_json.workspace = true
+rfd = "0.17.2"
+tauri-plugin-global-shortcut = "2"
+
+[dependencies.tauri]
+version = "2"
+features = ["tray-icon"]

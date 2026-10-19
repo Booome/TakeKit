@@ -5,7 +5,9 @@
 [中文说明见下方](#中文)
 
 > ⚠️ Early. The CLI records windows, the desktop and capture devices into a single
-> timestamped directory. The GUI does not exist yet.
+> timestamped directory. A desktop panel (Tauri) lives in `crates/takekit-gui`:
+> it lists what can be recorded, remembers the last setup, and keeps a history of
+> finished takes.
 
 ## Why
 
@@ -21,8 +23,9 @@ frame rate. Separate processes keep every source at its own rate.
 
 ## What it does today
 
-- Sources: a **window** (matched by title substring), the **whole desktop**, and
-  **DirectShow capture devices** (webcams, phones acting as webcams).
+- Sources: a **window** (by window handle — `--window "#12345"` — or by a unique
+  title), the **whole desktop**, and **DirectShow capture devices** (webcams,
+  phones acting as webcams).
 - One timestamped directory per take, with a `take.json` manifest recording the
   encoder, the sources and each file's duration.
 - **Hardware encoding when it works**: NVENC, then QSV, then AMF, falling back to
@@ -78,7 +81,8 @@ MIT. See [LICENSE](LICENSE).
 
 现在能做的：
 
-- 源：**窗口**（按标题片段匹配）、**整个桌面**、**DirectShow 采集设备**（摄像头、当摄像头用的手机）
+- 源：**窗口**（按窗口句柄 `--window "#12345"`，或按唯一标题）、**整个桌面**、**DirectShow 采集设备**（摄像头、当摄像头用的手机）
+- 桌面面板（Tauri，`crates/takekit-gui`）：列可录的源、记住上次的设置、保存录制历史（点一条直接进目录）
 - 每次录制一个时间戳目录，带 `take.json`（编码器、各源、各自时长）
 - **有硬件就用**：NVENC → QSV → AMF → libx264，每个都用一帧试编来验证，避免「驱动说有、实际用不了」
 - 录完报告各源之间的时长差

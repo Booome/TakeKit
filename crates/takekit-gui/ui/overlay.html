@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>TakeKit</title>
+    <link rel="stylesheet" href="overlay.css" />
+    <script>
+      // PROBE-ONLY: proves the HTML asset itself was served and parsed.
+      (function () {
+        var send = function (stage) {
+          try {
+            if (window.__TAURI__ && window.__TAURI__.core) {
+              window.__TAURI__.core.invoke("ui_ping", { stage: stage });
+            }
+          } catch (e) {}
+        };
+        send("overlay-head");
+        window.addEventListener("DOMContentLoaded", function () {
+          send("overlay-dom-ready");
+        });
+        window.addEventListener("error", function (ev) {
+          send("overlay-error:" + (ev.message || "?").slice(0, 120));
+        });
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="veil" class="veil">
+      <div id="big"></div>
+      <div id="list"></div>
+    </div>
+    <script src="shared.js"></script>
+    <script src="beep.js"></script>
+    <script src="overlay.js"></script>
+  </body>
+</html>

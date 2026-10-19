@@ -8,14 +8,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use takekit_core::encoder::{self, Encoder};
+use takekit_core::encoder::Encoder;
 use takekit_core::ffmpeg;
-use takekit_core::source::{Capture, Crop, Engine, Source};
-use takekit_core::take::Take;
-use takekit_core::marks;
+use takekit_core::session::{Session, Settings};
+use takekit_core::source::{Capture, Crop, Engine, Source, WindowItem};
 
 #[derive(Parser)]
-#[command(name = "takekit", version, about = "Record several sources at once into one take")]
+#[command(
+    name = "takekit",
+    version,
+    about = "Record several sources at once into one take"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -94,7 +97,12 @@ impl std::str::FromStr for CropArg {
             .map(|p| p.trim().parse::<u32>().map_err(|e| e.to_string()))
             .collect::<Result<_, _>>()?;
         match parts.as_slice() {
-            [t, b, l, r] => Ok(CropArg(Crop { top: *t, bottom: *b, left: *l, right: *r })),
+            [t, b, l, r] => Ok(CropArg(Crop {
+                top: *t,
+                bottom: *b,
+                left: *l,
+                right: *r,
+            })),
             _ => Err("expected top,bottom,left,right".into()),
         }
     }
@@ -113,11 +121,14 @@ fn main() {
 }
 
 fn list(filter: &str) -> Result<(), String> {
-    let ff = ffmpeg::locate().ok_or("ffmpeg not found on PATH")?;
+    let ff = ffmpeg::locate().ok_or_else(|| takekit_core::session::Error::NoFfmpeg.to_string())?;
 
     println!("windows:");
-    for (title, r) in takekit_core::source::list_windows(filter) {
-        println!("  {title}   [{}x{} at {},{}]", r.w, r.h, r.x, r.y);
+    for w in takekit_core::source::list_windows(filter, None) {
+        println!(
+            "  [{}] {}   [{}x{} at {},{}]",
+            w.hwnd, w.title, w.rect.w, w.rect.h, w.rect.x, w.rect.y
+        );
     }
 
     println!("\ncapture devices:");
@@ -131,78 +142,119 @@ fn list(filter: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn record(args: RecordArgs) -> Result<(), String> {
-    let ff = ffmpeg::locate().ok_or("ffmpeg not found on PATH")?;
-    let probe = ffmpeg::ffprobe(&ff);
+/// What `--window` names: a title substring, or an explicit handle.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowTarget {
+    Handle(isize),
+    Title(String),
+}
 
-    let enc = match args.encoder {
-        EncoderArg::Auto => encoder::pick(&ff),
-        EncoderArg::X264 => Encoder::X264,
-        EncoderArg::Nvenc => Encoder::Nvenc,
-        EncoderArg::Qsv => Encoder::Qsv,
-        EncoderArg::Amf => Encoder::Amf,
-    };
-    if enc.is_hardware() && !encoder::works(&ff, enc) {
-        return Err(format!("{} does not work on this machine", enc.name()));
+fn parse_window_target(spec: &str) -> Result<WindowTarget, String> {
+    match spec.strip_prefix('#') {
+        Some(digits) => digits
+            .trim()
+            .parse::<isize>()
+            .map(WindowTarget::Handle)
+            .map_err(|_| format!("\"{spec}\" is not a window handle")),
+        None => Ok(WindowTarget::Title(spec.to_string())),
     }
+}
 
+fn window_target(spec: &str) -> Result<WindowItem, String> {
+    match parse_window_target(spec)? {
+        WindowTarget::Handle(hwnd) => takekit_core::source::window_by_hwnd(hwnd),
+        WindowTarget::Title(needle) => takekit_core::source::find_window(&needle),
+    }
+}
+
+/// What `--desktop` records: the whole virtual screen, or the region `--crop`
+/// carves out of it. Without this the CLI accepted `--crop` and silently
+/// recorded everything.
+fn desktop_capture(crop: Crop) -> Capture {
+    if crop.is_zero() {
+        Capture::Desktop { rect: None }
+    } else {
+        Capture::Desktop {
+            rect: Some(crop.cropped(takekit_core::source::virtual_screen_rect())),
+        }
+    }
+}
+
+fn record(args: RecordArgs) -> Result<(), String> {
+    // `Duration::from_secs_f64` panics on NaN, infinity and values past
+    // `u64::MAX`; a day is far past any real take, so it doubles as the cap.
+    if !args.duration.is_finite() || !(0.0..=86_400.0).contains(&args.duration) {
+        return Err(format!(
+            "--duration must be between 0 and 86400 seconds (got {})",
+            args.duration
+        ));
+    }
     let mut sources = Vec::new();
-    if let Some(title) = &args.window {
+    if let Some(target) = &args.window {
+        let win = window_target(target)?;
         sources.push(Source::new(
             "win",
-            Capture::Window { title: title.clone(), crop: args.crop.0 },
+            Capture::Window {
+                hwnd: win.hwnd,
+                title: win.title,
+                crop: args.crop.0,
+            },
+            args.fps,
         ));
     } else {
-        sources.push(Source::new("screen", Capture::Desktop { rect: None }));
+        sources.push(Source::new(
+            "screen",
+            desktop_capture(args.crop.0),
+            args.fps,
+        ));
     }
-    if let Some(dev) = &args.cam {
+    if let Some(device) = &args.cam {
         sources.push(Source::new(
             "cam",
-            Capture::Camera { device: dev.clone(), crop: args.crop.0 },
+            Capture::Camera {
+                device: device.clone(),
+                crop: args.crop.0,
+            },
+            args.fps,
         ));
     }
 
-    let probe_rect = sources
-        .iter()
-        .find_map(|s| s.screen_rect())
-        .unwrap_or_else(takekit_core::source::virtual_screen_rect);
-    let engine = if ffmpeg::dda_available(&ff, probe_rect) {
-        Engine::Dda
-    } else {
-        println!("note: Desktop Duplication is unavailable, falling back to gdigrab");
-        Engine::Gdi
+    let settings = Settings {
+        sources,
+        out_root: args.out.clone(),
+        quality: args.quality,
+        encoder: match args.encoder {
+            EncoderArg::Auto => None,
+            EncoderArg::X264 => Some(Encoder::X264),
+            EncoderArg::Nvenc => Some(Encoder::Nvenc),
+            EncoderArg::Qsv => Some(Encoder::Qsv),
+            EncoderArg::Amf => Some(Encoder::Amf),
+        },
+        marks: args.marks,
     };
 
-    let mut take = Take::create(&args.out, enc, args.fps, &sources).map_err(|e| e.to_string())?;
-    println!("take   : {}", take.dir.display());
-    println!("encoder: {}{}", enc.name(), if enc.is_hardware() { " (hardware)" } else { "" });
+    let ids: Vec<String> = settings.sources.iter().map(|s| s.id.clone()).collect();
 
-    // Start the overlay *before* the capture. Creating a new topmost window while a
-    // Desktop Duplication session is live invalidates it (DXGI_ERROR_ACCESS_LOST),
-    // which truncates the recording to under a second.
-    let marks = if args.marks {
-        Some(marks::start().map_err(|e| format!("cannot start MouseShow: {e}"))?)
-    } else {
-        None
-    };
+    let prepared = Session::prepare(settings).map_err(|e| e.to_string())?;
+    let engine = prepared.engine();
+    let encoder = prepared.encoder();
+    if engine == Engine::Gdi {
+        println!("note: capturing with gdigrab, not Desktop Duplication");
+    }
 
-    let mut children = Vec::new();
-    for src in &sources {
-        let (input, extra_filter) = src.input_args(engine)?;
-        let out = take.path_for(&src.id);
-
-        let mut cmd: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
-        cmd.extend(input);
-        if let Some(f) = extra_filter {
-            cmd.extend(["-vf".into(), f]);
+    let rec = prepared.start().map_err(|e| e.to_string())?;
+    println!("take   : {}", rec.dir().display());
+    println!(
+        "encoder: {}{}",
+        encoder.name(),
+        if encoder.is_hardware() {
+            " (hardware)"
+        } else {
+            ""
         }
-        cmd.extend(enc.args(args.quality));
-        cmd.push(out.to_string_lossy().into_owned());
-
-        let log = take.dir.join(format!("{}.log", src.id));
-        println!("  {} -> {}", src.id, out.display());
-        let child = ffmpeg::spawn(&ff, &cmd, &log).map_err(|e| format!("spawn failed: {e}"))?;
-        children.push((src.id.clone(), child, log));
+    );
+    for id in &ids {
+        println!("  {id} -> {}", rec.path_for(id).display());
     }
 
     if args.duration > 0.0 {
@@ -213,32 +265,89 @@ fn record(args: RecordArgs) -> Result<(), String> {
         let _ = std::io::stdin().lock().read_line(&mut line);
     }
 
-    drop(marks);
-
-    for (id, mut child, log) in children {
-        ffmpeg::stop(&mut child);
-        let file = take.path_for(&id);
-        let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        if bytes == 0 {
-            println!("  {id}: FAILED — {}", ffmpeg::tail(&log, 3));
-            continue;
-        }
-        let d = ffmpeg::duration(&probe, &file);
-        take.set_duration(&id, d);
-        match d {
-            Some(d) => println!("  {id}: {d:.3}s  ({:.1} MB)", bytes as f64 / (1024.0 * 1024.0)),
-            None => println!("  {id}: (duration unknown)"),
+    let finished = rec.stop().map_err(|e| e.to_string())?;
+    for outcome in &finished.sources {
+        match (&outcome.error, outcome.seconds) {
+            (Some(err), _) => println!("  {}: FAILED — {}", outcome.id, err),
+            (None, Some(d)) => {
+                println!("  {}: {d:.3}s  ({:.1} MB)", outcome.id, outcome.megabytes())
+            }
+            (None, None) => println!("  {}: (duration unknown)", outcome.id),
         }
     }
-    take.manifest.duration = take.manifest.sources.iter().filter_map(|s| s.duration).reduce(f64::max);
-    take.save_manifest().map_err(|e| e.to_string())?;
-
-    let ds: Vec<Option<f64>> = take.manifest.sources.iter().map(|s| s.duration).collect();
-    if let (Some(a), Some(b)) = (
-        ds.first().and_then(|x| *x),
-        ds.get(1).and_then(|x| *x),
-    ) {
-        println!("duration delta: {:+.3}s", a - b);
+    if finished.sources.len() > 1 {
+        if let Some(d) = finished.delta() {
+            println!("duration delta: {d:+.3}s");
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hash_prefix_names_a_handle() {
+        assert_eq!(
+            parse_window_target("#12345"),
+            Ok(WindowTarget::Handle(12345))
+        );
+    }
+
+    #[test]
+    fn anything_else_is_a_title_substring() {
+        assert_eq!(
+            parse_window_target("Editor"),
+            Ok(WindowTarget::Title("Editor".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_bad_handle_is_rejected_before_looking_anything_up() {
+        let err = parse_window_target("#not-a-number").unwrap_err();
+        assert!(err.contains("is not a window handle"), "{err}");
+    }
+
+    #[test]
+    fn a_crop_takes_four_trimmed_numbers() {
+        let crop: CropArg = " 10, 20 ,30,40 ".parse().unwrap();
+        assert_eq!(crop.0.top, 10);
+        assert_eq!(crop.0.bottom, 20);
+        assert_eq!(crop.0.left, 30);
+        assert_eq!(crop.0.right, 40);
+    }
+
+    #[test]
+    fn a_crop_needs_exactly_four_numbers() {
+        let err = "1,2,3".parse::<CropArg>().unwrap_err();
+        assert!(err.contains("top,bottom,left,right"), "{err}");
+        let err = "1,2,3,4,5".parse::<CropArg>().unwrap_err();
+        assert!(err.contains("top,bottom,left,right"), "{err}");
+    }
+
+    #[test]
+    fn a_crop_rejects_non_numbers() {
+        assert!("1,x,3,4".parse::<CropArg>().is_err());
+    }
+
+    #[test]
+    fn a_desktop_crop_turns_into_a_region() {
+        let crop = Crop {
+            top: 10,
+            bottom: 0,
+            left: 0,
+            right: 0,
+        };
+        match desktop_capture(crop) {
+            Capture::Desktop { rect: Some(r) } => {
+                assert_eq!(r.y, takekit_core::source::virtual_screen_rect().y + 10);
+            }
+            other => panic!("expected a desktop region, got {other:?}"),
+        }
+        assert!(matches!(
+            desktop_capture(Crop::default()),
+            Capture::Desktop { rect: None }
+        ));
+    }
 }

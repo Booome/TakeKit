@@ -1,0 +1,55 @@
+/* TakeKit prompt layer — the veil that covers the screen while a take starts.
+   Palette lives here rather than in style.css: this is a full-screen surface
+   over live desktop content, not a panel, and the two share no layout. */
+
+:root {
+  /* The dark-theme literal from style.css. The veil is always dark (62% black
+     over whatever is on screen), so the light-theme green would be invisible on
+     it — this is the one accent that must not follow the system theme. */
+  --tk-ok: #6ccb5f;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* The window is transparent and the veil is what gets painted. */
+  background: transparent;
+  cursor: default;
+}
+
+.veil {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+}
+
+#big {
+  font: 500 96px/1.1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+#list {
+  font: 400 16px/1.6 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui,
+    sans-serif;
+  color: #fff;
+  opacity: 0.85;
+  text-align: center;
+}
+
+.go {
+  color: var(--tk-ok);
+}

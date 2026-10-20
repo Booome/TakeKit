@@ -19,9 +19,7 @@ use crate::ffmpeg;
 use crate::marks::Marks;
 use crate::source::{Backend, Capture, Engine, Source, is_recordable};
 use crate::take::Take;
-use takekit_media::{
-    CameraCapture, MediaFrame, PixelFormat, ScreenCapture, ScreenTarget, TakeClock, VideoWriter,
-};
+use takekit_media::{CameraCapture, MediaFrame, ScreenCapture, ScreenTarget, TakeClock};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -432,49 +430,22 @@ fn write_frames(
     clock: TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
 ) -> std::result::Result<WriteReport, String> {
-    use std::sync::atomic::Ordering;
-    let mut video: Option<VideoWriter> = None;
-    let mut frames = 0u64;
-    while let Ok(frame) = rx.recv() {
-        if let MediaFrame::Video(frame) = frame {
-            frames += 1;
-            let frame = takekit_media::writer::even_frame(&frame);
-            if video.is_none() {
-                let opened = match frame.format {
-                    PixelFormat::Nv12 => {
-                        VideoWriter::create_nv12(&out, frame.width, frame.height, fps, bitrate)
-                    }
-                    PixelFormat::Bgra => {
-                        VideoWriter::create(&out, frame.width, frame.height, fps, bitrate)
-                    }
-                };
-                video = Some(opened.map_err(|e| e.to_string())?);
-            }
-            video
-                .as_mut()
-                .expect("opened above")
-                .write(&frame)
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    if let Some(w) = video.take() {
-        // How long the last frame was on screen is only known from when the
-        // take stopped; without it a still picture is a zero-second file.
-        // The latched end wins over this thread's own view of the clock: every
-        // channel then covers the same stretch of the take.
-        let end = match end_hint.load(Ordering::SeqCst) {
-            0 => clock.now_100ns(),
-            t => t,
-        };
-        w.finish_at(Some(end)).map_err(|e| e.to_string())?;
-        return Ok(WriteReport {
-            seconds: end as f64 / 10_000_000.0,
-            frames,
-        });
-    }
+    // One writer loop for every caller (`write_stream` is where a frame
+    // channel becomes a file); this path writes every frame the capture
+    // delivered. The CLI's --cfr sampler is the same loop with `KeepLatest`.
+    let report = takekit_media::writer::write_stream(
+        rx,
+        &out,
+        fps,
+        bitrate,
+        clock,
+        end_hint,
+        takekit_media::writer::Sampling::EveryFrame,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(WriteReport {
-        seconds: 0.0,
-        frames: 0,
+        seconds: report.seconds,
+        frames: report.frames,
     })
 }
 

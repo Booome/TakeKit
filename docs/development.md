@@ -199,4 +199,4 @@ js-error:<msg>
 17. **WGC 只在画面变化时交付帧**，且 **MF SinkWriter 走不出真 VFR**（编码器按声明帧率展开重复帧）——详见 `api-recording.md` §4、§7，别再对这条路径抱 VFR 预期。
 18. **serde 枚举上线格式必须显式定死**（2026-10-20 踩坑）：`Backend` 没加 `rename_all = "lowercase"` 时，写出 `"Windows"` 但前端发 `"windows"`，**一个字段解析失败会毒化整个 config**（全部字段静默回退默认，还留下 `config.json.corrupt`）。IPC 枚举一律 lowercase + 往返测试。
 19. **别内联复制 IPC 请求对象**：`start_recording` 的内联 req 曾漏掉 `backend`，serde 默认值让 GUI 悄悄走 ffmpeg 后端、面板却显示"Windows API"。请求体统一用 `sessionParams()` 拼。
-20. **GUI 全链路测试入口**（本地 scratch `tk-gui-drive.py`）：种子 config.json（源/后端/输出目录）→ 起隔离 APPDATA 实例 → 等 `ui:ipc-config-applied:Ns`（Ns=源数，**必须等它**，之前按 F9 会丢 toggle 或 0 源）→ `PostMessage WM_HOTKEY`(id=168) 开停 → 读 journal/take.json + 解码核对。最小化窗口 client 0×0 会被 prepare 拒绝（正确行为），测前先 `ShowWindow SW_RESTORE`。
+20. **GUI 全链路测试入口**（本地 scratch `tk-gui-drive.py`）：种子 config.json（源/后端/输出目录）→ 起隔离 APPDATA 实例 → 等 `ui:ipc-config-applied:Ns`（Ns=源数，**必须等它**，之前按 F9 会丢 toggle 或 0 源）→ `PostMessage WM_HOTKEY`(id=168) 开停 → 读 journal/take.json + 解码核对。最小化窗口**开录前会自动恢复**（2026-10-20 起；WGC 对最小化窗口 0 帧，不恢复=录空气），回归测试应**故意最小化**目标窗口验证自动恢复链路——早先「prepare 拒绝 0×0 客户区」的旧行为已废。

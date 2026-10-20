@@ -178,12 +178,20 @@ impl Config {
     /// Same again for the remembered tab: only the four real panes exist, and
     /// an unknown name lands on the first rather than an empty window.
     pub fn effective_active_tab(&self) -> String {
-        match self.active_tab.as_str() {
-            "history" => "history".to_string(),
-            "log" => "log".to_string(),
-            "settings" => "settings".to_string(),
-            _ => "sources".to_string(),
-        }
+        valid_tab(&self.active_tab).to_string()
+    }
+}
+
+/// The one list of panes that exist. Used on the way in (`set_active_tab`) and
+/// on the way out (`config_get`); the panel just shows what it is handed. The
+/// set once lived in three places at once — an inline match here, one in
+/// main.rs, one in the JS — and a dead copy of this function was the tell.
+pub fn valid_tab(tab: &str) -> &'static str {
+    match tab {
+        "history" => "history",
+        "log" => "log",
+        "settings" => "settings",
+        _ => "sources",
     }
 }
 

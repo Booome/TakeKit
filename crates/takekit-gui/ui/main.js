@@ -1127,7 +1127,9 @@ function applySaved(cfg) {
   applyLanguageUi();
   renderSettingsState();
   // Land on the tab the user last had open (default: the first one).
-  if (TAB_ORDER.includes(cfg.active_tab)) selectTab(cfg.active_tab);
+  // config_get has already run the name through the one valid-tab list
+  // (Rust side); re-checking it here would just be a second copy.
+  selectTab(cfg.active_tab);
   // What the window is actually showing, not what the file said: the probe is
   // the only way to see the applied language, the resolved palette and the
   // chip's text without a screenshot.

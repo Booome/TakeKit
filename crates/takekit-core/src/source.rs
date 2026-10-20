@@ -442,6 +442,50 @@ pub fn push_to_back(hwnd: isize) {
     }
 }
 
+/// What the take did with a window source's placement. The GUI turns this
+/// into its probe text; the policy itself lives here, next to the capture
+/// facts it depends on.
+pub enum PlacementOutcome {
+    /// The user asked for the window in front. `ok` says whether the raise
+    /// worked; `before`/`after` are the Z ranks for the probe line.
+    Raised {
+        ok: bool,
+        before: Option<usize>,
+        after: Option<usize>,
+    },
+    /// It was minimized and is now back. `sunk` says it also went behind the
+    /// user's work.
+    Restored { sunk: bool },
+    /// Already up and no raise was asked for: left exactly as it was.
+    Untouched,
+}
+
+/// Placement policy for a window source at record time.
+///
+/// Un-minimizing is never optional: WGC delivers zero frames for a minimized
+/// window (DWM does not compose it), so a take of one would be empty. Where
+/// the window lands after coming back IS the user's switch (`raise`). Sinking
+/// a restored window is free for the Windows backend (WGC records the window
+/// itself however covered) and wrong for the ffmpeg backend (it records the
+/// screen area and would film the cover) — `sink` is the caller saying "this
+/// backend ignores Z-order".
+pub fn place_for_capture(hwnd: isize, raise: bool, sink: bool) -> PlacementOutcome {
+    if raise {
+        let before = z_rank_of(hwnd);
+        let ok = bring_to_front(hwnd);
+        let after = z_rank_of(hwnd);
+        PlacementOutcome::Raised { ok, before, after }
+    } else if unminimize(hwnd) {
+        let sunk = sink;
+        if sunk {
+            push_to_back(hwnd);
+        }
+        PlacementOutcome::Restored { sunk }
+    } else {
+        PlacementOutcome::Untouched
+    }
+}
+
 /// Undo a minimize so the window has something to capture again.
 ///
 /// `ShowWindow(SW_RESTORE)` would do it in one line; `SW_SHOWNOACTIVATE` says
@@ -724,6 +768,11 @@ fn client_rect(hwnd: HWND) -> ScreenRect {
 
 #[cfg(test)]
 mod tests {
+    // SAFETY note for the whole module: every `unsafe` here is a trivial
+    // Win32 state query (IsIconic / IsWindowVisible / client size) on a
+    // window this test created, or the test window's own message pump. No
+    // pointers, no aliasing, nothing that can dangle.
+
     use super::*;
     use std::sync::Mutex;
     use windows::Win32::Foundation::{HINSTANCE, LRESULT, WPARAM};
@@ -896,6 +945,15 @@ mod tests {
         // status paths must be able to call them without a window to move.
         assert!(!unminimize(0));
         push_to_back(0);
+        // And the policy entry point is just as inert on a dead handle.
+        assert!(matches!(
+            place_for_capture(0, true, true),
+            PlacementOutcome::Raised { ok: false, .. }
+        ));
+        assert!(matches!(
+            place_for_capture(0, false, true),
+            PlacementOutcome::Untouched
+        ));
     }
 
     #[test]

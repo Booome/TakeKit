@@ -120,22 +120,22 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
     // the cover), so that backend keeps whatever placement the restore gave it.
     for source in &req.sources {
         if let Capture::Window { hwnd, title, .. } = &source.capture {
-            if req.raise_sources {
-                let before = takekit_core::source::z_rank_of(*hwnd);
-                let raised = takekit_core::source::bring_to_front(*hwnd);
-                let after = takekit_core::source::z_rank_of(*hwnd);
-                crate::probe(&format!(
-                    "front:{title}={} rank {before:?}->{after:?}",
-                    u8::from(raised)
-                ));
-            } else if takekit_core::source::unminimize(*hwnd) {
-                if req.backend == Backend::Windows {
-                    takekit_core::source::push_to_back(*hwnd);
+            // The policy lives in core (it turns on capture facts, not UI
+            // ones); the probe text is the panel's business. `sink` tells
+            // core whether this backend ignores Z-order (WGC does, ffmpeg
+            // does not).
+            let sink = req.backend == Backend::Windows;
+            match takekit_core::source::place_for_capture(*hwnd, req.raise_sources, sink) {
+                takekit_core::source::PlacementOutcome::Raised { ok, before, after } => {
+                    crate::probe(&format!(
+                        "front:{title}={} rank {before:?}->{after:?}",
+                        u8::from(ok)
+                    ));
                 }
-                crate::probe(&format!(
-                    "restored:{title} sink={}",
-                    u8::from(req.backend == Backend::Windows)
-                ));
+                takekit_core::source::PlacementOutcome::Restored { sunk } => {
+                    crate::probe(&format!("restored:{title} sink={}", u8::from(sunk)));
+                }
+                takekit_core::source::PlacementOutcome::Untouched => {}
             }
         }
     }

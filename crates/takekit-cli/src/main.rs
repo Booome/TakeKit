@@ -14,7 +14,7 @@ use takekit_core::session::{Session, Settings};
 use takekit_core::source::{Backend, Capture, Crop, Engine, Source, WindowItem};
 use takekit_media::{
     AudioWriter, CameraCapture, DeviceList, MediaFrame, MicCapture, ScreenCapture, ScreenTarget,
-    TakeClock, VideoFrame, VideoWriter, writer,
+    TakeClock, writer,
 };
 
 #[derive(Parser)]
@@ -411,68 +411,16 @@ fn media(args: MediaArgs) -> Result<(), String> {
         let cfr = args.cfr;
         let writer_end = end_hint.clone();
         let handle = thread::spawn(move || -> Result<(String, u64), String> {
-            let mut video: Option<VideoWriter> = None;
-            let mut delivered = 0u64;
-
-            if cfr {
-                let interval = Duration::from_secs_f64(1.0 / fps as f64);
-                let mut latest: Option<VideoFrame> = None;
-                let mut due_slot = 0u64;
-                loop {
-                    match rx.recv_timeout(interval) {
-                        Ok(MediaFrame::Video(frame)) => {
-                            delivered += 1;
-                            latest = Some(writer::even_frame(&frame));
-                        }
-                        Ok(MediaFrame::Audio(_)) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    let end_slot = (clock.now_100ns() as u64 * fps as u64) / 10_000_000;
-                    while due_slot < end_slot {
-                        if let Some(frame) = latest.as_ref() {
-                            if video.is_none() {
-                                video = Some(open_video(&path, frame, fps, bitrate)?);
-                            }
-                            let mut out = frame.clone();
-                            out.time = (due_slot as i64 * 10_000_000) / i64::from(fps);
-                            video
-                                .as_mut()
-                                .expect("just opened")
-                                .write(&out)
-                                .map_err(string_of)?;
-                        }
-                        due_slot += 1;
-                    }
-                }
+            // The one writer loop again (`write_stream`): --cfr picks the
+            // keep-latest sampler, everything else writes what arrives.
+            let sampling = if cfr {
+                writer::Sampling::KeepLatest
             } else {
-                while let Ok(frame) = rx.recv() {
-                    if let MediaFrame::Video(frame) = frame {
-                        delivered += 1;
-                        let frame = writer::even_frame(&frame);
-                        if video.is_none() {
-                            video = Some(open_video(&path, &frame, fps, bitrate)?);
-                        }
-                        video
-                            .as_mut()
-                            .expect("just opened")
-                            .write(&frame)
-                            .map_err(string_of)?;
-                    }
-                }
-            }
-            if let Some(w) = video.take() {
-                // How long the last frame was on screen is something only the
-                // caller knows: nothing arrives after it. Without this a take of
-                // a still screen is a zero-second file. The latched end wins so
-                // all channels stop together.
-                let end = match writer_end.load(std::sync::atomic::Ordering::SeqCst) {
-                    0 => clock.now_100ns(),
-                    t => t,
-                };
-                w.finish_at(Some(end)).map_err(string_of)?;
-            }
-            Ok((name, delivered))
+                writer::Sampling::EveryFrame
+            };
+            let report = writer::write_stream(rx, &path, fps, bitrate, clock, writer_end, sampling)
+                .map_err(string_of)?;
+            Ok((name, report.frames))
         });
         (tx, handle)
     };
@@ -593,22 +541,6 @@ fn media(args: MediaArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn open_video(
-    path: &std::path::Path,
-    frame: &VideoFrame,
-    fps: u32,
-    bitrate: u32,
-) -> Result<VideoWriter, String> {
-    let out = if matches!(frame.format, takekit_media::PixelFormat::Nv12) {
-        VideoWriter::create_nv12(path, frame.width, frame.height, fps, bitrate)
-    } else {
-        VideoWriter::create(path, frame.width, frame.height, fps, bitrate)
-    };
-    out.map_err(string_of)
-}
-
-/// A window handle, in decimal or with a `0x` prefix — `media --list` prints
-/// hexadecimal, so typing back what it printed has to work.
 fn parse_hwnd(s: &str) -> Result<isize, String> {
     let (digits, radix) = match s
         .trim()

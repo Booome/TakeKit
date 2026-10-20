@@ -411,8 +411,11 @@ t=+2.5s  遮罩关闭，主窗口显示，托盘图标转灰
 | `sources` | 源清单（id / capture / fps / quality） | 空列表 |
 | `out_root` | 输出目录 | 用 `%TEMP%` |
 | `encoder` | 视频编码 | 自动 |
+| `backend` | 采集方式（`"windows"` / `"ffmpeg"`，**线上格式小写**） | `"ffmpeg"`（serde default） |
 | `marks` | 鼠标效果 | `true` |
 | `raise_sources` | 窗口置前（录制前把窗口源移到最前） | `false`（**默认关**，2026-10-20 用户定）。最小化窗口无论开关都会先恢复（WGC 对最小化窗口 0 帧），关时压到最底不遮用户 |
+| `language` | 界面语言（`"zh"` / `"en"`） | `zh`（非法值同样回落） |
+| `theme` | 主题（`"auto"` / `"light"` / `"dark"`） | `auto`（非法值同样回落） |
 | `active_tab` | 记住上次打开的页签（sources/history/log/settings），重启落回 | `"sources"`（2026-10-20 加，未知值回落 sources） |
 | `window_pos` | 面板位置（**物理像素**） | 由系统摆 |
 

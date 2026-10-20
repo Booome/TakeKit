@@ -125,6 +125,17 @@ impl VideoWriter {
     /// knowable once the next frame arrives, which is why a frame is kept back
     /// rather than written straight away.
     pub fn write(&mut self, frame: &VideoFrame) -> Result<()> {
+        self.write_timed(frame, frame.time)
+    }
+
+    /// Write the same picture at a chosen time on the take's timeline. The
+    /// keep-latest sampler stamps one buffer into several fps slots this way
+    /// instead of cloning the pixels just to change the timestamp.
+    pub fn write_at(&mut self, frame: &VideoFrame, time: i64) -> Result<()> {
+        self.write_timed(frame, time)
+    }
+
+    fn write_timed(&mut self, frame: &VideoFrame, time: i64) -> Result<()> {
         let mut bytes = std::mem::take(&mut self.spare);
         copy_frame(&mut bytes, frame, self.flip);
 
@@ -133,16 +144,16 @@ impl VideoWriter {
         // the take for the files to line up. The MP4 sink rebases every track
         // to its first sample, so the gap is filled with a black sample at
         // time 0 and the real frames keep their offsets behind it.
-        if self.pending.is_none() && frame.time > 0 {
+        if self.pending.is_none() && time > 0 {
             let lead = vec![0u8; bytes.len()];
             // SAFETY: owned zeros, as below.
             unsafe {
-                write_sample(&self.writer, self.stream, &lead, 0, frame.time)?;
+                write_sample(&self.writer, self.stream, &lead, 0, time)?;
             }
         }
 
         if let Some(previous) = self.pending.take() {
-            let duration = (frame.time - previous.time).max(0);
+            let duration = (time - previous.time).max(0);
             // SAFETY: `previous.bytes` is owned here and the writer copies what
             // it needs before `WriteSample` returns.
             unsafe {
@@ -157,10 +168,7 @@ impl VideoWriter {
             self.last_duration = duration;
             self.spare = previous.bytes;
         }
-        self.pending = Some(Pending {
-            time: frame.time,
-            bytes,
-        });
+        self.pending = Some(Pending { time, bytes });
         Ok(())
     }
 
@@ -314,11 +322,16 @@ unsafe fn write_sample(
 /// height cannot be encoded at all — and a monitor or a window with an odd
 /// size is entirely ordinary. The far row and column are dropped rather than
 /// scaled, which is what the ffmpeg backend does too.
-pub fn even_frame(frame: &VideoFrame) -> VideoFrame {
+///
+/// Takes the frame by value: on the common path (already even) it hands the
+/// same buffer back, where a `&VideoFrame` signature meant cloning the whole
+/// pixel buffer every frame — ~8 MB a frame at 1080p BGRA, just to feed the
+/// encoder.
+pub fn even_frame(frame: VideoFrame) -> VideoFrame {
     let width = frame.width & !1;
     let height = frame.height & !1;
     if width == frame.width && height == frame.height {
-        return frame.clone();
+        return frame;
     }
     let bytes_per_pixel = match frame.format {
         PixelFormat::Bgra => 4usize,
@@ -425,6 +438,132 @@ fn aac_type(sample_rate: u32, channels: u32, bitrate_kbps: u32) -> Result<IMFMed
     }
 }
 
+/// How one source's frames reach the encoder.
+pub enum Sampling {
+    /// Every frame as it arrives, with the gaps it really had (the take's own
+    /// timeline). The encoder expands a held frame across a pause either way;
+    /// this just never skips a fresh picture.
+    EveryFrame,
+    /// Fixed rate: each 1/fps slot on the clock gets the latest picture and
+    /// older ones are dropped rather than queued — same frames out, different
+    /// sampling in (`takekit media --cfr`).
+    KeepLatest,
+}
+
+/// What one source's writer saw. `frames` is what the capture actually
+/// delivered — the output has `duration x fps` slots either way, because the
+/// encoder holds a frame across a pause. The difference between the two is how
+/// much of the take is a held picture rather than a fresh one, which is the
+/// only visible form a dropped capture update can take.
+pub struct StreamReport {
+    pub seconds: f64,
+    pub frames: u64,
+}
+
+/// Drain one source's frame channel into its own MP4. The writer opens on the
+/// first frame (that is when the real dimensions are known) and closes with
+/// `end_hint` — latched when the take stops — so every channel covers the same
+/// stretch of the take.
+///
+/// This is the one place that turns a frame channel into a file: the session
+/// writes takes with it and the CLI's device harness samples with it. A second
+/// copy of this loop once cost a fix two call sites (`even_frame`).
+pub fn write_stream(
+    rx: std::sync::mpsc::Receiver<crate::frame::MediaFrame>,
+    out: &std::path::Path,
+    fps: u32,
+    bitrate: u32,
+    clock: crate::clock::TakeClock,
+    end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    sampling: Sampling,
+) -> Result<StreamReport> {
+    use crate::frame::MediaFrame;
+    use std::sync::atomic::Ordering;
+
+    let fps = fps.max(1);
+    let interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    let mut video: Option<VideoWriter> = None;
+    let mut frames = 0u64;
+    let mut latest: Option<VideoFrame> = None;
+    let mut due_slot = 0u64;
+
+    loop {
+        match sampling {
+            Sampling::EveryFrame => match rx.recv() {
+                Ok(MediaFrame::Video(frame)) => {
+                    frames += 1;
+                    let frame = even_frame(frame);
+                    if video.is_none() {
+                        video = Some(open_for(&frame, out, fps, bitrate)?);
+                    }
+                    video.as_mut().expect("opened above").write(&frame)?;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            Sampling::KeepLatest => {
+                match rx.recv_timeout(interval) {
+                    Ok(MediaFrame::Video(frame)) => {
+                        frames += 1;
+                        latest = Some(even_frame(frame));
+                    }
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // Advance to "now" one slot at a time; each slot gets the held
+                // picture stamped to the slot, not to its capture time.
+                let end_slot = (clock.now_100ns() as u64 * fps as u64) / 10_000_000;
+                while due_slot < end_slot {
+                    if let Some(frame) = latest.as_ref() {
+                        if video.is_none() {
+                            video = Some(open_for(frame, out, fps, bitrate)?);
+                        }
+                        let slot_time = (due_slot as i64 * 10_000_000) / i64::from(fps);
+                        video
+                            .as_mut()
+                            .expect("opened above")
+                            .write_at(frame, slot_time)?;
+                    }
+                    due_slot += 1;
+                }
+            }
+        }
+    }
+
+    let Some(w) = video.take() else {
+        return Ok(StreamReport {
+            seconds: 0.0,
+            frames,
+        });
+    };
+    // How long the last frame was on screen is something only the caller
+    // knows: nothing arrives after it. Without this a take of a still screen
+    // is a zero-second file. The latched end wins so all channels stop
+    // together.
+    let end = match end_hint.load(Ordering::SeqCst) {
+        0 => clock.now_100ns(),
+        t => t,
+    };
+    w.finish_at(Some(end))?;
+    Ok(StreamReport {
+        seconds: end as f64 / 10_000_000.0,
+        frames,
+    })
+}
+
+fn open_for(
+    frame: &VideoFrame,
+    out: &std::path::Path,
+    fps: u32,
+    bitrate: u32,
+) -> Result<VideoWriter> {
+    match frame.format {
+        PixelFormat::Nv12 => VideoWriter::create_nv12(out, frame.width, frame.height, fps, bitrate),
+        PixelFormat::Bgra => VideoWriter::create(out, frame.width, frame.height, fps, bitrate),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +605,7 @@ mod tests {
             ],
             time: 0,
         };
-        let trimmed = even_frame(&frame);
+        let trimmed = even_frame(frame);
         assert_eq!((trimmed.width, trimmed.height), (4, 2));
         assert_eq!(&trimmed.data[..8], &[1, 2, 3, 4, 6, 7, 8, 9]);
         assert_eq!(trimmed.data.len(), 12, "eight luma bytes plus four chroma");

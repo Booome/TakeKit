@@ -433,7 +433,11 @@ async fn set_countdown(secs: u8) -> Result<(), String> {
 /// What the panel starts from: the settings from last time.
 #[tauri::command]
 fn config_get() -> config::Config {
-    config::Config::load()
+    let mut cfg = config::Config::load();
+    // Sanitized here rather than in the panel: `valid_tab` is the only list of
+    // real panes, and the JS trusts what it is handed instead of re-deriving.
+    cfg.active_tab = cfg.effective_active_tab();
+    cfg
 }
 
 /// The language and palette in force, as the file records them.
@@ -456,12 +460,7 @@ fn ui_settings() -> SettingsInfo {
 #[tauri::command]
 async fn set_active_tab(tab: String) -> Result<(), String> {
     // The file is hand-editable: only the four real panes store as themselves.
-    let tab = match tab.as_str() {
-        "history" => "history",
-        "log" => "log",
-        "settings" => "settings",
-        _ => "sources",
-    };
+    let tab = config::valid_tab(&tab);
     tauri::async_runtime::spawn_blocking(move || {
         config::Config::update(|cfg| cfg.active_tab = tab.to_string())
     })

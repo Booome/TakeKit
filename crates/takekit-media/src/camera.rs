@@ -19,6 +19,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
+use crate::clock::TakeClock;
 use crate::devices::activate;
 use crate::error::{MediaError, Result};
 use crate::frame::{MediaFrame, PixelFormat, VideoFrame};
@@ -47,7 +48,7 @@ pub struct CameraCapture {
 
 impl CameraCapture {
     /// Start capturing `link` into `out`.
-    pub fn start(link: &str, fps: u32, out: Sender<MediaFrame>) -> Result<Self> {
+    pub fn start(link: &str, fps: u32, out: Sender<MediaFrame>, clock: TakeClock) -> Result<Self> {
         let (ready, opened) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
@@ -61,7 +62,7 @@ impl CameraCapture {
         let thread = std::thread::spawn(move || match open(&link, fps) {
             Ok((reader, width, height)) => {
                 let _ = ready.send(Ok(CameraFormat { width, height, fps }));
-                if let Err(e) = pump(&reader, width, height, thread_stop, out)
+                if let Err(e) = pump(&reader, width, height, thread_stop, out, clock)
                     && let Ok(mut slot) = thread_failure.lock()
                 {
                     *slot = Some(e.to_string());
@@ -178,8 +179,11 @@ fn pump(
     height: u32,
     stop: Arc<AtomicBool>,
     out: Sender<MediaFrame>,
+    clock: TakeClock,
 ) -> Result<()> {
-    let mut first: Option<i64> = None;
+    // Bridged once, at the first sample: the camera's clock counts from its
+    // own origin and knows nothing about the take's.
+    let mut anchor: Option<i64> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -187,7 +191,7 @@ fn pump(
         let Some((sample, time)) = next_sample(reader, VIDEO_STREAM)? else {
             return Ok(());
         };
-        let start = *first.get_or_insert(time);
+        let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(time));
         let data = sample_bytes(&sample)?;
         if out
             .send(MediaFrame::Video(VideoFrame {
@@ -195,7 +199,7 @@ fn pump(
                 height,
                 format: PixelFormat::Nv12,
                 data,
-                time: time - start,
+                time: time - anchor,
             }))
             .is_err()
         {

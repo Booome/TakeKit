@@ -12,6 +12,7 @@ authors.workspace = true
 mouseshow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+takekit-media = { path = "../takekit-media" }
 
 [dependencies.windows]
 version = "0.62.2"

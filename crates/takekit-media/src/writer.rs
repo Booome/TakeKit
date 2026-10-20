@@ -2,13 +2,26 @@
 //!
 //! The alternative to handing frames to an ffmpeg child is to hand them to the
 //! OS, and that is what makes the capture timestamps worth having: a sample
-//! carries the time it was captured, so a take can be variable-frame-rate
-//! without drifting, and two sources written by the same process share one
-//! clock instead of each child guessing from when it happened to start.
+//! carries when it was captured, and two sources written by the same process
+//! share one clock instead of each child guessing from when it happened to
+//! start.
 //!
 //! Media Foundation inserts the encoder itself: the sink is told it is writing
 //! H.264 into an MP4 and is given uncompressed frames, and it loads the
 //! encoder transform in between.
+//!
+//! One measured property of that pipeline governs the rest of this module: the
+//! encoder runs at a fixed frame rate and expands every sample's duration into
+//! that many repeated frames. Sample times never reach the container as-is
+//! (the sink rebases the track to its first sample), but *placement* does: a
+//! sample written for [1.0s, 1.5s) comes out as frames 10..14 at 10 fps. That
+//! is what lets several files line up frame for frame — the shared origin is
+//! carried by a lead-in sample (black video, silent audio) filling [0, first
+//! frame), and everything after it lands where the take's clock put it.
+//!
+//! In other words this path cannot produce true variable-frame-rate files, and
+//! does not need to: a held frame is worth the same as a repeated one, and the
+//! repeats are what makes the files alignable.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -42,6 +55,8 @@ pub struct VideoWriter {
     flip: bool,
     /// The frame waiting for its duration. It cannot be written as it arrives:
     /// how long a frame was on screen is only known once the next one shows up.
+    /// The duration it is finally given is the gap to the next frame — the
+    /// truth — which the encoder then expands into repeated CFR frames.
     pending: Option<Pending>,
     /// The buffer the previous frame owned, kept so a take recycles one
     /// allocation instead of making one per frame.
@@ -113,6 +128,19 @@ impl VideoWriter {
         let mut bytes = std::mem::take(&mut self.spare);
         copy_frame(&mut bytes, frame, self.flip);
 
+        // The first frame arrives when its capture woke up, not when the take
+        // started — a camera opening 300ms late still has to land 300ms into
+        // the take for the files to line up. The MP4 sink rebases every track
+        // to its first sample, so the gap is filled with a black sample at
+        // time 0 and the real frames keep their offsets behind it.
+        if self.pending.is_none() && frame.time > 0 {
+            let lead = vec![0u8; bytes.len()];
+            // SAFETY: owned zeros, as below.
+            unsafe {
+                write_sample(&self.writer, self.stream, &lead, 0, frame.time)?;
+            }
+        }
+
         if let Some(previous) = self.pending.take() {
             let duration = (frame.time - previous.time).max(0);
             // SAFETY: `previous.bytes` is owned here and the writer copies what
@@ -137,8 +165,29 @@ impl VideoWriter {
     }
 
     /// Close the file. A take without this is not playable.
-    pub fn finish(mut self) -> Result<()> {
+    ///
+    /// The frame still held back is written with the same duration as the gap
+    /// before it, which is a guess: nothing ever arrived to say how long it
+    /// lasted. A caller that knows when the take was stopped should use
+    /// `finish_at` instead — with a screen that never changed, the guess is
+    /// zero and the file would be zero seconds long.
+    pub fn finish(self) -> Result<()> {
+        self.finish_at(None)
+    }
+
+    /// Close the file, holding the last frame until `end`.
+    ///
+    /// `end` is when the capture was told to stop, in the same 100 ns units as
+    /// a frame's time. It is what makes a still picture a five-second file
+    /// rather than a zero-second one: under variable frame rate a screen that
+    /// did not change produced one frame, and only the stop time says how long
+    /// that frame was on screen.
+    pub fn finish_at(mut self, end: Option<i64>) -> Result<()> {
         if let Some(last) = self.pending.take() {
+            let duration = match end {
+                Some(end) => (end - last.time).max(self.last_duration),
+                None => self.last_duration,
+            };
             // SAFETY: owned buffer, as above.
             unsafe {
                 write_sample(
@@ -146,7 +195,7 @@ impl VideoWriter {
                     self.stream,
                     &last.bytes,
                     last.time,
-                    self.last_duration,
+                    duration.max(0),
                 )?;
             }
         }
@@ -163,6 +212,9 @@ pub struct AudioWriter {
     bytes_per_second: u32,
     /// Where the next chunk starts.
     next: Option<i64>,
+    /// Whether any chunk has been written yet, so the lead-in silence the
+    /// video writer's black sample plays against is written exactly once.
+    started: bool,
 }
 
 impl AudioWriter {
@@ -180,6 +232,7 @@ impl AudioWriter {
                 stream,
                 bytes_per_second: sample_rate * channels * 2,
                 next: None,
+                started: false,
             })
         }
     }
@@ -196,6 +249,18 @@ impl AudioWriter {
         }
         let duration = duration_of(chunk.data.len(), self.bytes_per_second);
         let start = self.next.unwrap_or(chunk.time);
+        if !self.started && start > 0 {
+            // The microphone woke up after the take did: fill the gap with
+            // silence so the file's timeline keeps the shared origin, exactly
+            // like the video writer's black lead-in.
+            let silence =
+                vec![0u8; (start as u128 * self.bytes_per_second as u128 / 10_000_000) as usize];
+            // SAFETY: owned zeros, as below.
+            unsafe {
+                write_sample(&self.writer, self.stream, &silence, 0, start)?;
+            }
+        }
+        self.started = true;
         // SAFETY: the chunk is borrowed for the duration of the call, which
         // copies it into the sample's own buffer.
         unsafe {
@@ -420,5 +485,162 @@ mod tests {
             0,
             "an unknown rate must not divide by zero"
         );
+    }
+
+    /// Where each frame's content lands on the take's timeline.
+    ///
+    /// The MP4 sink runs the H.264 encoder at a fixed frame rate and expands
+    /// every sample's duration into that many repeated frames — input sample
+    /// times never reach the container as-is. What does survive is *placement*:
+    /// a frame written for [1.0s, 1.5s) must appear as output frames 10..14
+    /// at 10 fps. Multi-source sync is exactly this placement, so this test
+    /// decodes the file and checks the picture, not the timestamps.
+    #[test]
+    fn frames_land_where_the_take_timeline_puts_them() {
+        let dir = std::env::temp_dir().join("takekit-writer-places");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.mp4");
+
+        let mut w = VideoWriter::create(&path, 64, 64, 10, 2_000).unwrap();
+        // White from 1.0s, grey from 1.5s, and nothing before 1.0s — the
+        // writer owes a black lead-in for that gap on its own.
+        for (t, level) in [(10_000_000i64, 255u8), (15_000_000, 64)] {
+            let frame = VideoFrame {
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra,
+                data: vec![level; 64 * 64 * 4],
+                time: t,
+            };
+            w.write(&frame).unwrap();
+        }
+        w.finish_at(Some(25_000_000)).unwrap();
+
+        // Decode to raw grey and read the frames back.
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg is on the PATH of a machine that can build this crate");
+        let frame_len = 64 * 64;
+        let frames: Vec<&[u8]> = out.stdout.chunks_exact(frame_len).collect();
+        assert_eq!(frames.len(), 25, "2.5s at 10fps is 25 output frames");
+
+        let level_of = |i: usize| -> u32 {
+            frames[i].iter().map(|&b| b as u32).sum::<u32>() / frame_len as u32
+        };
+        // [0, 1.0s) black, [1.0s, 1.5s) white, [1.5s, 2.5s) grey — ten, five
+        // and ten frames. If the lead-in were missing, white would start at
+        // frame 0 and every file of a multi-source take would slide against
+        // the others by however late its capture woke up.
+        assert_eq!(level_of(0), 0, "frames 0..10 are the lead-in");
+        assert_eq!(level_of(9), 0);
+        assert_eq!(level_of(10), 255, "white starts exactly at 1.0s");
+        assert_eq!(level_of(14), 255);
+        assert_eq!(level_of(15), 64, "grey starts exactly at 1.5s");
+        assert_eq!(level_of(24), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where content lands when the capture delivered frames between slots.
+    ///
+    /// Real captures arrive whenever they arrive: 37ms here, 51ms there. Each
+    /// sample's duration is expanded into `round(duration x fps)` output
+    /// frames, so if that rounding accumulated, a long take's picture would
+    /// drift against its own timeline and against the other channels. Content
+    /// must land within half a slot of where it was captured, all the way to
+    /// the end.
+    #[test]
+    fn between_slot_capture_times_do_not_drift() {
+        let dir = std::env::temp_dir().join("takekit-writer-drift");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.mp4");
+
+        // 30 fps, frames at 0.37s / 1.02s / 1.53s / 1.97s — none on a slot
+        // boundary (slots are 33.3ms). Grey levels 255 / 192 / 128 / 64.
+        let mut w = VideoWriter::create(&path, 64, 64, 30, 2_000).unwrap();
+        for (t, level) in [
+            (3_700_000i64, 255u8),
+            (10_200_000, 192),
+            (15_300_000, 128),
+            (19_700_000, 64),
+        ] {
+            let frame = VideoFrame {
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra,
+                data: vec![level; 64 * 64 * 4],
+                time: t,
+            };
+            w.write(&frame).unwrap();
+        }
+        w.finish_at(Some(24_000_000)).unwrap();
+
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                path.to_str().unwrap(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg is on the PATH of a machine that can build this crate");
+        let frame_len = 64 * 64;
+        let frames: Vec<&[u8]> = out.stdout.chunks_exact(frame_len).collect();
+        // 2.4s at 30fps is 72 slots. The tail may round +/-1; the content
+        // positions are what must not drift.
+        assert!(
+            (70..=73).contains(&frames.len()),
+            "72 slots expected, got {}",
+            frames.len()
+        );
+
+        let level_of = |i: usize| -> u32 {
+            frames[i].iter().map(|&b| b as u32).sum::<u32>() / frame_len as u32
+        };
+        // The slot for time t is round(t x fps): 0.37s -> slot 11, 1.02s ->
+        // slot 31, 1.53s -> slot 46, 1.97s -> slot 59. Each must land within
+        // one slot of that; anything more is the expansion rounding piling up.
+        // H.264 is lossy: a flat grey comes back within a couple of steps,
+        // never exactly. Nearest level within tolerance counts as a hit.
+        let where_level = |level: u32| -> usize {
+            frames
+                .iter()
+                .position(|f| {
+                    let v = f.iter().map(|&b| b as u32).sum::<u32>() / frame_len as u32;
+                    v.abs_diff(level) <= 4
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let first = |level: u32, expected: usize, name: &str| {
+            let at = where_level(level);
+            assert!(
+                at.abs_diff(expected) <= 1,
+                "{name} at slot {at}, expected within 1 of {expected} — expansion rounding drifted"
+            );
+        };
+        first(255, 11, "frame at 0.37s");
+        first(192, 31, "frame at 1.02s");
+        first(128, 46, "frame at 1.53s");
+        first(64, 59, "frame at 1.97s");
+        // And nothing before its slot: the lead-in really is black.
+        assert_eq!(level_of(0), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

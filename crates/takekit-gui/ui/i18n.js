@@ -16,13 +16,12 @@
 const I18N = {
   zh: {
     "tabs.aria": "面板",
-    "tab.sources": "源",
+    "tab.sources": "录制",
     "tab.history": "历史",
     "tab.log": "日志",
+    "tab.settings": "设置",
 
     "section.sources": "源",
-    "section.history": "历史",
-    "section.log": "日志",
 
     "sources.add": "添加源",
     "sources.emptyTitle": "还没有源",
@@ -38,14 +37,18 @@ const I18N = {
 
     "params.out": "输出目录",
     "params.outPick": "选择输出目录",
+    "params.backend": "采集方式",
+    "params.backendWindows": "Windows API（后台窗口可录）",
+    "params.backendFfmpeg": "ffmpeg",
     "params.encoder": "视频编码",
     "params.encoderAuto": "自动",
     "params.encoderAutoWith": "自动（{name}）",
     "params.marks": "鼠标效果",
     "params.marksHint": "点击涟漪与拖动轨迹叠加到录制画面上",
     "params.countdown": "倒计时",
-    "params.countdownHint":
-      "开始录制前的全屏倒计时。关掉后按 F9 直接开录，但开头 0.3–0.5 秒的动作不会进画面。",
+    "params.raise": "窗口置前",
+    "params.raiseHint": "最小化的窗口开录时都会自动恢复显示",
+    "params.countdownHint": "关掉后按 F9 直接开录，开头 0.3–0.5 秒不进画面",
     "params.hotkey": "快捷键",
     "params.hotkeyHint": "点击后按新的组合键",
 
@@ -67,6 +70,7 @@ const I18N = {
     "picker.desktopAll": "整个桌面",
     "picker.allDisplays": "全部显示器",
     "picker.none": "没有匹配项",
+    "picker.bgCapable": "被遮挡时仍可录",
     "picker.added": "已添加 · {meta}",
     "picker.addedTitle": "已在清单中",
 
@@ -93,13 +97,15 @@ const I18N = {
     "notice.noFfmpegDetail": "安装 ffmpeg 并加入 PATH，重启面板后生效。",
     "notice.takePartial": "录制完成，但 {n} 路没有录到（已保存 {secs} · {mb} MB）",
 
-    "settings.open": "设置",
+    "settings.interface": "界面",
+    "settings.capture": "采集与编码",
+    "settings.recording": "录制行为",
     "settings.language": "语言",
     "settings.theme": "主题",
     "settings.themeAuto": "跟随系统",
     "settings.themeLight": "浅色",
     "settings.themeDark": "深色",
-    "settings.note": "语言与主题立即生效，并记住到下次启动。",
+    "settings.note": "各项设置立即生效，并记住到下次启动。",
 
     "tray.stateIdle": "未在录制",
     "tray.stateRecording": "录制中",
@@ -129,13 +135,12 @@ const I18N = {
 
   en: {
     "tabs.aria": "Panel",
-    "tab.sources": "Sources",
+    "tab.sources": "Record",
     "tab.history": "History",
     "tab.log": "Log",
+    "tab.settings": "Settings",
 
     "section.sources": "Sources",
-    "section.history": "History",
-    "section.log": "Log",
 
     "sources.add": "Add source",
     "sources.emptyTitle": "No sources yet",
@@ -152,14 +157,18 @@ const I18N = {
 
     "params.out": "Output folder",
     "params.outPick": "Choose output folder",
+    "params.backend": "Capture method",
+    "params.backendWindows": "Windows API (records background windows)",
+    "params.backendFfmpeg": "ffmpeg",
     "params.encoder": "Video encoder",
     "params.encoderAuto": "Auto",
     "params.encoderAutoWith": "Auto ({name})",
     "params.marks": "Mouse effects",
     "params.marksHint": "Draw clicks and drags onto the recording",
     "params.countdown": "Countdown",
-    "params.countdownHint":
-      "Full-screen countdown before a take. Off: F9 records immediately, and the first 0.3–0.5 s are not in the file.",
+    "params.raise": "Raise windows",
+    "params.raiseHint": "Minimized windows are always brought back at record time",
+    "params.countdownHint": "Off: F9 starts instantly; the first 0.3–0.5 s stays out of frame",
     "params.hotkey": "Hotkey",
     "params.hotkeyHint": "Click, then press a new shortcut",
 
@@ -181,6 +190,7 @@ const I18N = {
     "picker.desktopAll": "Entire desktop",
     "picker.allDisplays": "All displays",
     "picker.none": "No matches",
+    "picker.bgCapable": "keeps recording when covered",
     "picker.added": "Added · {meta}",
     "picker.addedTitle": "Already in the list",
 
@@ -207,13 +217,15 @@ const I18N = {
     "notice.noFfmpegDetail": "Install ffmpeg and add it to PATH, then restart the panel.",
     "notice.takePartial": "Take finished, but {n} source(s) recorded nothing (saved {secs} · {mb} MB)",
 
-    "settings.open": "Settings",
+    "settings.interface": "Interface",
+    "settings.capture": "Capture & encoding",
+    "settings.recording": "Recording",
     "settings.language": "Language",
     "settings.theme": "Theme",
     "settings.themeAuto": "System",
     "settings.themeLight": "Light",
     "settings.themeDark": "Dark",
-    "settings.note": "Both apply immediately and are remembered.",
+    "settings.note": "All settings apply immediately and are remembered.",
 
     "tray.stateIdle": "Not recording",
     "tray.stateRecording": "Recording",

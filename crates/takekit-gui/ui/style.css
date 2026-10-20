@@ -4,32 +4,35 @@
    not derived. */
 
 :root {
-  --tk-canvas: #f4f4f4;
+  --tk-canvas: #f5f6f8;
   --tk-surface: #ffffff;
-  --tk-sunken: #ececec;
-  --tk-border: #d6d6d6;
-  --tk-border-strong: #b0b0b0;
+  --tk-sunken: #eef0f3;
+  --tk-border: #e4e6ea;
+  --tk-border-strong: #c6c9d0;
   --tk-text: #16161a;
   /* 4.5:1 on white: the old #8a8a8a was ~3.5:1, which reads as grey fuzz at
      13px (row meta, empty-state hints, log detail lines). */
-  --tk-text-2: #5c5c5c;
-  --tk-text-3: #767676;
-  --tk-accent: #0b62c4;
+  --tk-text-2: #54565e;
+  --tk-text-3: #71737c;
+  --tk-accent: #2563eb;
   --tk-accent-fg: #ffffff;
-  --tk-accent-soft: rgba(11, 98, 196, 0.12);
-  --tk-rec: #ce1f1f;
+  --tk-accent-soft: rgba(37, 99, 235, 0.1);
+  --tk-rec: #dc2626;
   --tk-rec-fg: #ffffff;
   --tk-ok: #0e700e;
   --tk-ok-soft: rgba(14, 112, 14, 0.12);
   --tk-warn: #8a5300;
-  --tk-radius-sm: 4px;
-  --tk-radius-md: 6px;
+  --tk-radius-sm: 6px;
+  --tk-radius-md: 8px;
   --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
     system-ui, sans-serif;
   --tk-font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
   --tk-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23808080' stroke-width='1.5'/%3E%3C/svg%3E");
   --tk-dur: 160ms;
   --tk-ease: cubic-bezier(0.2, 0, 0, 1);
+  /* Two steps of elevation: cards lift off the canvas, hover lifts a card. */
+  --tk-shadow-1: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --tk-shadow-2: 0 2px 8px rgba(16, 24, 40, 0.08);
 }
 
 /* `auto` follows the system; an explicit choice is an attribute on <html>
@@ -76,6 +79,8 @@
   --tk-ok: #6ccb5f;
   --tk-ok-soft: rgba(108, 203, 95, 0.18);
   --tk-warn: #e8b339;
+  --tk-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --tk-shadow-2: 0 2px 8px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -174,8 +179,9 @@ select {
 
 .tab {
   position: relative;
-  height: 32px;
-  padding: 0 14px;
+  height: 36px;
+  padding: 0 12px;
+  font-weight: 500;
   margin-bottom: -1px;
   font-size: 13px;
   color: var(--tk-text-2);
@@ -196,12 +202,8 @@ select {
   border-bottom-color: var(--tk-accent);
 }
 
-.tab .count {
-  margin-left: 6px;
-}
-
-/* Something in that pane has not been looked at yet. Drawn as a dot rather
-   than a badge: the count is already beside it. */
+/* Something in that pane has not been looked at yet. Drawn as a dot: a badge
+   would fight the plain tab label (no source count on the tab anymore). */
 .tab.unread::after {
   content: "";
   position: absolute;
@@ -319,11 +321,11 @@ select {
 
 .ghost {
   margin-left: auto;
-  height: 24px;
+  height: 26px;
   padding: 0 10px;
   font-size: 12px;
   color: var(--tk-text-2);
-  background: transparent;
+  background: var(--tk-surface);
   border: 1px solid var(--tk-border-strong);
   border-radius: var(--tk-radius-sm);
   cursor: pointer;
@@ -353,16 +355,36 @@ select {
   padding-bottom: 16px;
 }
 
+/* Icon tile: the source kind (desktop / window / camera) is readable at a
+   glance — before this, every row opened with the same grey dot. */
+.tile {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--tk-accent-soft);
+  color: var(--tk-accent);
+}
+
+.tile svg {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+
 .row {
   flex: none;
-  height: 56px;
+  height: 58px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 12px;
+  gap: 12px;
+  padding: 0 14px 0 10px;
   background: var(--tk-surface);
   border: 1px solid var(--tk-border);
   border-radius: var(--tk-radius-md);
+  box-shadow: var(--tk-shadow-1);
   transition:
     border-color var(--tk-dur) var(--tk-ease),
     background var(--tk-dur) var(--tk-ease);
@@ -370,6 +392,7 @@ select {
 
 .row:hover {
   border-color: var(--tk-border-strong);
+  box-shadow: var(--tk-shadow-2);
 }
 
 .dot {
@@ -400,7 +423,7 @@ select {
 }
 
 .row-name {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   overflow: hidden;
   white-space: nowrap;
@@ -408,9 +431,12 @@ select {
 }
 
 .row-meta {
-  font-family: var(--tk-font-mono);
-  font-size: 11px;
-  color: var(--tk-text-2);
+  /* UI font with tabular figures, not mono: the line mixes prose and numbers
+     and mono made the prose part read like a log dump. */
+  font-family: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tk-text-3);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -434,19 +460,22 @@ select {
 }
 
 .row-remove:hover {
-  background: var(--tk-sunken);
-  color: var(--tk-text);
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--tk-rec);
 }
 
 .row-param {
   flex: none;
-  height: 24px;
-  padding: 0 20px 0 6px;
-  font-size: 12px;
+  height: 26px;
+  padding: 0 22px 0 8px;
+  font-size: 11.5px;
   color: var(--tk-text-2);
-  background: var(--tk-canvas) var(--tk-chevron) no-repeat right 5px center;
+  background-color: transparent;
+  background-image: var(--tk-chevron);
+  background-repeat: no-repeat;
+  background-position: right 7px center;
   border: 1px solid var(--tk-border);
-  border-radius: var(--tk-radius-sm);
+  border-radius: 999px;
   appearance: none;
   cursor: pointer;
   transition:
@@ -457,6 +486,7 @@ select {
 .row-param:hover {
   border-color: var(--tk-border-strong);
   color: var(--tk-text);
+  background-color: var(--tk-sunken);
 }
 
 .row-param:focus-visible {
@@ -474,16 +504,35 @@ select {
   text-align: center;
 }
 
+.empty .mark {
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 10px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  color: var(--tk-text-3);
+  box-shadow: var(--tk-shadow-1);
+}
+
+.empty .mark svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
 .empty-title {
   margin: 0;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--tk-text-2);
 }
 
 .empty-hint {
   margin: 0;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--tk-text-3);
 }
 
@@ -652,14 +701,41 @@ select {
 
 /* ── Params ─────────────────────────────────────────────────────────────── */
 
+/* Both of these are the Record workspace's chrome (2026-10-20): on History /
+   Log / Settings they read as leftovers — an output path and a record button
+   for a pane the window is not showing. The transport bar stays while a take
+   is running, on any tab: the timer and the stop button must never be hidden
+   from the person recording. */
+body:not([data-tab="sources"]) .params {
+  display: none;
+}
+
+body:not([data-tab="sources"]):not(.recording) .bar {
+  display: none;
+}
+
+/* Two rows (layout plan A, 2026-10-20): the output path owns the first row
+   — widest and most-read field, never squeezed half-hidden by controls — and
+   nothing else is left: capture method, encoder, switches and the hotkey
+   chip all moved to the settings pane (2026-10-20). Only the output path
+   stays put — the one value to check before every take. */
 .params {
   flex: none;
   display: flex;
-  align-items: flex-start;
-  gap: 24px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   padding: 12px 16px 14px;
   background: var(--tk-sunken);
   border-top: 1px solid var(--tk-border);
+}
+
+.params-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+  /* Long English option text must wrap, never push the hotkey out of sight. */
+  flex-wrap: wrap;
 }
 
 .field {
@@ -674,7 +750,8 @@ select {
 }
 
 .field input.value,
-.field select.value {
+.field select.value,
+.set-row select.value {
   height: 28px;
   padding: 0 8px;
   color: var(--tk-text);
@@ -692,17 +769,20 @@ select {
 }
 
 .field input.value:hover,
-.field select.value:hover {
+.field select.value:hover,
+.set-row select.value:hover {
   border-color: var(--tk-border-strong);
 }
 
 .field input.value:focus,
-.field select.value:focus {
+.field select.value:focus,
+.set-row select.value:focus {
   outline-offset: -1px;
   border-color: transparent;
 }
 
-.field select.value {
+.field select.value,
+.set-row select.value {
   padding-right: 24px;
   appearance: none;
   background: var(--tk-surface) var(--tk-chevron) no-repeat right 7px center;
@@ -807,13 +887,15 @@ select {
 }
 
 .clock {
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 600;
+  letter-spacing: 0.01em;
   color: var(--tk-text);
+  font-variant-numeric: tabular-nums;
 }
 
 .hint {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--tk-text-2);
   overflow: hidden;
   white-space: nowrap;
@@ -825,30 +907,40 @@ select {
   align-items: center;
   gap: 8px;
   margin-left: auto;
-  height: 40px;
-  min-width: 132px;
+  height: 38px;
+  min-width: 136px;
   justify-content: center;
   padding: 0 18px;
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 13.5px;
+  font-weight: 500;
   color: var(--tk-rec-fg);
   background: var(--tk-rec);
   border: none;
   border-radius: var(--tk-radius-md);
   cursor: pointer;
-  transition: background var(--tk-dur) var(--tk-ease);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--tk-rec) 28%, transparent);
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    box-shadow var(--tk-dur) var(--tk-ease),
+    transform var(--tk-dur) var(--tk-ease);
 }
 
 .rec::before {
   content: "";
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
   background: currentColor;
   border-radius: 50%;
+  opacity: 0.95;
 }
 
 .rec:hover:not(:disabled) {
   background: color-mix(in srgb, var(--tk-rec) 88%, var(--tk-text));
+}
+
+.rec:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: none;
 }
 
 .rec:disabled {
@@ -985,37 +1077,9 @@ select {
 
 /* ── Settings entry (tab bar) ───────────────────────────────────────────── */
 
-.gear {
-  flex: none;
-  align-self: center;
-  width: 30px;
-  height: 30px;
-  margin: 0 0 3px auto;
-  display: grid;
-  place-items: center;
-  color: var(--tk-text-2);
-  background: none;
-  border: none;
-  border-radius: var(--tk-radius-sm);
-  cursor: pointer;
-  transition:
-    background var(--tk-dur) var(--tk-ease),
-    color var(--tk-dur) var(--tk-ease);
-}
 
-.gear:hover {
-  color: var(--tk-text);
-}
 
-.gear[aria-expanded="true"] {
-  background: var(--tk-sunken);
-  color: var(--tk-text);
-}
 
-.gear svg {
-  width: 16px;
-  height: 16px;
-}
 
 /* ── Hotkey chip (params row) ───────────────────────────────────────────── */
 /* Reads as a value, not a button: the only affordance is the cursor and the
@@ -1071,23 +1135,25 @@ select {
   white-space: nowrap;
 }
 
-/* ── Settings popover ───────────────────────────────────────────────────── */
+/* ── Settings pane: one row component for every setting ─────────────────── */
+/* SetRow (2026-10-20 redesign): text column (title + optional hint) on the
+   left, value control in a right slot whose right edge is shared by all
+   eight rows. The old pane mixed "label + row" groups with full-width seg
+   blocks, which read as stapled together; groups are now three semantic
+   domains and every row has the same shape. */
 
-.settings {
+.set-body {
   display: block;
-  top: 48px;
-  right: 12px;
-  width: 268px;
-  max-height: none;
-  padding: 14px;
+  max-width: 470px;
+  padding: 4px 0 12px;
 }
 
-.settings-group + .settings-group {
-  margin-top: 14px;
+.set-group + .set-group {
+  margin-top: 16px;
 }
 
-.settings-label {
-  margin: 0 0 6px;
+.set-label {
+  margin: 0 0 8px;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.09em;
@@ -1095,42 +1161,65 @@ select {
   color: var(--tk-text-3);
 }
 
-.seg {
+.set-row {
   display: flex;
-  border: 1px solid var(--tk-border-strong);
-  border-radius: var(--tk-radius-sm);
-  overflow: hidden;
+  align-items: center;
+  gap: 16px;
+  min-height: 32px;
+  padding: 4px 0;
 }
 
-.seg button {
+.set-row + .set-row {
+  margin-top: 4px;
+}
+
+.set-row .txt {
   flex: 1;
-  height: 28px;
-  font-size: 12px;
+  min-width: 0;
+}
+
+.set-row .title {
+  display: block;
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 400;
   color: var(--tk-text-2);
-  background: var(--tk-surface);
-  border: none;
-  border-right: 1px solid var(--tk-border);
+}
+
+/* A real label still toggles its control by click. */
+.set-row label.title {
   cursor: pointer;
-  transition:
-    background var(--tk-dur) var(--tk-ease),
-    color var(--tk-dur) var(--tk-ease);
 }
 
-.seg button:last-child {
-  border-right: 0;
+/* Moved out of tooltips (2026-10-20): the long explanations are always
+   visible under the title. Height is reserved on every hint line — the
+   hotkey one comes and goes, and rows must not jump. */
+.set-row .hint {
+  display: block;
+  margin-top: 4px;
+  min-height: 15px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--tk-text-3);
 }
 
-.seg button:hover {
-  background: var(--tk-sunken);
-  color: var(--tk-text);
+.set-row .ctl {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
-.seg button[aria-pressed="true"] {
-  background: var(--tk-accent);
-  color: var(--tk-accent-fg);
+
+.set-row select.value {
+  /* 300px, not the 250px of the mockup: with border-box + 24px chevron pad
+     the longest English option ("Windows API (records background windows)")
+     needs ~299px and ellipsised at 250. The label column keeps 154px. */
+  width: 300px;
 }
 
-.settings-note {
+.set-note {
   margin: 12px 0 0;
   font-size: 11px;
   color: var(--tk-text-3);

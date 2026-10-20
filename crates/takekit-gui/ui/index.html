@@ -32,7 +32,7 @@
       })();
     </script>
   </head>
-  <body>
+  <body data-tab="sources">
     <!-- The Chinese text in this file is the fallback: it is what a page shows
          if i18n.js never runs, and what `data-i18n` replaces on load. -->
     <nav class="tabs" role="tablist" aria-label="面板" data-i18n-aria="tabs.aria">
@@ -44,7 +44,7 @@
         aria-selected="true"
         aria-controls="pane-sources"
       >
-        <span data-i18n="tab.sources">源</span><span class="count" id="count"></span>
+        <span data-i18n="tab.sources">录制</span>
       </button>
       <button
         class="tab"
@@ -69,20 +69,15 @@
         日志
       </button>
       <button
-        class="gear"
-        id="settings-btn"
+        class="tab"
+        id="tab-settings"
         type="button"
-        aria-haspopup="true"
-        aria-expanded="false"
-        aria-controls="settings"
-        title="设置"
-        data-i18n-title="settings.open"
+        role="tab"
+        aria-selected="false"
+        aria-controls="pane-settings"
+        data-i18n="tab.settings"
       >
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-          <path d="M2 5h6.5M12.5 5H14M2 11h1.5M7.5 11H14" />
-          <circle cx="10.5" cy="5" r="1.7" />
-          <circle cx="5.5" cy="11" r="1.7" />
-        </svg>
+        设置
       </button>
     </nav>
 
@@ -93,6 +88,12 @@
       </div>
       <div id="source-list" class="source-list"></div>
       <div id="empty" class="empty">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <rect x="1.5" y="2.5" width="13" height="9" rx="1.4" />
+            <path d="M5 14h6M8 11.5V14" stroke-linecap="round" />
+          </svg>
+        </div>
         <p class="empty-title" data-i18n="sources.emptyTitle">还没有源</p>
         <p class="empty-hint" data-i18n="sources.emptyHint">
           添加一个窗口、桌面或摄像头开始录制。
@@ -102,13 +103,18 @@
 
     <section class="pane hidden" id="pane-history" role="tabpanel" aria-labelledby="tab-history">
       <div class="section-head">
-        <h2 class="section-title" data-i18n="section.history">历史</h2>
         <button class="ghost" id="history-clear" type="button" data-i18n="history.clear">
           清空…
         </button>
       </div>
       <div id="history-list" class="take-list"></div>
       <div id="history-empty" class="empty">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <circle cx="8" cy="8" r="5.5" />
+            <path d="M8 5.5V8l1.8 1.8" stroke-linecap="round" />
+          </svg>
+        </div>
         <p class="empty-title" data-i18n="history.emptyTitle">还没有录制过</p>
         <p class="empty-hint" data-i18n="history.emptyHint">
           按 F9 或点「开始录制」，录完的那一段会出现在这里。
@@ -118,13 +124,17 @@
 
     <section class="pane hidden" id="pane-log" role="tabpanel" aria-labelledby="tab-log">
       <div class="section-head">
-        <h2 class="section-title" data-i18n="section.log">日志</h2>
         <button class="ghost" id="log-clear" type="button" data-i18n="history.clear">
           清空…
         </button>
       </div>
       <div id="log-list" class="take-list"></div>
       <div id="log-empty" class="empty">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <path d="M3 4h10M3 8h10M3 12h6" stroke-linecap="round" />
+          </svg>
+        </div>
         <p class="empty-title" data-i18n="log.emptyTitle">没有需要处理的事</p>
         <p class="empty-hint" data-i18n="log.emptyHint">
           源失效、编码失败这类问题会记在这里。
@@ -132,74 +142,138 @@
       </div>
     </section>
 
+    <section
+      class="pane hidden"
+      id="pane-settings"
+      role="tabpanel"
+      aria-labelledby="tab-settings"
+    >
+      <div class="set-body">
+        <div class="set-group">
+          <p class="set-label" data-i18n="settings.capture">采集与编码</p>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="backend" data-i18n="params.backend">采集方式</label>
+            </div>
+            <div class="ctl">
+              <select class="value" id="backend">
+                <option value="windows" data-i18n="params.backendWindows">
+                  Windows API（后台窗口可录）
+                </option>
+                <option value="ffmpeg" data-i18n="params.backendFfmpeg">ffmpeg</option>
+              </select>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="encoder" data-i18n="params.encoder">视频编码</label>
+            </div>
+            <div class="ctl">
+              <select class="value" id="encoder">
+                <option value="" data-i18n="params.encoderAuto">自动</option>
+                <option value="nvenc">NVENC</option>
+                <option value="qsv">QSV</option>
+                <option value="amf">AMF</option>
+                <option value="x264">libx264</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="set-group">
+          <p class="set-label" data-i18n="settings.recording">录制行为</p>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="marks-value" data-i18n="params.marks">鼠标效果</label>
+              <span class="hint" data-i18n="params.marksHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="marks-value" type="checkbox" role="switch" checked />
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="countdown-value" data-i18n="params.countdown">倒计时</label>
+              <span class="hint" data-i18n="params.countdownHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="countdown-value" type="checkbox" role="switch" checked />
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="raise-value" data-i18n="params.raise">窗口置前</label>
+              <span class="hint" data-i18n="params.raiseHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="raise-value" type="checkbox" role="switch" />
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="hotkey-btn" data-i18n="params.hotkey">快捷键</label>
+              <!-- The capture hint comes and goes in this slot; its height is
+                   reserved so the row list never jumps. -->
+              <span class="hint" id="hotkey-note" data-i18n="params.hotkeyHint"></span>
+            </div>
+            <div class="ctl">
+              <button class="chip" id="hotkey-btn" type="button">F9</button>
+            </div>
+          </div>
+        </div>
+        <div class="set-group">
+          <p class="set-label" data-i18n="settings.interface">界面</p>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="lang-select" data-i18n="settings.language">语言</label>
+            </div>
+            <div class="ctl">
+              <!-- Dropdown like 采集方式 (2026-10-20): the seg block was the
+                   one shape on the page that looked foreign. Language names
+                   stay in their own language on purpose. -->
+              <select class="value" id="lang-select">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="theme-select" data-i18n="settings.theme">主题</label>
+            </div>
+            <div class="ctl">
+              <select class="value" id="theme-select">
+                <option value="auto" data-i18n="settings.themeAuto">跟随系统</option>
+                <option value="light" data-i18n="settings.themeLight">浅色</option>
+                <option value="dark" data-i18n="settings.themeDark">深色</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <p class="set-note" data-i18n="settings.note">各项设置立即生效，并记住到下次启动。</p>
+      </div>
+    </section>
+
     <section class="params" aria-labelledby="params-title">
       <h2 class="sr-only" id="params-title">参数</h2>
 
-      <div class="field grow">
-        <label for="out-path" data-i18n="params.out">输出目录</label>
-        <div class="path-row">
-          <input class="value mono" id="out-path" type="text" value="takes" spellcheck="false" />
-          <button
-            class="browse"
-            id="out-browse"
-            type="button"
-            aria-label="选择输出目录"
-            title="选择输出目录"
-            data-i18n-aria="params.outPick"
-            data-i18n-title="params.outPick"
-          >
-            …
-          </button>
+      <div class="params-row">
+        <div class="field grow">
+          <label for="out-path" data-i18n="params.out">输出目录</label>
+          <div class="path-row">
+            <input class="value mono" id="out-path" type="text" value="takes" spellcheck="false" />
+            <button
+              class="browse"
+              id="out-browse"
+              type="button"
+              aria-label="选择输出目录"
+              title="选择输出目录"
+              data-i18n-aria="params.outPick"
+              data-i18n-title="params.outPick"
+            >
+              …
+            </button>
+          </div>
         </div>
-      </div>
-
-      <div class="field">
-        <label for="encoder" data-i18n="params.encoder">视频编码</label>
-        <select class="value" id="encoder">
-          <option value="" data-i18n="params.encoderAuto">自动</option>
-          <option value="nvenc">NVENC</option>
-          <option value="qsv">QSV</option>
-          <option value="amf">AMF</option>
-          <option value="x264">libx264</option>
-        </select>
-      </div>
-
-      <div class="field centered">
-        <label
-          for="marks-value"
-          title="点击涟漪与拖动轨迹叠加到录制画面上"
-          data-i18n-title="params.marksHint"
-          data-i18n="params.marks"
-          >鼠标效果</label
-        >
-        <input class="switch" id="marks-value" type="checkbox" role="switch" checked />
-      </div>
-
-      <div class="field centered">
-        <label
-          for="countdown-value"
-          title="开始录制前的全屏倒计时。关掉后按 F9 直接开录，但开头 0.3–0.5 秒的动作不会进画面。"
-          data-i18n-title="params.countdownHint"
-          data-i18n="params.countdown"
-          >倒计时</label
-        >
-        <input class="switch" id="countdown-value" type="checkbox" role="switch" checked />
-      </div>
-
-      <div class="field">
-        <label for="hotkey-btn" data-i18n="params.hotkey">快捷键</label>
-        <button
-          class="chip"
-          id="hotkey-btn"
-          type="button"
-          title="点击后按新的组合键"
-          data-i18n-title="params.hotkeyHint"
-        >
-          F9
-        </button>
-        <!-- Reserved height in every state: the params row must not jump when
-             the capture hint comes and goes. -->
-        <span class="field-note" id="hotkey-note"></span>
       </div>
     </section>
 
@@ -234,31 +308,6 @@
       <div class="picker-body" id="picker-body"></div>
     </div>
 
-    <div class="popover settings hidden" id="settings" role="dialog" aria-label="设置"
-         data-i18n-aria="settings.open">
-      <div class="settings-group">
-        <p class="settings-label" data-i18n="settings.language">语言</p>
-        <div class="seg">
-          <button type="button" data-lang="zh" aria-pressed="true">中文</button>
-          <button type="button" data-lang="en" aria-pressed="false">English</button>
-        </div>
-      </div>
-      <div class="settings-group">
-        <p class="settings-label" data-i18n="settings.theme">主题</p>
-        <div class="seg">
-          <button type="button" data-theme-opt="auto" aria-pressed="true" data-i18n="settings.themeAuto">
-            跟随系统
-          </button>
-          <button type="button" data-theme-opt="light" aria-pressed="false" data-i18n="settings.themeLight">
-            浅色
-          </button>
-          <button type="button" data-theme-opt="dark" aria-pressed="false" data-i18n="settings.themeDark">
-            深色
-          </button>
-        </div>
-      </div>
-      <p class="settings-note" data-i18n="settings.note">语言与主题立即生效，并记住到下次启动。</p>
-    </div>
 
     <script src="shared.js"></script>
     <script src="i18n.js"></script>

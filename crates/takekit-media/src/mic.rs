@@ -19,6 +19,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
+use crate::clock::TakeClock;
 use crate::devices::activate;
 use crate::error::{MediaError, Result};
 use crate::frame::{AudioChunk, MediaFrame};
@@ -44,7 +45,7 @@ pub struct MicCapture {
 }
 
 impl MicCapture {
-    pub fn start(endpoint: &str, out: Sender<MediaFrame>) -> Result<Self> {
+    pub fn start(endpoint: &str, out: Sender<MediaFrame>, clock: TakeClock) -> Result<Self> {
         let (ready, opened) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
@@ -60,7 +61,7 @@ impl MicCapture {
                     sample_rate,
                     channels,
                 }));
-                if let Err(e) = pump(&reader, thread_stop, out)
+                if let Err(e) = pump(&reader, thread_stop, out, clock)
                     && let Ok(mut slot) = thread_failure.lock()
                 {
                     *slot = Some(e.to_string());
@@ -174,8 +175,15 @@ fn native_type(source: &IMFMediaSource) -> Result<IMFMediaType> {
     }
 }
 
-fn pump(reader: &IMFSourceReader, stop: Arc<AtomicBool>, out: Sender<MediaFrame>) -> Result<()> {
-    let mut first: Option<i64> = None;
+fn pump(
+    reader: &IMFSourceReader,
+    stop: Arc<AtomicBool>,
+    out: Sender<MediaFrame>,
+    clock: TakeClock,
+) -> Result<()> {
+    // Same bridge as the camera: one offset at the first sample, then the
+    // device's own spacing comes through untouched.
+    let mut anchor: Option<i64> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -183,12 +191,12 @@ fn pump(reader: &IMFSourceReader, stop: Arc<AtomicBool>, out: Sender<MediaFrame>
         let Some((sample, time)) = next_sample(reader, AUDIO_STREAM)? else {
             return Ok(());
         };
-        let start = *first.get_or_insert(time);
+        let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(time));
         let data = sample_bytes(&sample)?;
         if out
             .send(MediaFrame::Audio(AudioChunk {
                 data,
-                time: time - start,
+                time: time - anchor,
             }))
             .is_err()
         {

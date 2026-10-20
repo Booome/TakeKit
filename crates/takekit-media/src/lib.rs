@@ -8,6 +8,7 @@
 //! encode and mux.
 
 pub mod camera;
+pub mod clock;
 pub mod devices;
 pub mod error;
 pub mod frame;
@@ -18,6 +19,7 @@ pub mod screen;
 pub mod writer;
 
 pub use camera::{CameraCapture, CameraFormat};
+pub use clock::TakeClock;
 pub use devices::{CameraInfo, DeviceList, MicInfo, ScreenInfo};
 pub use error::{MediaError, Result};
 pub use frame::{AudioChunk, MediaFrame, PixelFormat, VideoFrame};

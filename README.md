@@ -94,3 +94,37 @@ takekit record --desktop --crop 33,0,0,0
 ```
 
 仅支持 Windows；ffmpeg 需在 PATH 里。点击波纹/拖动轨迹由 [MouseShow](https://github.com/Booome/MouseShow) 提供，以库的形式链接。
+
+## 文档
+
+| 内容 | 位置 |
+|---|---|
+| 设计契约（视觉 / 组件 / 记忆 / 历史日志 / 键盘） | `DESIGN.md` |
+| 开发笔记（构建测试、架构地图、实现契约、探针与验证、陷阱清单） | `docs/development.md` |
+| WebView2 与 agent 沙箱（启动配方，唯一出处） | `docs/webview2-agent-sandbox.md` |
+| API 采集后端（WGC + Media Foundation，已默认） | `docs/api-recording.md` |
+
+## 当前状态与待办
+
+面板已可日常使用：源列表、设置记忆、F9 开/停、托盘、录制历史、日志页签、
+倒计时 3/2/1/GO + 提示音 + Esc 取消、快捷键/语言/主题设置。录制后端默认走
+**Windows API**（WGC + Media Foundation），窗口被遮挡也能录；ffmpeg 后端保留为回退。
+
+**待办**（大致按优先级）：
+
+1. **B4 收尾流程**：停止时逐源 finalize 清单 + `take:finalize|source|done` 事件。
+   实施前先读本地工作区 `.superpowers/sdd/overlay-tray-plan/plan.md` 的 Task B4，
+   并对照 `docs/api-recording.md`——API 后端下收尾语义已经变了。注意：**不要再补
+   "已保存"横幅**，成功反馈由历史行承担。
+2. **音频通道补全**：系统声音（WASAPI loopback）尚未实现；麦克风与摄像头代码就绪
+   但本机无设备未验证（`docs/api-recording.md` §5）。有设备后跑
+   `takekit media --list` → `takekit media --camera <名> --mic <名>`。
+3. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
+   视结果决定是否做 slew 校正（设计讨论见 2026-10-20 工作日志）。
+4. **状态条 failed 态**：`StatusInfo.error` 与 `last_error` 已就位，只差 UI。
+5. **B6**：`finalize_panel == false` 的停止路径。
+6. 待拍板：单实例保护；提示层创建失败降级为"无提示层 + 记探针"（现在会拖垮整个
+   app）；历史/日志「清空」是否连磁盘文件一起删；CLI `--marks` 与 UI「鼠标效果」
+   文案对齐；ffmpeg 路径可配置。
+7. 未实测：150% 缩放、多显示器、深色主题下历史页浮窗/徽章观感；历史行双击会开
+   两个资源管理器窗口（未节流）。

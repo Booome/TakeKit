@@ -11,10 +11,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use takekit_core::encoder::Encoder;
 use takekit_core::ffmpeg;
 use takekit_core::session::{Session, Settings};
-use takekit_core::source::{Capture, Crop, Engine, Source, WindowItem};
+use takekit_core::source::{Backend, Capture, Crop, Engine, Source, WindowItem};
 use takekit_media::{
     AudioWriter, CameraCapture, DeviceList, MediaFrame, MicCapture, ScreenCapture, ScreenTarget,
-    VideoFrame, VideoWriter, writer,
+    TakeClock, VideoFrame, VideoWriter, writer,
 };
 
 #[derive(Parser)]
@@ -52,6 +52,12 @@ struct RecordArgs {
     #[arg(long, conflicts_with = "window")]
     desktop: bool,
 
+    /// Capture through the Windows APIs (WGC + Media Foundation) instead of
+    /// ffmpeg children. Keeps recording a window that sits behind others, and
+    /// records the first monitor only
+    #[arg(long)]
+    windows: bool,
+
     /// Crop the captured area: "top,bottom,left,right" in pixels
     #[arg(long, value_name = "T,B,L,R", default_value = "0,0,0,0")]
     crop: CropArg,
@@ -85,13 +91,18 @@ struct RecordArgs {
 
 #[derive(clap::Args)]
 struct MediaArgs {
-    /// List the screens, cameras and microphones the APIs can see
+    /// List the screens, windows, cameras and microphones the APIs can see
     #[arg(long)]
     list: bool,
 
     /// Record a screen: the one-based monitor index
     #[arg(long, value_name = "INDEX")]
     screen: Option<usize>,
+
+    /// Record a window by handle. Unlike the ffmpeg backend this one keeps
+    /// recording while the window sits behind others
+    #[arg(long, value_name = "HWND", value_parser = parse_hwnd)]
+    window: Option<isize>,
 
     /// Record a camera: its name, or its symbolic link
     #[arg(long, value_name = "CAMERA")]
@@ -115,6 +126,13 @@ struct MediaArgs {
     /// Video bitrate in kbit/s
     #[arg(long, default_value_t = 12_000)]
     bitrate: u32,
+
+    /// Sample the picture at --fps instead of writing only when it changed.
+    /// The file is a fixed-frame-rate either way — the encoder repeats frames
+    /// to fill a gap — so this only decides whether a slot shows the picture
+    /// as it was at the slot or the last one that arrived
+    #[arg(long)]
+    cfr: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -272,28 +290,39 @@ fn record(args: RecordArgs) -> Result<(), String> {
             EncoderArg::Amf => Some(Encoder::Amf),
         },
         marks: args.marks,
+        backend: if args.windows {
+            takekit_core::source::Backend::Windows
+        } else {
+            takekit_core::source::Backend::Ffmpeg
+        },
     };
 
     let ids: Vec<String> = settings.sources.iter().map(|s| s.id.clone()).collect();
 
     let prepared = Session::prepare(settings).map_err(|e| e.to_string())?;
-    let engine = prepared.engine();
-    let encoder = prepared.encoder();
-    if engine == Engine::Gdi {
-        println!("note: capturing with gdigrab, not Desktop Duplication");
+    if prepared.backend() == Backend::Windows {
+        // The engine and the encoder pick are both ffmpeg concepts; on this
+        // path neither was consulted and printing them would be a lie.
+        println!("backend: Windows APIs (WGC + Media Foundation)");
+    } else {
+        let engine = prepared.engine();
+        let encoder = prepared.encoder();
+        if engine == Engine::Gdi {
+            println!("note: capturing with gdigrab, not Desktop Duplication");
+        }
+        println!(
+            "encoder: {}{}",
+            encoder.name(),
+            if encoder.is_hardware() {
+                " (hardware)"
+            } else {
+                ""
+            }
+        );
     }
 
     let rec = prepared.start().map_err(|e| e.to_string())?;
     println!("take   : {}", rec.dir().display());
-    println!(
-        "encoder: {}{}",
-        encoder.name(),
-        if encoder.is_hardware() {
-            " (hardware)"
-        } else {
-            ""
-        }
-    );
     for id in &ids {
         println!("  {id} -> {}", rec.path_for(id).display());
     }
@@ -334,9 +363,12 @@ fn media(args: MediaArgs) -> Result<(), String> {
     if args.list {
         return media_list();
     }
-    let wanted = args.screen.is_some() || args.camera.is_some() || args.mic.is_some();
+    let wanted = args.screen.is_some()
+        || args.window.is_some()
+        || args.camera.is_some()
+        || args.mic.is_some();
     if !wanted {
-        return Err("nothing to record: pass --screen, --camera or --mic".into());
+        return Err("nothing to record: pass --screen, --window, --camera or --mic".into());
     }
     if !args.duration.is_finite() || !(0.1..=86_400.0).contains(&args.duration) {
         return Err(format!(
@@ -351,61 +383,96 @@ fn media(args: MediaArgs) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
     let devices = takekit_media::devices::list();
-    let mut writers: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
+    // One origin for every source, so several files can be cut against each
+    // other: a source whose first frame arrives late keeps that gap visible
+    // instead of silently starting its own timeline at zero.
+    let clock = TakeClock::start();
+    // Latched when the take stops so every file ends on the same instant of the
+    // take's timeline — otherwise the channels differ by however long each
+    // writer's drain took.
+    let end_hint = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut writers: Vec<thread::JoinHandle<Result<(String, u64), String>>> = Vec::new();
     let mut senders: Vec<mpsc::Sender<MediaFrame>> = Vec::new();
 
     // Each source gets its own channel and its own writer thread: a capture
     // must never block on an encoder, and the files are separate anyway.
-    // A source is written at a steady rate even when it delivers nothing:
-    // Windows Graphics Capture only produces a frame when the picture changes,
-    // so a still desktop is a pause, and a take of it has to hold the last
-    // picture for as long as the pause really was. Every writer thread starts
-    // its clock when the take does, which is also what keeps several sources in
-    // step with each other.
-    let open = |name: &str| -> (
-        mpsc::Sender<MediaFrame>,
-        thread::JoinHandle<Result<(), String>>,
-    ) {
+    //
+    // The output is a fixed-frame-rate MP4 either way: the encoder expands a
+    // held sample into repeated frames. Without `--cfr` a frame is written
+    // when it arrives with the gap it really had; with `--cfr` the picture is
+    // sampled at --fps. Same frames out, different sampling in.
+    type SourceWriter = thread::JoinHandle<Result<(String, u64), String>>;
+    let open = |name: &str| -> (mpsc::Sender<MediaFrame>, SourceWriter) {
         let (tx, rx) = mpsc::channel::<MediaFrame>();
         let path = dir.join(format!("{name}.mp4"));
+        let name = name.to_string();
         let fps = args.fps.max(1);
         let bitrate = args.bitrate;
-        let handle = thread::spawn(move || -> Result<(), String> {
-            let interval = Duration::from_secs_f64(1.0 / fps as f64);
-            let started = std::time::Instant::now();
+        let cfr = args.cfr;
+        let writer_end = end_hint.clone();
+        let handle = thread::spawn(move || -> Result<(String, u64), String> {
             let mut video: Option<VideoWriter> = None;
-            let mut latest: Option<VideoFrame> = None;
-            let mut due_slot = 0u64;
+            let mut delivered = 0u64;
 
-            loop {
-                match rx.recv_timeout(interval) {
-                    Ok(MediaFrame::Video(frame)) => latest = Some(writer::even_frame(&frame)),
-                    Ok(MediaFrame::Audio(_)) => {}
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-                let elapsed = started.elapsed().as_secs_f64() * fps as f64;
-                let end_slot = elapsed as u64;
-                while due_slot < end_slot {
-                    if let Some(frame) = latest.as_ref() {
-                        if video.is_none() {
-                            video = Some(open_video(&path, frame, fps, bitrate)?);
+            if cfr {
+                let interval = Duration::from_secs_f64(1.0 / fps as f64);
+                let mut latest: Option<VideoFrame> = None;
+                let mut due_slot = 0u64;
+                loop {
+                    match rx.recv_timeout(interval) {
+                        Ok(MediaFrame::Video(frame)) => {
+                            delivered += 1;
+                            latest = Some(writer::even_frame(&frame));
                         }
-                        let mut out = frame.clone();
-                        out.time = (due_slot as i64 * 10_000_000) / i64::from(fps);
+                        Ok(MediaFrame::Audio(_)) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    let end_slot = (clock.now_100ns() as u64 * fps as u64) / 10_000_000;
+                    while due_slot < end_slot {
+                        if let Some(frame) = latest.as_ref() {
+                            if video.is_none() {
+                                video = Some(open_video(&path, frame, fps, bitrate)?);
+                            }
+                            let mut out = frame.clone();
+                            out.time = (due_slot as i64 * 10_000_000) / i64::from(fps);
+                            video
+                                .as_mut()
+                                .expect("just opened")
+                                .write(&out)
+                                .map_err(string_of)?;
+                        }
+                        due_slot += 1;
+                    }
+                }
+            } else {
+                while let Ok(frame) = rx.recv() {
+                    if let MediaFrame::Video(frame) = frame {
+                        delivered += 1;
+                        let frame = writer::even_frame(&frame);
+                        if video.is_none() {
+                            video = Some(open_video(&path, &frame, fps, bitrate)?);
+                        }
                         video
                             .as_mut()
                             .expect("just opened")
-                            .write(&out)
+                            .write(&frame)
                             .map_err(string_of)?;
                     }
-                    due_slot += 1;
                 }
             }
             if let Some(w) = video.take() {
-                w.finish().map_err(string_of)?;
+                // How long the last frame was on screen is something only the
+                // caller knows: nothing arrives after it. Without this a take of
+                // a still screen is a zero-second file. The latched end wins so
+                // all channels stop together.
+                let end = match writer_end.load(std::sync::atomic::Ordering::SeqCst) {
+                    0 => clock.now_100ns(),
+                    t => t,
+                };
+                w.finish_at(Some(end)).map_err(string_of)?;
             }
-            Ok(())
+            Ok((name, delivered))
         });
         (tx, handle)
     };
@@ -416,7 +483,20 @@ fn media(args: MediaArgs) -> Result<(), String> {
             senders.push(tx.clone());
             writers.push(handle);
             Some(
-                ScreenCapture::start(ScreenTarget::Monitor(index), args.fps, tx)
+                ScreenCapture::start(ScreenTarget::Monitor(index), args.fps, tx, clock)
+                    .map_err(string_of)?,
+            )
+        }
+        None => None,
+    };
+
+    let window = match args.window {
+        Some(hwnd) => {
+            let (tx, handle) = open("window");
+            senders.push(tx.clone());
+            writers.push(handle);
+            Some(
+                ScreenCapture::start(ScreenTarget::Window(hwnd), args.fps, tx, clock)
                     .map_err(string_of)?,
             )
         }
@@ -429,7 +509,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
             let (tx, handle) = open("camera");
             senders.push(tx.clone());
             writers.push(handle);
-            Some(CameraCapture::start(&link, args.fps, tx).map_err(string_of)?)
+            Some(CameraCapture::start(&link, args.fps, tx, clock).map_err(string_of)?)
         }
         None => None,
     };
@@ -444,20 +524,23 @@ fn media(args: MediaArgs) -> Result<(), String> {
             let (format_tx, format_rx) = mpsc::channel();
             let path = dir.join("mic.mp4");
             let bitrate = args.bitrate;
-            let handle = thread::spawn(move || -> Result<(), String> {
+            let handle = thread::spawn(move || -> Result<(String, u64), String> {
                 let (rate, channels) = format_rx
                     .recv()
                     .map_err(|_| "the microphone never reported a format".to_string())?;
                 let mut writer = AudioWriter::create(&path, rate, channels, bitrate.min(256))
                     .map_err(string_of)?;
+                let mut delivered = 0u64;
                 while let Ok(frame) = rx.recv() {
                     if let MediaFrame::Audio(chunk) = frame {
+                        delivered += 1;
                         writer.write(&chunk).map_err(string_of)?;
                     }
                 }
-                writer.finish().map_err(string_of)
+                writer.finish().map_err(string_of)?;
+                Ok(("mic".to_string(), delivered))
             });
-            let capture = MicCapture::start(&endpoint, tx.clone()).map_err(string_of)?;
+            let capture = MicCapture::start(&endpoint, tx.clone(), clock).map_err(string_of)?;
             let format = capture.format();
             format_tx
                 .send((format.sample_rate, format.channels))
@@ -472,10 +555,16 @@ fn media(args: MediaArgs) -> Result<(), String> {
     println!("recording for {:.1}s into {}", args.duration, dir.display());
     thread::sleep(Duration::from_secs_f64(args.duration));
 
+    // The take ends now, for every channel alike.
+    end_hint.store(clock.now_100ns(), std::sync::atomic::Ordering::SeqCst);
+
     // Stop the captures before the writers: dropping a sender is what tells its
     // writer thread there are no more frames, and a capture stopped afterwards
     // would push into a closed channel.
     if let Some(c) = screen {
+        c.stop().map_err(string_of)?;
+    }
+    if let Some(c) = window {
         c.stop().map_err(string_of)?;
     }
     if let Some(c) = camera {
@@ -489,7 +578,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
     let mut failed = 0;
     for w in writers {
         match w.join() {
-            Ok(Ok(())) => {}
+            Ok(Ok((name, frames))) => println!("  {name}: {frames} frames delivered"),
             Ok(Err(e)) => {
                 failed += 1;
                 eprintln!("takekit: {e}");
@@ -518,6 +607,20 @@ fn open_video(
     out.map_err(string_of)
 }
 
+/// A window handle, in decimal or with a `0x` prefix — `media --list` prints
+/// hexadecimal, so typing back what it printed has to work.
+fn parse_hwnd(s: &str) -> Result<isize, String> {
+    let (digits, radix) = match s
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| s.trim().strip_prefix("0X"))
+    {
+        Some(rest) => (rest, 16),
+        None => (s.trim(), 10),
+    };
+    isize::from_str_radix(digits, radix).map_err(|_| format!("not a window handle: {s}"))
+}
+
 fn media_list() -> Result<(), String> {
     let devices = takekit_media::devices::list();
     println!("screens:");
@@ -526,6 +629,18 @@ fn media_list() -> Result<(), String> {
             "  [{}] {} {}x{} @{}Hz",
             s.index, s.name, s.width, s.height, s.refresh
         );
+    }
+    println!("windows:");
+    // The same list the panel offers, since a window is addressed by the same
+    // handle either way — and unlike the ffmpeg backend this one keeps
+    // recording while the window is behind another.
+    let windows = takekit_core::source::list_windows("", None);
+    if windows.is_empty() {
+        println!("  (none)");
+    }
+    for w in &windows {
+        let title: String = w.title.chars().take(56).collect();
+        println!("  [{:#x}] {} {}x{}", w.hwnd, title, w.rect.w, w.rect.h);
     }
     println!("cameras:");
     if devices.cameras.is_empty() {

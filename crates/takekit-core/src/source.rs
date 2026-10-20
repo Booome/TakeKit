@@ -7,11 +7,39 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_HWNDNEXT, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetTopWindow, GetWindow,
     GetWindowLongW, GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPlacement, SetWindowPos,
-    WINDOWPLACEMENT, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GetWindowThreadProcessId, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow,
+    IsWindowVisible, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPlacement,
+    SetWindowPos, WINDOWPLACEMENT, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 use windows::core::BOOL;
+
+/// Which machinery turns a source into a file.
+///
+/// `Ffmpeg` drives a child process per source and is the long-standing path.
+/// `Windows` captures in-process — Windows Graphics Capture for a screen or a
+/// window, Media Foundation for a camera — and is the only one that keeps
+/// recording a window which sits behind others. It is also the only one that
+/// needs no ffmpeg on the machine.
+/// Lowercase on the wire: the panel sends `"windows"` / `"ffmpeg"` as plain
+/// select values, and a config file holds the same strings. Without the
+/// rename, serde writes `"Windows"` but rejects the panel's own value on the
+/// way back in — which poisoned the whole config file, not just the field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Ffmpeg,
+    Windows,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Ffmpeg => "ffmpeg",
+            Backend::Windows => "windows",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Crop {
@@ -306,8 +334,13 @@ fn is_pickable(w: &WindowItem, lower_needle: &str, exclude_pid: Option<u32>) -> 
 /// panel and pressing record, it can close, and a stale handle must fail loudly
 /// instead of quietly capturing whatever inherited the number. The picker's
 /// taskbar rule is deliberately not applied here — a remembered source must
-/// still resolve when its app is minimized, which is what bringing it back to
-/// the front is for.
+/// still resolve when its app is minimized.
+///
+/// A minimized window is brought back on the way, without the keyboard focus:
+/// DWM stops composing a minimized window entirely, so there is nothing to
+/// capture and nothing to measure (its client area reads 0x0). This is part of
+/// resolving the window *for capture*, not a Z-order preference — that is
+/// `raise_sources`'s job, and the two are independent.
 pub fn window_by_hwnd(hwnd: isize) -> Result<WindowItem, String> {
     let handle = HWND(hwnd as *mut core::ffi::c_void);
     // SAFETY: both calls take a window handle and read state; a stale handle
@@ -320,6 +353,7 @@ pub fn window_by_hwnd(hwnd: isize) -> Result<WindowItem, String> {
             return Err(format!("window {hwnd} is not visible"));
         }
     }
+    restore(handle);
     let rect = client_rect(handle);
     if rect.w == 0 || rect.h == 0 {
         return Err(format!("window {hwnd} has no client area"));
@@ -371,6 +405,40 @@ pub fn bring_to_front(hwnd: isize) -> bool {
         }
 
         !cloaked(handle) && matches!((before, z_rank(handle)), (Some(b), Some(a)) if a <= b)
+    }
+}
+
+/// Bring a minimized window back so it can be recorded. `true` when it *was*
+/// minimized and is now up.
+///
+/// A recording prerequisite, not a preference: WGC delivers zero frames for a
+/// minimized window (DWM does not compose it at all), so a take of one would
+/// come back empty. Callers that want the window out of the way afterwards can
+/// `push_to_back`; whether it is raised at all is `raise_sources`.
+pub fn unminimize(hwnd: isize) -> bool {
+    let handle = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: a state query and a placement restore on one handle; no pointers.
+    let was_minimized = unsafe { IsIconic(handle).as_bool() };
+    restore(handle);
+    was_minimized
+}
+
+/// Put a window behind the others without activating anything — the
+/// un-minimize escape hatch for `raise_sources: off`, where the window must be
+/// back on screen to be captured but must not land on top of the user's work.
+pub fn push_to_back(hwnd: isize) {
+    let handle = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: a Z-order move on one handle; no pointers.
+    unsafe {
+        let _ = SetWindowPos(
+            handle,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -483,10 +551,11 @@ pub fn resolve_window(hwnd: isize, title: &str) -> Result<WindowItem, String> {
 /// drop such a source rather than record the wrong thing.
 ///
 /// The handle is the identity, so a window that has closed is not followed to a
-/// look-alike by title. A minimized window stays a source: `bring_to_front`
-/// recovers it before the take starts, and it has no client area to measure
-/// until then — which is why this is not `window_by_hwnd`. Cameras and the
-/// desktop are taken on trust; the take itself reports a device that is gone.
+/// look-alike by title. A minimized window stays a source: the take brings it
+/// back before capture (WGC cannot see a minimized window at all), and this
+/// stays `window_by_hwnd`-free because status polling must never move the
+/// user's windows around. Cameras and the desktop are taken on trust; the take
+/// itself reports a device that is gone.
 pub fn is_recordable(capture: &Capture) -> bool {
     match capture {
         Capture::Window { hwnd, .. } => live_window(HWND(*hwnd as *mut core::ffi::c_void)),
@@ -823,6 +892,10 @@ mod tests {
     #[test]
     fn a_window_that_is_gone_cannot_be_brought_to_front() {
         assert!(!bring_to_front(0));
+        // Un-minimizing and Z-order moves are just as inert on a dead handle:
+        // status paths must be able to call them without a window to move.
+        assert!(!unminimize(0));
+        push_to_back(0);
     }
 
     #[test]
@@ -873,6 +946,45 @@ mod tests {
             z_rank(window.handle).expect("still in the Z order") < rank_before,
             "the window did not move up the Z order"
         );
+    }
+
+    /// With `raise_sources` off the window must still come back — WGC
+    /// delivers zero frames for a minimized one — but it must come back
+    /// *behind* the other windows, not on top of the work it interrupted.
+    ///
+    /// `cargo test -p takekit-core --ignored --nocapture quietly`.
+    #[test]
+    #[ignore = "shows a real window; run by hand on an interactive desktop"]
+    fn a_minimized_window_comes_back_quietly_when_not_raised() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_MINIMIZE, ShowWindow};
+
+        let _turn = INTERACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let window = TestWindow::open();
+        let rank_before = z_rank(window.handle).expect("still in the Z order");
+
+        unsafe {
+            let _ = ShowWindow(window.handle, SW_MINIMIZE);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert!(unsafe { IsIconic(window.handle).as_bool() });
+
+        assert!(
+            unminimize(window.hwnd()),
+            "it was minimized, so this is a restore"
+        );
+        assert!(
+            !unsafe { IsIconic(window.handle).as_bool() },
+            "still minimized"
+        );
+        // Restoring alone can leave it on top of the user's work…
+        push_to_back(window.hwnd());
+        // …and this is the point: it lands behind, not in front.
+        assert!(
+            z_rank(window.handle).expect("still in the Z order") > rank_before,
+            "the window came back in front of the user's work"
+        );
+        // A second call is honest about having nothing to do.
+        assert!(!unminimize(window.hwnd()));
     }
 
     /// A minimized window is still the one the user picked, and a take of it
@@ -1243,5 +1355,20 @@ mod tests {
     fn filter_arg(args: &[String]) -> String {
         let at = args.iter().position(|a| a == "-vf").expect("-vf");
         args[at + 1].clone()
+    }
+
+    #[test]
+    fn backend_is_lowercase_on_the_wire_both_ways() {
+        // The panel sends `"windows"`; serde must accept it, and the config
+        // it writes must read back. PascalCase here once poisoned the whole
+        // config: one rejected field fell every field back to defaults.
+        let from_panel: Backend = serde_json::from_str("\"windows\"").unwrap();
+        assert_eq!(from_panel, Backend::Windows);
+        let from_panel: Backend = serde_json::from_str("\"ffmpeg\"").unwrap();
+        assert_eq!(from_panel, Backend::Ffmpeg);
+        assert_eq!(
+            serde_json::to_string(&Backend::Windows).unwrap(),
+            "\"windows\""
+        );
     }
 }

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use takekit_core::session::{Prepared, Recording, Session, Settings};
-use takekit_core::source::Capture;
+use takekit_core::source::{Backend, Capture};
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -103,15 +103,40 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
     // The rank is logged with the result because `bring_to_front` can only
     // report so much: Windows 11 drops a plain raise from a background process
     // without saying so, and the ranks are what show whether the window moved.
+    // Two separate decisions here, and only the second one is the user's.
+    //
+    // Un-minimizing is not optional: DWM stops composing a minimized window
+    // entirely, so WGC delivers zero frames for one (measured — 45 frames
+    // visible, 0 minimized, 46 back) and its client area reads 0x0 to
+    // measure. A take of a still-minimized window would be empty, so it comes
+    // back first, without the keyboard focus.
+    //
+    // Where it lands afterwards IS the user's call (`raise_sources`). On: the
+    // front, which `bring_to_front` does along with the un-minimize. Off
+    // (default): out of the way — it must be on screen to be captured, but it
+    // must not cover the work the user is actually doing. Sinking it is free
+    // for the Windows backend (WGC records the window itself however covered)
+    // and wrong for the ffmpeg one (it records the screen area and would film
+    // the cover), so that backend keeps whatever placement the restore gave it.
     for source in &req.sources {
         if let Capture::Window { hwnd, title, .. } = &source.capture {
-            let before = takekit_core::source::z_rank_of(*hwnd);
-            let raised = takekit_core::source::bring_to_front(*hwnd);
-            let after = takekit_core::source::z_rank_of(*hwnd);
-            crate::probe(&format!(
-                "front:{title}={} rank {before:?}->{after:?}",
-                u8::from(raised)
-            ));
+            if req.raise_sources {
+                let before = takekit_core::source::z_rank_of(*hwnd);
+                let raised = takekit_core::source::bring_to_front(*hwnd);
+                let after = takekit_core::source::z_rank_of(*hwnd);
+                crate::probe(&format!(
+                    "front:{title}={} rank {before:?}->{after:?}",
+                    u8::from(raised)
+                ));
+            } else if takekit_core::source::unminimize(*hwnd) {
+                if req.backend == Backend::Windows {
+                    takekit_core::source::push_to_back(*hwnd);
+                }
+                crate::probe(&format!(
+                    "restored:{title} sink={}",
+                    u8::from(req.backend == Backend::Windows)
+                ));
+            }
         }
     }
 
@@ -122,6 +147,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         quality: req.quality,
         encoder: req.encoder,
         marks: req.marks,
+        backend: req.backend,
     })
     .map_err(|e| {
         // The panel is still on screen and reports this through the rejected
@@ -316,8 +342,11 @@ fn spawn_started(
     stop_esc_watch(state);
     *state.last_error.lock().unwrap() = None;
 
-    let engine = format!("{:?}", prepared.engine());
-    let encoder = prepared.encoder().name().to_string();
+    let engine = match prepared.backend() {
+        Backend::Windows => "wgc+mf".to_string(),
+        Backend::Ffmpeg => format!("{:?}", prepared.engine()),
+    };
+    let encoder = prepared.encoder_label().to_string();
     match prepared.start() {
         Ok(recording) => {
             let dir = recording.dir().to_string_lossy().into_owned();

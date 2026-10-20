@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use takekit_core::encoder;
-use takekit_core::source::Source;
+use takekit_core::source::{Backend, Source};
 
 /// `Clone` because `begin` keeps a copy of the request next to the take it
 /// produced, so a failed start can say how many sources it was for.
@@ -21,6 +21,14 @@ pub struct StartRequest {
     /// rejects it up front when the binary cannot actually encode with it.
     #[serde(default)]
     pub encoder: Option<encoder::Encoder>,
+    /// ffmpeg children or the in-process OS capture APIs.
+    #[serde(default)]
+    pub backend: Backend,
+    /// Bring window sources to the front before recording. Off by default:
+    /// the Windows backend records the window itself and needs no raise, and
+    /// yanking a covered window forward is not something to do unasked.
+    #[serde(default)]
+    pub raise_sources: bool,
 }
 
 #[derive(Serialize)]
@@ -38,7 +46,11 @@ pub struct SessionConfig {
     pub sources: Vec<Source>,
     pub out_root: Option<String>,
     pub encoder: Option<encoder::Encoder>,
+    #[serde(default)]
+    pub backend: Backend,
     pub marks: bool,
+    #[serde(default)]
+    pub raise_sources: bool,
 }
 
 #[derive(Serialize)]

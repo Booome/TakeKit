@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use takekit_core::encoder::Encoder;
-use takekit_core::source::Source;
+use takekit_core::source::{Backend, Source};
 
 /// Every writer takes this, so a drag and a source edit cannot lose each
 /// other's field to a read-modify-write race on the shared file.
@@ -39,11 +39,21 @@ pub struct Config {
     pub out_root: Option<String>,
     /// `None` keeps the automatic pick.
     pub encoder: Option<Encoder>,
+    /// ffmpeg children, or the OS capture APIs in-process (the only one that
+    /// records a window sitting behind others).
+    pub backend: Backend,
     pub marks: bool,
+    /// Bring window sources to the front before recording. Off by default;
+    /// the ffmpeg backend needs it or the take shows whatever covered the
+    /// window, the Windows backend needs it never.
+    pub raise_sources: bool,
     /// UI language: `"zh"` or `"en"`. Anything else reads as Chinese.
     pub language: String,
     /// Palette: `"auto"` (follow the system), `"light"` or `"dark"`.
     pub theme: String,
+    /// Tab the user last had open (`"sources"` / `"history"` / `"log"` /
+    /// `"settings"`); a restart lands there. Anything else reads as the first.
+    pub active_tab: String,
     /// `None` lets the window manager place the panel.
     pub window_pos: Option<WindowPos>,
 }
@@ -57,9 +67,12 @@ impl Default for Config {
             sources: Vec::new(),
             out_root: None,
             encoder: None,
+            backend: Backend::Windows,
             marks: true,
+            raise_sources: false,
             language: "zh".to_string(),
             theme: "auto".to_string(),
+            active_tab: "sources".to_string(),
             window_pos: None,
         }
     }
@@ -161,6 +174,17 @@ impl Config {
             _ => "auto".to_string(),
         }
     }
+
+    /// Same again for the remembered tab: only the four real panes exist, and
+    /// an unknown name lands on the first rather than an empty window.
+    pub fn effective_active_tab(&self) -> String {
+        match self.active_tab.as_str() {
+            "history" => "history".to_string(),
+            "log" => "log".to_string(),
+            "settings" => "settings".to_string(),
+            _ => "sources".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +230,7 @@ mod tests {
             out_root: Some(r"D:\takes".to_string()),
             encoder: Some(Encoder::X264),
             marks: false,
+            raise_sources: false,
             window_pos: Some(WindowPos { x: 240.0, y: 260.0 }),
             ..Config::default()
         };
@@ -296,10 +321,12 @@ mod tests {
         let cfg = Config {
             language: "fr".to_string(),
             theme: "neon".to_string(),
+            active_tab: "nowhere".to_string(),
             ..Config::default()
         };
         assert_eq!(cfg.effective_language(), "zh");
         assert_eq!(cfg.effective_theme(), "auto");
+        assert_eq!(cfg.effective_active_tab(), "sources");
     }
 
     #[test]
@@ -308,11 +335,34 @@ mod tests {
         let cfg = Config {
             language: "en".to_string(),
             theme: "dark".to_string(),
+            active_tab: "settings".to_string(),
             ..Config::default()
         };
         cfg.save_to(&path).unwrap();
         let back = Config::load_from(&path);
         assert_eq!(back.effective_language(), "en");
         assert_eq!(back.effective_theme(), "dark");
+        assert_eq!(back.effective_active_tab(), "settings");
+    }
+
+    #[test]
+    fn raising_sources_defaults_to_off_and_round_trips() {
+        // The switch is opt-in: a config from before it existed must read as
+        // "off", not "on", and the value the panel sets must survive a save.
+        let path = scratch("raise");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"hotkey":"F7","marks":false,"backend":"windows"}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path);
+        assert!(!cfg.raise_sources);
+        assert_eq!(cfg.hotkey, "F7");
+
+        let mut cfg = cfg;
+        cfg.raise_sources = true;
+        cfg.save_to(&path).unwrap();
+        assert!(Config::load_from(&path).raise_sources);
     }
 }

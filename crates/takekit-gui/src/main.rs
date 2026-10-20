@@ -451,6 +451,26 @@ fn ui_settings() -> SettingsInfo {
     current_settings()
 }
 
+/// Remember which tab was last open so a restart lands there — and so a
+/// screenshot harness can seed the pane it wants without clicking anything.
+#[tauri::command]
+async fn set_active_tab(tab: String) -> Result<(), String> {
+    // The file is hand-editable: only the four real panes store as themselves.
+    let tab = match tab.as_str() {
+        "history" => "history",
+        "log" => "log",
+        "settings" => "settings",
+        _ => "sources",
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        config::Config::update(|cfg| cfg.active_tab = tab.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    probe(&format!("ui:active-tab={tab}"));
+    Ok(())
+}
+
 /// Switch the UI language.
 ///
 /// Every window is told (`ui:settings`) rather than only the caller: the tray
@@ -529,7 +549,9 @@ async fn save_session(session: proto::SessionConfig) -> Result<(), String> {
             cfg.sources = session.sources;
             cfg.out_root = session.out_root;
             cfg.encoder = session.encoder;
+            cfg.backend = session.backend;
             cfg.marks = session.marks;
+            cfg.raise_sources = session.raise_sources;
         })
     })
     .await
@@ -806,6 +828,7 @@ fn main() {
             ui_settings,
             set_language,
             set_theme,
+            set_active_tab,
             save_session,
             journal_get,
             journal_seen,

@@ -13,7 +13,15 @@ const state = {
   devices: [],
   outRoot: "takes",
   encoder: null,
+  // "windows" captures in-process through WGC/Media Foundation and keeps
+  // recording a window that sits behind others; "ffmpeg" spawns a child per
+  // source, the long-standing path.
+  backend: "windows",
   marks: true,
+  // Yank window sources to the front before recording. Off by default: WGC
+  // records covered windows anyway, and moving the user's windows unasked is
+  // not a default behaviour.
+  raiseSources: false,
   // Seconds of the full-screen countdown before a take starts; 0 = off. The
   // switch only flips between "the seconds remembered here" and off, so
   // toggling it twice does not lose a value B5's number input once allows.
@@ -83,15 +91,22 @@ function truncate(text, n) {
 // A remembered source carries no display text — only what the core needs — so
 // the row labels are derived back from the capture spec.
 function labelFor(capture) {
-  if (capture.Desktop) return { name: t("label.desktop"), meta: "ddagrab / gdigrab" };
-  if (capture.Window) {
-    const live = state.windows.find((x) => x.hwnd === capture.Window.hwnd);
+  const bg = state.backend === "windows" ? ` · ${t("picker.bgCapable")}` : "";
+  if (capture.Desktop) {
     return {
-      name: truncate(capture.Window.title, 48),
-      meta: live ? t("label.windowMeta", { w: live.w, h: live.h }) : t("label.window"),
+      name: t("label.desktop"),
+      meta: state.backend === "windows" ? "WGC" : "ddagrab / gdigrab",
     };
   }
-  return { name: truncate(capture.Camera.device, 48), meta: t("label.camera") };
+  if (capture.Window) {
+    const live = state.windows.find((x) => x.hwnd === capture.Window.hwnd);
+    const size = live ? t("label.windowMeta", { w: live.w, h: live.h }) : t("label.window");
+    return {
+      name: truncate(capture.Window.title, 48),
+      meta: state.backend === "windows" ? `${size}${bg}` : size,
+    };
+  }
+  return { name: truncate(capture.Camera.device, 48), meta: "Media Foundation" };
 }
 
 // What makes two sources the same source: the handle, the device, or the
@@ -111,7 +126,9 @@ function sessionParams() {
     sources: state.sources.map(({ id, capture, fps, quality }) => ({ id, capture, fps, quality })),
     out_root: state.outRoot,
     encoder: state.encoder,
+    backend: state.backend,
     marks: state.marks,
+    raise_sources: state.raiseSources,
   };
 }
 
@@ -139,6 +156,9 @@ function addSource(id, capture, name, meta) {
 // have to pay the multi-second probe. Fire-and-forget: a failed preheat only
 // means start pays the probe itself.
 function preheatFor(capture) {
+  // The Windows backend has no DDA verdict to warm and no window rectangle to
+  // raise — its prepare checks addresses only, in microseconds.
+  if (state.backend === "windows") return;
   let rect = null;
   if (capture.Desktop) {
     rect = state.screen;
@@ -220,15 +240,37 @@ function sourceSelect(label, options, prefix, current, apply, disabled) {
   return sel;
 }
 
+// Source-row tile icons (outline, 1.4 stroke — one family, three kinds).
+// Decorative: the row-name beside the tile already says what it is.
+const SOURCE_ICONS = {
+  desktop:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="9" rx="1.4"/><path d="M5 14h6M8 11.5V14" stroke-linecap="round"/></svg>',
+  window:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="11" rx="1.4"/><path d="M1.5 5.5h13"/><circle cx="4" cy="4" r="0.6" fill="currentColor" stroke="none"/></svg>',
+  camera:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="4" width="9.5" height="8" rx="1.6"/><path d="M11 7.2 14.2 5.4v5.2L11 8.8z" stroke-linejoin="round"/></svg>',
+};
+
+function sourceTile(capture) {
+  const tile = document.createElement("span");
+  tile.className = "tile";
+  tile.setAttribute("aria-hidden", "true");
+  const kind = capture.Desktop ? "desktop" : capture.Window ? "window" : "camera";
+  tile.innerHTML = SOURCE_ICONS[kind];
+  return tile;
+}
+
 function render() {
+  // While a take is running the transport bar stays on every tab: a timer and
+  // a stop button you cannot see are how a recording gets forgotten.
+  document.body.classList.toggle("recording", state.recording);
   listEl.replaceChildren();
 
   for (const s of state.sources) {
     const row = document.createElement("div");
     row.className = "row";
 
-    const dot = document.createElement("span");
-    dot.className = "dot";
+    const tile = sourceTile(s.capture);
 
     // Derived on every render rather than stored: switching language has to
     // relabel the rows that are already in the list.
@@ -276,7 +318,7 @@ function render() {
       removeSource(s.id);
     });
 
-    row.append(dot, main, fpsSel, qualitySel, remove);
+    row.append(tile, main, fpsSel, qualitySel, remove);
     listEl.append(row);
   }
 
@@ -334,7 +376,8 @@ function openTake(dir) {
 }
 
 function renderTabs() {
-  $("count").textContent = state.sources.length > 0 ? String(state.sources.length) : "";
+  // No source count on the tab (2026-10-20): the pane and the status bar
+  // already say it, and the badge just made the tab bar noisy.
   $("tab-history").classList.toggle("unread", journal.unread_takes > 0);
   const logTab = $("tab-log");
   logTab.classList.toggle("unread", journal.unread_log > 0);
@@ -492,11 +535,19 @@ async function refreshJournal() {
 
 function selectTab(name) {
   activeTab = name;
-  for (const tab of ["sources", "history", "log"]) {
+  // The params bar and the transport only belong to the Record workspace;
+  // style.css hides them on the other tabs off this attribute.
+  document.body.dataset.tab = name;
+  for (const tab of TAB_ORDER) {
     $("tab-" + tab).setAttribute("aria-selected", String(tab === name));
     $("pane-" + tab).classList.toggle("hidden", tab !== name);
   }
-  if (name !== "sources") refreshJournal();
+  if (name === "history" || name === "log") refreshJournal();
+  // Remember the tab across restarts. Fire and forget: a failed write must
+  // not interrupt someone clicking around the tabs.
+  invoke("set_active_tab", { tab: name }).catch((e) =>
+    console.error("set_active_tab", e),
+  );
 }
 
 async function refreshSources() {
@@ -580,10 +631,14 @@ function buildPicker() {
   const gWindows = group(t("picker.windows"));
   for (const w of state.windows) {
     const name = truncate(w.title, 48);
+    const meta =
+      state.backend === "windows"
+        ? `${w.w}×${w.h} · ${t("picker.bgCapable")}`
+        : `${w.w}×${w.h}`;
     item(
       gWindows,
       name,
-      `${w.w}×${w.h}`,
+      meta,
       (q) => w.title.toLowerCase().includes(q),
       () =>
         addSource(
@@ -757,20 +812,14 @@ async function toggleRecording() {
       // off the take is already running when this resolves (and `take:started`
       // can arrive first), so blindly setting the countdown flag afterwards
       // would freeze the clock for the whole take.
+      // Reusing sessionParams is deliberate: an inline copy once forgot
+      // `backend`, and serde's default quietly sent every take to the ffmpeg
+      // backend while the panel said "Windows API".
       const started = await invoke("start_recording", {
         req: {
-          // fps and quality are per source; the session-wide quality only
-          // covers a source that somehow has none.
-          sources: state.sources.map(({ id, capture, fps, quality }) => ({
-            id,
-            capture,
-            fps,
-            quality,
-          })),
-          out_root: state.outRoot,
+          ...sessionParams(),
+          // The session-wide quality only covers a source without its own.
           quality: DEFAULT_QUALITY,
-          encoder: state.encoder,
-          marks: state.marks,
         },
       });
       // The take is prepared but not running: the veil is counting down and
@@ -839,13 +888,21 @@ async function tick() {
 }
 
 $("add-btn").addEventListener("click", openPicker);
+$("backend").addEventListener("change", (e) => {
+  state.backend = e.target.value;
+  persist();
+  buildPicker();
+  render();
+  PROBE(`backend-changed:${state.backend}`);
+});
+
 pickerSearch.addEventListener("input", applyPickerFilter);
 pickerSearch.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closePicker();
 });
 $("rec-btn").addEventListener("click", toggleRecording);
 
-const TAB_ORDER = ["sources", "history", "log"];
+const TAB_ORDER = ["sources", "history", "log", "settings"];
 
 for (const tab of TAB_ORDER) {
   const el = $("tab-" + tab);
@@ -950,7 +1007,18 @@ window.__TAURI__.event.listen("ui:settings", (e) => {
 });
 
 function setParamsDisabled(off) {
-  for (const el of document.querySelectorAll(".params input, .params select, .params button")) {
+  // The recording switches live in the settings popover now (the params bar
+  // overflows with their English labels), but they configure the next take
+  // and stay locked while one is running — same rule as the params bar.
+  // Every recording control lives in the settings pane now (the params bar
+  // is just the output path), but they configure the next take and stay
+  // locked while one is running — same rule as before. Language/theme rows
+  // stay clickable.
+  // Recording controls by name — the language/theme selects share .set-row
+  // but are UI settings and stay usable while a take runs.
+  for (const el of document.querySelectorAll(
+    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #raise-value, #hotkey-btn",
+  )) {
     el.disabled = off;
   }
 }
@@ -980,6 +1048,10 @@ function bindParams() {
     state.marks = e.target.checked;
     persist();
   });
+  $("raise-value").addEventListener("change", (e) => {
+    state.raiseSources = e.target.checked;
+    persist();
+  });
   $("countdown-value").addEventListener("change", (e) => {
     if (e.target.checked) {
       state.countdownSecs = state.lastCountdownSecs || 3;
@@ -1000,14 +1072,10 @@ document.addEventListener("mousedown", (e) => {
   if (!picker.classList.contains("hidden")) {
     if (!picker.contains(e.target) && !e.target.closest("#add-btn")) closePicker();
   }
-  if (!settingsPanel.classList.contains("hidden")) {
-    if (!settingsPanel.contains(e.target) && !settingsBtn.contains(e.target)) closeSettings();
-  }
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closePicker();
-    closeSettings();
   }
 });
 
@@ -1021,8 +1089,15 @@ function applySaved(cfg) {
     state.encoder = cfg.encoder;
     $("encoder").value = cfg.encoder;
   }
+  // Anything that is not "ffmpeg" reads as the Windows backend: an old config
+  // has no field at all, and the in-process backend is the default going
+  // forward.
+  state.backend = cfg.backend === "ffmpeg" ? "ffmpeg" : "windows";
+  $("backend").value = state.backend;
   state.marks = cfg.marks;
   $("marks-value").checked = state.marks;
+  state.raiseSources = !!cfg.raise_sources;
+  $("raise-value").checked = state.raiseSources;
   state.countdownSecs = typeof cfg.countdown_secs === "number" ? cfg.countdown_secs : 3;
   if (state.countdownSecs > 0) state.lastCountdownSecs = state.countdownSecs;
   $("countdown-value").checked = state.countdownSecs > 0;
@@ -1051,6 +1126,8 @@ function applySaved(cfg) {
   applyTheme(state.theme);
   applyLanguageUi();
   renderSettingsState();
+  // Land on the tab the user last had open (default: the first one).
+  if (TAB_ORDER.includes(cfg.active_tab)) selectTab(cfg.active_tab);
   // What the window is actually showing, not what the file said: the probe is
   // the only way to see the applied language, the resolved palette and the
   // chip's text without a screenshot.
@@ -1068,8 +1145,7 @@ function applySaved(cfg) {
 // moment. The panel applies what comes back rather than what it asked for —
 // the file is the truth, and a value that failed to save must not look applied.
 
-const settingsPanel = $("settings");
-const settingsBtn = $("settings-btn");
+const settingsPanel = $("pane-settings");
 
 function encoderAutoLabel() {
   return state.encoderName
@@ -1090,12 +1166,8 @@ function applyLanguageUi() {
 }
 
 function renderSettingsState() {
-  for (const b of settingsPanel.querySelectorAll("[data-lang]")) {
-    b.setAttribute("aria-pressed", String(b.dataset.lang === state.language));
-  }
-  for (const b of settingsPanel.querySelectorAll("[data-theme-opt]")) {
-    b.setAttribute("aria-pressed", String(b.dataset.themeOpt === state.theme));
-  }
+  $("lang-select").value = state.language;
+  $("theme-select").value = state.theme;
 }
 
 function applySettings(info) {
@@ -1110,41 +1182,17 @@ function applySettings(info) {
   PROBE(`settings-changed lang=${state.language} theme=${state.theme}`);
 }
 
-function openSettings() {
-  settingsPanel.classList.remove("hidden");
-  settingsBtn.setAttribute("aria-expanded", "true");
-  // The picker and this card share a corner; two open popovers would overlap
-  // into something that reads as a bug.
-  closePicker();
-}
+$("lang-select").addEventListener("change", (e) => {
+  invoke("set_language", { language: e.target.value })
+    .then(applySettings)
+    .catch((err) => notify("error", uiErrorText(err)));
+});
 
-function closeSettings() {
-  settingsPanel.classList.add("hidden");
-  settingsBtn.setAttribute("aria-expanded", "false");
-}
-
-function toggleSettings() {
-  if (settingsPanel.classList.contains("hidden")) openSettings();
-  else closeSettings();
-}
-
-settingsBtn.addEventListener("click", toggleSettings);
-
-for (const b of settingsPanel.querySelectorAll("[data-lang]")) {
-  b.addEventListener("click", () => {
-    invoke("set_language", { language: b.dataset.lang })
-      .then(applySettings)
-      .catch((e) => notify("error", uiErrorText(e)));
-  });
-}
-
-for (const b of settingsPanel.querySelectorAll("[data-theme-opt]")) {
-  b.addEventListener("click", () => {
-    invoke("set_theme", { theme: b.dataset.themeOpt })
-      .then(applySettings)
-      .catch((e) => notify("error", uiErrorText(e)));
-  });
-}
+$("theme-select").addEventListener("change", (e) => {
+  invoke("set_theme", { theme: e.target.value })
+    .then(applySettings)
+    .catch((err) => notify("error", uiErrorText(err)));
+});
 
 // ── The hotkey chip ────────────────────────────────────────────────────────
 // Registration lives in Rust: `set_hotkey` re-registers through the plugin,
@@ -1173,7 +1221,9 @@ function beginHotkeyCapture() {
 function endHotkeyCapture() {
   state.capturing = false;
   chip.classList.remove("capturing");
-  chipNote.textContent = "";
+  // Back to the standing hint — the slot stays filled so the row keeps its
+  // height and the line reads as help rather than a gap.
+  chipNote.textContent = t("params.hotkeyHint");
   window.removeEventListener("keydown", captureHotkey, true);
   renderHotkey();
 }

@@ -3305,6 +3305,7 @@ dependencies = [
  "mouseshow",
  "serde",
  "serde_json",
+ "takekit-media",
  "windows",
 ]
 

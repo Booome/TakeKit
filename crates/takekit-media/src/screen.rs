@@ -23,6 +23,7 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window;
 
+use crate::clock::TakeClock;
 use crate::error::{MediaError, Result};
 use crate::frame::{MediaFrame, PixelFormat, VideoFrame};
 
@@ -48,10 +49,15 @@ impl ScreenCapture {
     /// long pause. The interval passed here caps how often an update is
     /// *eligible* — without it a 144 Hz display hands over far more frames than
     /// the take needs.
-    pub fn start(target: ScreenTarget, fps: u32, out: Sender<MediaFrame>) -> Result<Self> {
+    pub fn start(
+        target: ScreenTarget,
+        fps: u32,
+        out: Sender<MediaFrame>,
+        clock: TakeClock,
+    ) -> Result<Self> {
         let interval =
             MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
-        let flags = (std::sync::Arc::new(AtomicBool::new(false)), out);
+        let flags = (std::sync::Arc::new(AtomicBool::new(false)), out, clock);
 
         let control = match target {
             ScreenTarget::Monitor(index) => {
@@ -115,12 +121,12 @@ where
     .map_err(|e| MediaError::message(e.to_string()))
 }
 
-type HandlerFlags = (std::sync::Arc<AtomicBool>, Sender<MediaFrame>);
+type HandlerFlags = (std::sync::Arc<AtomicBool>, Sender<MediaFrame>, TakeClock);
 
 struct Handler {
     stop: std::sync::Arc<AtomicBool>,
     out: Sender<MediaFrame>,
-    first: Option<i64>,
+    clock: TakeClock,
 }
 
 impl GraphicsCaptureApiHandler for Handler {
@@ -130,12 +136,8 @@ impl GraphicsCaptureApiHandler for Handler {
     fn new(
         ctx: windows_capture::capture::Context<Self::Flags>,
     ) -> std::result::Result<Self, Self::Error> {
-        let (stop, out) = ctx.flags;
-        Ok(Self {
-            stop,
-            out,
-            first: None,
-        })
+        let (stop, out, clock) = ctx.flags;
+        Ok(Self { stop, out, clock })
     }
 
     fn on_frame_arrived(
@@ -152,9 +154,10 @@ impl GraphicsCaptureApiHandler for Handler {
 
         // The frame's own clock, not a stopwatch started here: several sources
         // in the same take have to agree on when a moment was, and only the
-        // capture timestamps do that.
-        let time = frame.timestamp()?.Duration;
-        let start = *self.first.get_or_insert(time);
+        // capture timestamps do that. WGC stamps in the system clock, so the
+        // take's shared origin is one subtraction away — exact, unlike a
+        // device clock which has to be bridged through the wall.
+        let time = self.clock.from_system(frame.timestamp()?.Duration);
 
         let buffer = frame
             .buffer()
@@ -171,7 +174,7 @@ impl GraphicsCaptureApiHandler for Handler {
             height,
             format: PixelFormat::Bgra,
             data,
-            time: time - start,
+            time,
         }));
         Ok(())
     }

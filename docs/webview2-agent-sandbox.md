@@ -100,7 +100,7 @@ TakeKit 进程里有三个窗口（托盘面板 → overlay → 主窗口）。�
 ```powershell
 $root = "$env:TEMP\tk_run"
 $env:APPDATA = "$root\APPDATA"                       # 隔离配置/历史，不碰用户真实数据
-$env:TAKEKIT_PROBE_LOG = "$root\probe.log"           # 探针（见 HANDOFF §7.1）
+$env:TAKEKIT_PROBE_LOG = "$root\probe.log"           # 探针（见 docs/development.md §5.1）
 $env:WEBVIEW2_USER_DATA_FOLDER = "$root\wv2"         # 缓解①
 $env:TAKEKIT_WEBVIEW_NO_SANDBOX = "1"                # 缓解②（RendererCodeIntegrity 自动并入）
 Start-Process -FilePath "target\release\takekit-gui.exe" -WorkingDirectory (Get-Location) -PassThru
@@ -117,7 +117,7 @@ Start-Process -FilePath "target\release\takekit-gui.exe" -WorkingDirectory (Get-
 4. 抓屏：倒计时期间用 **.NET 中心裁剪**（900×500，~100ms）；`Graphics.CopyFromScreen`
    全屏编码要 ~4s（错过整个倒计时），**ffmpeg gdigrab 在遮罩升起时不可用**
    （会挂住）。倒计时结束后再全屏 shot 没有时间压力。
-5. PowerShell 5.1 按 ANSI 读无 BOM 的 .ps1——**脚本里不要出现中文**（HANDOFF 陷阱 #10 同类）。
+5. PowerShell 5.1 按 ANSI 读无 BOM 的 .ps1——**脚本里不要出现中文**（`docs/development.md` 陷阱清单同类）。
 
 ## 5. 已知残余风险
 
@@ -125,7 +125,7 @@ Start-Process -FilePath "target\release\takekit-gui.exe" -WorkingDirectory (Get-
   （同配置后续 4 次全部稳定 60–240s）。无 Rust panic、无事件日志，疑似注入 DLL
   与渲染管线的竞态。若复现，优先怀疑 UDF 被上次崩溃现场污染（换新目录再试）。
 - **UIA 内容树取不到**：之前会话能用 `FromHandle + Descendants` 拿到 40 个元素
-  驱动面板；本环境实测（聚焦 + 真实点击后）只有 16 个空 Pane。HANDOFF §7.3 的
+  驱动面板；本环境实测（聚焦 + 真实点击后）只有 16 个空 Pane。`docs/development.md` §5.2 的
   UIA 点击法当前不可用，需要点具体控件时先重新验证此法。
 - 沙箱代理在命令结束后死亡：GUI 进程里残留的 `HTTP_PROXY` 指向死端口。
   WebView2 的自带网络请求可能因此挂起（未观察到影响页面加载，记录备查）。

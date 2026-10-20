@@ -14,6 +14,11 @@ pub struct SourceRecord {
     pub id: String,
     pub file: String,
     pub duration: Option<f64>,
+    /// Frames the capture delivered (Windows-API sources). The file itself has
+    /// `duration x fps` slots — a pause is held frames — so this number says
+    /// how much of the take was a fresh picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u64>,
     pub source: Source,
 }
 
@@ -28,12 +33,20 @@ pub struct Manifest {
 
 pub struct Take {
     pub dir: PathBuf,
+    /// The output extension: `.mkv` for the ffmpeg backend, `.mp4` for the
+    /// Windows one — Media Foundation's sink writer muxes MP4.
+    pub ext: &'static str,
     pub manifest: Manifest,
 }
 
 impl Take {
     /// Create `root/<timestamp>/` for a new take.
-    pub fn create(root: &Path, encoder: Encoder, sources: &[Source]) -> std::io::Result<Self> {
+    pub fn create(
+        root: &Path,
+        ext: &'static str,
+        encoder: Encoder,
+        sources: &[Source],
+    ) -> std::io::Result<Self> {
         let stamp = timestamp();
         // A stop followed by a start inside the same second would otherwise
         // reuse the directory: the second take's manifest would overwrite the
@@ -69,18 +82,19 @@ impl Take {
                 .iter()
                 .map(|s| SourceRecord {
                     id: s.id.clone(),
-                    file: format!("{}.mkv", s.id),
+                    file: format!("{}.{}", s.id, ext),
                     duration: None,
+                    frames: None,
                     source: s.clone(),
                 })
                 .collect(),
         };
 
-        Ok(Self { dir, manifest })
+        Ok(Self { dir, ext, manifest })
     }
 
     pub fn path_for(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.mkv"))
+        self.dir.join(format!("{id}.{}", self.ext))
     }
 
     pub fn save_manifest(&self) -> std::io::Result<()> {
@@ -90,6 +104,13 @@ impl Take {
         // rewritten when the take ends, and a crash mid-write must not leave a
         // truncated take.json where a valid one already was.
         crate::fsx::write_atomic(&self.dir.join("take.json"), &text)
+    }
+
+    /// Record how many frames a source's capture delivered.
+    pub fn set_frames(&mut self, id: &str, frames: Option<u64>) {
+        if let Some(s) = self.manifest.sources.iter_mut().find(|s| s.id == id) {
+            s.frames = frames;
+        }
     }
 
     pub fn set_duration(&mut self, id: &str, seconds: Option<f64>) {
@@ -134,7 +155,7 @@ mod tests {
     #[test]
     fn a_manifest_round_trips_through_disk() {
         let root = scratch("roundtrip");
-        let mut take = Take::create(&root, Encoder::X264, &[source("screen")]).unwrap();
+        let mut take = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
         take.set_duration("screen", Some(2.5));
         take.save_manifest().unwrap();
 
@@ -151,8 +172,8 @@ mod tests {
     #[test]
     fn a_second_take_in_the_same_second_gets_its_own_directory() {
         let root = scratch("collision");
-        let first = Take::create(&root, Encoder::X264, &[source("screen")]).unwrap();
-        let second = Take::create(&root, Encoder::X264, &[source("screen")]).unwrap();
+        let first = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
+        let second = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
         assert_ne!(first.dir, second.dir);
         assert!(second.dir.to_string_lossy().ends_with("-2"));
         let _ = fs::remove_dir_all(&root);
@@ -161,7 +182,7 @@ mod tests {
     #[test]
     fn set_duration_leaves_unknown_ids_alone() {
         let root = scratch("duration");
-        let mut take = Take::create(&root, Encoder::X264, &[source("screen")]).unwrap();
+        let mut take = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
         take.set_duration("missing", Some(1.0));
         assert!(take.manifest.sources[0].duration.is_none());
         let _ = fs::remove_dir_all(&root);

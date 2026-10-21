@@ -4,6 +4,12 @@ takes/
 *.mp4
 *.mov
 .superpowers/
+# The workbench: scratch files, screenshots, mockups. Never committed — the
+# same rule as the main repo's top-level _scratch/.
+_scratch/
 # Probe/verification scripts stay local (see docs/development.md §5.3):
 # they drive Win32/UIA and drift with the environment, not part of the product.
-docs/tools/
+# The one exception is check-contracts.py: pure static analysis, cross-platform,
+# and CI runs it (a fresh clone must have it).
+docs/tools/*
+!docs/tools/check-contracts.py

@@ -17,6 +17,10 @@ use takekit_media::{
     TakeClock, writer,
 };
 
+mod client;
+mod ctl;
+mod mcp;
+
 #[derive(Parser)]
 #[command(
     name = "takekit",
@@ -40,6 +44,11 @@ enum Command {
     Record(RecordArgs),
     /// Capture through the Windows APIs instead of ffmpeg (experimental)
     Media(MediaArgs),
+    /// Drive the running panel (docs/agent-control.md)
+    #[command(subcommand)]
+    Ctl(ctl::Ctl),
+    /// Speak MCP over stdio, for AI agents
+    Mcp,
 }
 
 #[derive(clap::Args)]
@@ -53,8 +62,8 @@ struct RecordArgs {
     desktop: bool,
 
     /// Capture through the Windows APIs (WGC + Media Foundation) instead of
-    /// ffmpeg children. Keeps recording a window that sits behind others, and
-    /// records the first monitor only
+    /// ffmpeg children. Keeps recording a window that sits behind others.
+    /// Records one monitor: the first, or the one a --crop region sits on
     #[arg(long)]
     windows: bool,
 
@@ -145,7 +154,7 @@ enum EncoderArg {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CropArg(Crop);
+pub(crate) struct CropArg(pub(crate) Crop);
 
 impl std::str::FromStr for CropArg {
     type Err = String;
@@ -172,6 +181,8 @@ fn main() {
         Command::List { filter } => list(&filter),
         Command::Record(args) => record(args),
         Command::Media(args) => media(args),
+        Command::Ctl(cmd) => ctl::run(cmd),
+        Command::Mcp => mcp::run(),
     };
     if let Err(e) = result {
         eprintln!("takekit: {e}");
@@ -380,7 +391,11 @@ fn media(args: MediaArgs) -> Result<(), String> {
     }
 
     std::fs::create_dir_all(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))?;
-    let stamp = chrono_stamp();
+    // The same local-time stamp the panel and `record` name their takes with
+    // (shared from the core): this harness once computed the date from the
+    // UNIX epoch by hand, which is UTC — on a UTC+8 machine its folders read
+    // eight hours off the panel's history.
+    let stamp = takekit_core::take::timestamp();
     let dir = args.out.join(stamp);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
@@ -625,41 +640,6 @@ fn resolve_mic(devices: &DeviceList, name: &str) -> Result<String, String> {
 
 fn string_of<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
-}
-
-/// A directory name from the local clock, the same shape the ffmpeg backend
-/// uses for a take.
-fn chrono_stamp() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = seconds / 86_400;
-    let time_of_day = seconds % 86_400;
-    let (y, m, d) = civil_from_days(days as i64);
-    format!(
-        "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}",
-        y,
-        m,
-        d,
-        time_of_day / 3600,
-        time_of_day % 3600 / 60,
-        time_of_day % 60
-    )
-}
-
-/// Days since 1970-01-01 as a calendar date (Howard Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

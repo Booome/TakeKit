@@ -486,7 +486,11 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
         // Cover first, then the event that paints STOP on it: the veil must
         // not come up empty and fill in a frame later.
         crate::overlay::show(app);
-        let _ = app.emit_to(crate::overlay::LABEL, "take:beep", &BeepInfo { hz: 660, ms: 200 });
+        let _ = app.emit_to(
+            crate::overlay::LABEL,
+            "take:beep",
+            &BeepInfo { hz: 660, ms: 200 },
+        );
     }
     let _ = app.emit(
         "take:finalize",
@@ -553,9 +557,11 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     // window is in front, and "it stopped" has to be something the user sees.
     // Stopping from the panel itself is a no-op here — it is already front.
     crate::show_main_window(app);
-    if announce {
-        let _ = app.emit_to("main", "take:stopped", &result);
-    }
+    // `take:done` above is the one completion event: the panel's status bar,
+    // the history refresh and the stop screen all read it. A second
+    // `take:stopped` used to exist and now has no listener — the event
+    // contract lives in proto.rs and DESIGN §4.11, so it was removed rather
+    // than left as an alias.
     Ok(result)
 }
 

@@ -1,6 +1,20 @@
 //! Small filesystem helpers shared by the core and the GUI.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// `%APPDATA%\TakeKit` — the one place the app keeps its files, falling back
+/// to the temp dir when `APPDATA` is unset (a stripped environment still gets
+/// persistence).
+///
+/// Single definition on purpose: the panel's `config.json`, the control
+/// surface's `control.json` and the CLI client that reads it all resolve
+/// through here, so the three can never disagree about where the door is.
+pub fn app_dir() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("TakeKit")
+}
 
 /// Write `body` to `path` through a sibling staging file and a rename.
 ///
@@ -33,6 +47,13 @@ pub fn backup_corrupt(path: &Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_app_dir_ends_with_the_one_folder_every_front_end_agrees_on() {
+        // The panel, the control server and the CLI client all join their
+        // file names onto this; a rename here moves all three together.
+        assert_eq!(app_dir().file_name().unwrap(), "TakeKit");
+    }
 
     #[test]
     fn a_write_replaces_the_previous_content() {

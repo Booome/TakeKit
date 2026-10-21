@@ -16,10 +16,12 @@ the camera with another, then line them up in an editor. TakeKit treats a
 recording the way a film crew treats a take — every source starts and stops
 together, so the files already line up.
 
-Each source gets **its own encoder process**. That is not a shortcut, it is the
-point: a single ffmpeg fed several inputs picks the input to read next by
+Each source gets **its own encoder**: one ffmpeg child per source on the
+ffmpeg backend, and one in-process writer thread per source on the default
+Windows-API backend (no child processes at all). That is not a shortcut, it is
+the point: a single ffmpeg fed several inputs picks the input to read next by
 timestamp, which starves the desktop grabber down to about half the requested
-frame rate. Separate processes keep every source at its own rate.
+frame rate. Separate encoders keep every source at its own rate.
 
 ## What it does today
 
@@ -77,7 +79,7 @@ MIT. See [LICENSE](LICENSE).
 
 录屏通常是拼出来的：一个工具录屏幕、另一个录摄像头，再到剪辑软件里对齐。TakeKit 把一次录制当成电影里的「一条 take」——所有源同时开始、同时结束，文件本来就是对好的。
 
-**每个源一个独立 ffmpeg 进程**，这不是偷懒而是必需：单个 ffmpeg 喂多路输入时会按时间戳挑下一个该读谁，抓屏那一路会被饿到只剩一半帧率。拆开进程才能让每路都跑满自己的帧率。
+**每个源一个独立编码器**，这不是偷懒而是必需：ffmpeg 后端下是每个源一个 ffmpeg 子进程，默认的 Windows API 后端则是每个源一个进程内 writer 线程（不 spawn 任何子进程）。单个 ffmpeg 喂多路输入时会按时间戳挑下一个该读谁，抓屏那一路会被饿到只剩一半帧率。编码器分开才能让每路都跑满自己的帧率。
 
 现在能做的：
 

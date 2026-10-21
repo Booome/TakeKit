@@ -189,9 +189,11 @@ pub fn monitors() -> Result<Vec<MonitorRect>> {
 pub fn monitor_index_for(x: i32, y: i32, w: u32, h: u32) -> Option<usize> {
     let cx = x + (w as i32 / 2);
     let cy = y + (h as i32 / 2);
-    monitors().ok()?.into_iter().find(|m| {
-        cx >= m.x && cx < m.x + m.w as i32 && cy >= m.y && cy < m.y + m.h as i32
-    }).map(|m| m.index)
+    monitors()
+        .ok()?
+        .into_iter()
+        .find(|m| cx >= m.x && cx < m.x + m.w as i32 && cy >= m.y && cy < m.y + m.h as i32)
+        .map(|m| m.index)
 }
 
 type HandlerFlags = (std::sync::Arc<AtomicBool>, Sender<MediaFrame>, TakeClock);

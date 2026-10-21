@@ -14,8 +14,10 @@ pub const ID: &str = "main";
 /// than a copy of a palette token — it only has to read as "neutral" against
 /// both light and dark taskbars.
 const IDLE: [u8; 3] = [0x8a, 0x8a, 0x8a];
-/// Recording red, taken from `--tk-rec` in `ui/style.css`.
-const RECORDING: [u8; 3] = [0xce, 0x1f, 0x1f];
+/// Recording red, taken from `--tk-rec` in `ui/style.css` (light theme; the
+/// dark theme's `#ff5f52` is too light to read on a dark taskbar). Keep the
+/// two in sync — this constant drifted a palette generation behind once.
+const RECORDING: [u8; 3] = [0xdc, 0x26, 0x26];
 
 const SIZE: u32 = 32;
 const CENTER: f32 = 16.0;
@@ -94,8 +96,8 @@ mod tests {
     #[test]
     fn centre_is_opaque_and_takes_the_colour() {
         let buf = dot_rgba(RECORDING);
-        assert_eq!(px(&buf, 16, 16), [0xce, 0x1f, 0x1f, 255]);
-        assert_eq!(px(&buf, 15, 15), [0xce, 0x1f, 0x1f, 255]);
+        assert_eq!(px(&buf, 16, 16), [0xdc, 0x26, 0x26, 255]);
+        assert_eq!(px(&buf, 15, 15), [0xdc, 0x26, 0x26, 255]);
     }
 
     #[test]

@@ -402,7 +402,12 @@ impl MediaRunning {
                 Some((report.width, report.height)),
                 None,
             ),
-            Ok(_) => (None, Some(0), None, Some("no frames were written".to_string())),
+            Ok(_) => (
+                None,
+                Some(0),
+                None,
+                Some("no frames were written".to_string()),
+            ),
             Err(e) => (None, None, None, Some(e)),
         };
         Collected {

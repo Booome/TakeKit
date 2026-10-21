@@ -16,3 +16,7 @@ path = "src/main.rs"
 takekit-core = { path = "../takekit-core" }
 takekit-media = { path = "../takekit-media" }
 clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true
+# Talking to the panel's control surface (docs/agent-control.md). No TLS
+# feature: the server is loopback-only and plain http://127.0.0.1.
+ureq = { version = "2", default-features = false, features = ["json"] }

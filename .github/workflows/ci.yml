@@ -16,7 +16,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Fmt
+        run: cargo fmt --all --check
       - name: Test
         run: cargo test --release
+      - name: Contracts
+        run: python docs/tools/check-contracts.py
       - name: Build
         run: cargo build --release --locked

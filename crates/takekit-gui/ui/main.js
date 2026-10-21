@@ -471,28 +471,28 @@ function renderTabs() {
   logTab.classList.toggle("error", journal.unread_log_level === "error");
 }
 
-// The trash on a history row. Same two-step rule as Clear (`bindClear`): the
-// first click arms, the second deletes — a delete that happens on one click is
-// a delete that happens by accident. The folder on disk goes with the row
-// (take_delete), so the arm state is the only thing standing between a slip
-// and an unrecoverable file.
-function takeDeleteButton(take) {
+// The trash on a row (history takes, log entries). Same two-step rule as
+// Clear (`bindClear`): the first click arms, the second deletes — a delete
+// that happens on one click is a delete that happens by accident. `label` is
+// the aria sentence naming the row, `text`/`armedText` the two halves of the
+// title, and `onConfirm` does the deed (a take also takes its folder with it,
+// which is why the arm state is not optional).
+function rowTrash({ label, text, armedText, onConfirm }) {
   const btn = document.createElement("button");
   btn.className = "row-del";
   btn.type = "button";
-  const label = () => t("take.deleteLabel", { when: timeLabel(take.at) });
   const stamp = () => {
     // While armed the name says what the second click will do; `title` is the
     // only text an icon button has, so it carries both halves of the story.
-    const text = btn.classList.contains("armed") ? t("take.deleteArmed") : t("take.delete");
-    btn.title = text;
-    btn.setAttribute("aria-label", `${label()} — ${text}`);
+    const words = btn.classList.contains("armed") ? armedText : text;
+    btn.title = words;
+    btn.setAttribute("aria-label", `${label} — ${words}`);
   };
   stamp();
   btn.innerHTML = TRASH_ICON;
   let armed = null;
   btn.addEventListener("click", (e) => {
-    // A click on the trash is a delete, never an invitation to open the take.
+    // A click on the trash is a delete, never an invitation to open the row.
     e.stopPropagation();
     if (!armed) {
       btn.classList.add("armed");
@@ -506,7 +506,7 @@ function takeDeleteButton(take) {
     }
     clearTimeout(armed);
     armed = null;
-    invoke("take_delete", { dir: take.dir })
+    onConfirm()
       .then((view) => {
         journal = view;
         renderJournal();
@@ -519,6 +519,27 @@ function takeDeleteButton(take) {
       });
   });
   return btn;
+}
+
+function takeDeleteButton(take) {
+  return rowTrash({
+    label: t("take.deleteLabel", { when: timeLabel(take.at) }),
+    text: t("take.delete"),
+    armedText: t("take.deleteArmed"),
+    onConfirm: () => invoke("take_delete", { dir: take.dir }),
+  });
+}
+
+function logDeleteButton(entry) {
+  return rowTrash({
+    label: t("log.deleteLabel", { when: timeLabel(entry.at) }),
+    text: t("log.delete"),
+    armedText: t("log.deleteArmed"),
+    // By the stamp the entry carries, not its position: the list moves under
+    // a row every time a new line lands, and a row that deletes "slot 3" one
+    // second later deletes someone else.
+    onConfirm: () => invoke("log_delete", { at: entry.at }),
+  });
 }
 
 // Outline trash, same 16px / 1.4 family as SOURCE_ICONS (Phosphor `trash`).
@@ -611,7 +632,7 @@ function logRow(entry) {
     body.append(why);
   }
 
-  row.append(dot, when, body);
+  row.append(dot, when, body, logDeleteButton(entry));
   return row;
 }
 
@@ -1152,12 +1173,14 @@ $("notice-x").addEventListener("click", hideNotice);
 function bindClear(pane) {
   const btn = $(`${pane}-clear`);
   // A function, not a string: the label follows the language, including
-  // while an armed button is counting down.
-  const idle = () => t("history.clear");
+  // while an armed button is counting down. Each pane owns its keys — the
+  // log pane once read the history ones, which only looked right while the
+  // two said the same thing.
+  const idle = () => t(`${pane}.clear`);
   let armed = null;
   btn.addEventListener("click", () => {
     if (!armed) {
-      btn.textContent = t("history.clearArmed");
+      btn.textContent = t(`${pane}.clearArmed`);
       armed = setTimeout(() => {
         armed = null;
         btn.textContent = idle();
@@ -1260,16 +1283,31 @@ window.__TAURI__.event.listen("ui:settings", (e) => {
   applySettings(e.payload);
 });
 
+// The agent's writes land here (docs/agent-control.md): the panel must show
+// them the moment they happen, or the user is looking at a screen that quietly
+// disagrees with what was just recorded. A full re-sync rather than a
+// per-field diff on purpose — these events are rare (an agent acts, then
+// stops), and a stale branch is exactly the bug this exists to prevent.
+window.__TAURI__.event.listen("ctl:changed", async () => {
+  try {
+    const cfg = await invoke("config_get");
+    // Rebuilt, not merged: a source the agent removed must actually leave.
+    state.sources = [];
+    applySaved(cfg);
+    await pruneSources();
+    render();
+    renderSettingsState();
+    await refreshJournal();
+  } catch (e) {
+    console.error("ctl:changed", e);
+  }
+});
+
 function setParamsDisabled(off) {
-  // The recording switches live in the settings popover now (the params bar
-  // overflows with their English labels), but they configure the next take
-  // and stay locked while one is running — same rule as the params bar.
-  // Every recording control lives in the settings pane now (the params bar
-  // is just the output path), but they configure the next take and stay
-  // locked while one is running — same rule as before. Language/theme rows
-  // stay clickable.
-  // Recording controls by name — the language/theme selects share .set-row
-  // but are UI settings and stay usable while a take runs.
+  // Every recording control lives in the settings pane now (the params bar is
+  // just the output path), but they configure the *next* take and stay locked
+  // while one runs. Recording controls are selected by name: the
+  // language/theme rows share .set-row but are UI settings and stay usable.
   for (const el of document.querySelectorAll(
     ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn",
   )) {
@@ -1284,7 +1322,10 @@ function bindParams() {
     persist();
   });
   $("out-browse").addEventListener("click", () => {
-    invoke("pick_folder")
+    // The native dialog is the one surface the webview's i18n cannot reach,
+    // so its title travels into the command from here — where the dictionary
+    // lives. Same key as the button's own aria/title.
+    invoke("pick_folder", { title: t("params.outPick") })
       .then((dir) => {
         if (dir) {
           state.outRoot = dir;
@@ -1327,6 +1368,14 @@ function bindParams() {
       console.error("set_finalize_panel", e),
     );
   });
+  // The switch owns a server, not a setting field: Rust starts or stops the
+  // listener and writes the file (docs/agent-control.md).
+  $("control-value").addEventListener("change", (e) => {
+    state.control = e.target.checked;
+    invoke("set_control", { on: state.control }).catch((e) =>
+      console.error("set_control", e),
+    );
+  });
 }
 bindParams();
 
@@ -1366,6 +1415,10 @@ function applySaved(cfg) {
   // An old config has no field: the stop screen defaults to on (DESIGN §4.6).
   state.finalizePanel = cfg.finalize_panel !== false;
   $("finalize-value").checked = state.finalizePanel;
+  // The agent's door (docs/agent-control.md) defaults to open: a config from
+  // before it existed comes up with the switch on, matching the Rust side.
+  state.control = cfg.control !== false;
+  $("control-value").checked = state.control;
   for (const s of savedSources) {
     state.sources.push({
       id: s.id,
@@ -2147,47 +2200,60 @@ function initEditor() {
 async function init() {
   PROBE("js-main-eval");
   initEditor();
-  // Parallel on purpose: the source lists do not depend on the environment
-  // probe, and the picker is usable as soon as they land — gating them behind
-  // the encoder probe would leave the picker empty for its first second.
+  // The source rows come from the config alone. The device lists, the
+  // environment probe and the journal all start at once and repaint what they
+  // own when they land — the first paint used to wait behind the ffmpeg
+  // encoder probe and the MF device walk, which left the Sources tab blank
+  // for their whole duration.
   const sources = refreshSources().catch((e) => {
     console.error("refreshSources", e);
   });
+  const env = invoke("env_info")
+    .then((e) => {
+      PROBE("ipc-env-ok:" + JSON.stringify(e));
+      return e;
+    })
+    .catch((e) => {
+      PROBE("ipc-env-fail:" + String(e).slice(0, 120));
+      notify("error", String(e));
+      return null;
+    });
   // Nothing saved is not a failure: the panel just comes up empty.
   const saved = await invoke("config_get").catch((e) => {
     console.error("config_get", e);
     return null;
   });
-  try {
-    const env = await invoke("env_info");
-    PROBE("ipc-env-ok:" + JSON.stringify(env));
-    state.screen = env.screen;
-    state.monitors = env.monitors || [];
-    // The temp directory is only a first-run default: a directory the user
-    // picked themselves outranks it.
-    if (!saved || !saved.out_root) {
-      if (env.default_out_root) {
-        state.outRoot = env.default_out_root;
-        $("out-path").value = state.outRoot;
-      }
-    }
-    if (!env.ffmpeg) {
-      notify("error", t("notice.noFfmpeg"), t("notice.noFfmpegDetail"));
-    } else if (env.encoder) {
-      state.encoderName = env.encoder;
-      $("encoder").options[0].textContent = encoderAutoLabel();
-    }
-  } catch (e) {
-    PROBE("ipc-env-fail:" + String(e).slice(0, 120));
-    notify("error", String(e));
-  }
-  await sources;
   if (saved) applySaved(saved);
   // Before the first render: a source that went away while the panel was
   // closed should never show up at all.
   const dropped = await pruneSources();
   render();
   if (dropped) notify("warn", prunedNotice(dropped), null);
+  const e = await env;
+  if (e) {
+    state.screen = e.screen;
+    state.monitors = e.monitors || [];
+    // The temp directory is only a first-run default: a directory the user
+    // picked themselves outranks it.
+    if (!saved || !saved.out_root) {
+      if (e.default_out_root) {
+        state.outRoot = e.default_out_root;
+        $("out-path").value = state.outRoot;
+      }
+    }
+    if (!e.ffmpeg) {
+      notify("error", t("notice.noFfmpeg"), t("notice.noFfmpegDetail"));
+    } else if (e.encoder) {
+      state.encoderName = e.encoder;
+      $("encoder").options[0].textContent = encoderAutoLabel();
+    }
+    // The picker has one row per monitor. When the device walk beat the probe
+    // it built without them; rebuild now that they are known. (The other
+    // order — probe first — leaves `sourcesLoaded` false, and the pending
+    // buildPicker gets the monitors for free.)
+    if (state.sourcesLoaded) buildPicker();
+  }
+  await sources;
   // Both list panes are restored before the first paint of them: opening a
   // tab must not show an empty list for a frame.
   await refreshJournal();

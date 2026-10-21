@@ -113,7 +113,9 @@ pub fn watch_moves(window: &WebviewWindow) {
         // Closing does not move the window, so this only catches a move made
         // inside the throttle window above.
         WindowEvent::CloseRequested { .. } => {
-            if !in_crop_mode() && let Ok(pos) = handle.outer_position() {
+            if !in_crop_mode()
+                && let Ok(pos) = handle.outer_position()
+            {
                 save(pos.x as f64, pos.y as f64);
             }
         }
@@ -208,9 +210,7 @@ pub fn enter_crop_mode(window: &WebviewWindow) -> Result<(), String> {
     let (ww, wh) = (work.size.width, work.size.height);
     // 90% of the work area.
     let inner = tauri::PhysicalSize::new(((ww as f64) * 0.9) as u32, ((wh as f64) * 0.9) as u32);
-    window
-        .set_size(inner)
-        .map_err(|e| format!("resize: {e}"))?;
+    window.set_size(inner).map_err(|e| format!("resize: {e}"))?;
     // Centred on the work area, using the size the window actually grew to
     // (the title bar is outside `inner_size` and would otherwise push the
     // window half a title bar low).

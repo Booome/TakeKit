@@ -230,10 +230,13 @@ MP4 sink 会把轨道重定基到首样本，所以共享原点以**前导填充
 
 ### 仍知的限制
 
+> 本节是 **2026-10-20 接入当日的快照**。下表有两条已被后续更新取代，划掉保留是为了
+> 记录当时的判断，现状以 §5 / §6 的更新为准。
+
 | 项 | 状态 |
 |---|---|
-| 桌面源 | Windows 后端只录**第一块显示器**（WGC 一次一个输出；虚拟屏不存在） |
+| 桌面源 | ~~Windows 后端只录**第一块显示器**~~ → ✅ 已支持（2026-10-21，picker 逐屏 + rect→Monitor，见 §5） |
 | 桌面 crop | 忽略（prepare 不再报错；面板默认无 crop 不受影响） |
-| 光标 | 仍不录（`CursorCaptureSettings::Default`），要对齐 ffmpeg 的 `draw_mouse=1` 得改 `WithCursor` |
+| 光标 | ~~仍不录（`CursorCaptureSettings::Default`）~~ → ✅ 已对齐（2026-10-21，`WithCursor`，见 §5） |
 | 摄像头 / 麦克风 | 代码就绪，本机无设备未验证 |
 | 编码器 | MF 自选（软件 H.264），quality 映射为分档 bitrate（`bitrate_for`） |

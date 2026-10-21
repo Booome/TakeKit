@@ -34,8 +34,9 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 ```
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
-- `takekit-core` 有 4 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
-- 基线（2026-10-20）：core 33 / cli 7 / gui 60 / media 14。以 `cargo test` 实际输出为准。
+- `takekit-core` 有 5 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
+- 基线（2026-10-22 实测）：core 43 / cli 9 / gui 82 / media 20。以 `cargo test` 实际输出为准。
+- `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **隔离运行**（不碰用户真实配置）与 WebView2 双缓解：见 `docs/webview2-agent-sandbox.md` §4（唯一出处，配方与两条铁律都在那里）。
 
 **开发约定**：沟通中文；代码、注释、标识符一律英文；`docs/` 下文档用中文。新行为走 TDD（先写失败测试）。不自动 commit / push——只有用户明确发话才提交。
@@ -153,9 +154,12 @@ ui:tick-first（每次 take 首次成功轮询）/ ui:show-main / main:close-hid
 js-error:<msg>
 ```
 
-**事件 vs 探针**：`take:started`、`take:stopped`、`take:cancelled`、`take:failed`、
-`take:beep`、`overlay:countdown`、`overlay:wake`、`hotkey:toggle`、`ui:settings` 是
-**Tauri 事件**（`emit_to`，前端 `listen` 接），不出现在探针里；它们的前端处理才写 `PROBE`。
+**事件 vs 探针**：`take:started`、`take:finalize`、`take:source`、`take:done`、
+`take:cancelled`、`take:failed`、`take:beep`、`overlay:countdown`、`overlay:wake`、
+`hotkey:toggle`、`ui:settings`、`ctl:changed`（控制面写操作后的全量重同步，
+见 `docs/agent-control.md`）是 **Tauri 事件**（`emit_to`，前端 `listen` 接），
+不出现在探针里；它们的前端处理才写 `PROBE`。（`take:stopped` 已删除：完成态
+由 `take:done` 单点承担，见 take.rs stop()。）
 
 **`js-error:` 最有用**：`index.html` 挂了 `window.onerror`，JS 一抛就进探针——不用猜"为什么界面不动"。
 

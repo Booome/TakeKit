@@ -18,6 +18,12 @@ serde.workspace = true
 serde_json.workspace = true
 rfd = "0.17.2"
 tauri-plugin-global-shortcut = "2"
+# The agent's control surface (docs/agent-control.md): a loopback HTTP server.
+# tiny_http rather than an async stack because the routes call the same
+# blocking functions the panel's commands do, one request at a time — see the
+# module's header. getrandom is the bearer token's entropy.
+tiny_http = "0.12"
+getrandom = "0.2"
 # The source editor's preview is one still picture carried to the page as a
 # data URL: PNG because a screenshot compresses, and base64 because that is
 # what an <img src> takes.

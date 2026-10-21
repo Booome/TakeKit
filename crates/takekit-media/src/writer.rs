@@ -888,7 +888,11 @@ mod tests {
         );
         // Edges rounded down to even: the 4x2 rectangle starting at (0, 0).
         assert_eq!((cropped.width, cropped.height), (4, 2));
-        assert_eq!(cropped.data.len(), 4 * 2 + 4, "luma plus a half-height chroma");
+        assert_eq!(
+            cropped.data.len(),
+            4 * 2 + 4,
+            "luma plus a half-height chroma"
+        );
         assert_eq!(&cropped.data[..4], &[0, 1, 2, 3]);
     }
 

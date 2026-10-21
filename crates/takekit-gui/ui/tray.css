@@ -1,25 +1,29 @@
 /* TakeKit tray popover — the panel's neutral ramp in a 220px card.
    Only the shared variables are copied from style.css: that file's layout is
-   built for the main window and would fight this one. */
+   built for the main window and would fight this one.
+   2026-10-21 synced: the light block had drifted a palette generation behind
+   the panel (accent #0b62c4, rec #ce1f1f, radius 4/6, greyer neutrals) while
+   dark already matched. Both themes now equal the panel's values; if the tray
+   ever needs its own ramp again, say so here and in DESIGN §2. */
 
 :root {
-  --tk-canvas: #f4f4f4;
+  --tk-canvas: #f5f6f8;
   --tk-surface: #ffffff;
-  --tk-sunken: #ececec;
-  --tk-border: #d6d6d6;
-  --tk-border-strong: #b0b0b0;
+  --tk-sunken: #eef0f3;
+  --tk-border: #e4e6ea;
+  --tk-border-strong: #c6c9d0;
   --tk-text: #16161a;
-  --tk-text-2: #5c5c5c;
-  --tk-text-3: #767676;
-  --tk-accent: #0b62c4;
+  --tk-text-2: #54565e;
+  --tk-text-3: #71737c;
+  --tk-accent: #2563eb;
   --tk-accent-fg: #ffffff;
-  --tk-accent-soft: rgba(11, 98, 196, 0.12);
-  --tk-rec: #ce1f1f;
+  --tk-accent-soft: rgba(37, 99, 235, 0.1);
+  --tk-rec: #dc2626;
   --tk-rec-fg: #ffffff;
   --tk-ok: #0e700e;
   --tk-warn: #8a5300;
-  --tk-radius-sm: 4px;
-  --tk-radius-md: 6px;
+  --tk-radius-sm: 6px;
+  --tk-radius-md: 8px;
   --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
     system-ui, sans-serif;
   --tk-font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
@@ -70,6 +74,15 @@
 
 * {
   box-sizing: border-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
 }
 
 html,

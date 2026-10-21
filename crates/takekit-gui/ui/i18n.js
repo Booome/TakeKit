@@ -29,6 +29,8 @@ const I18N = {
 
     "history.clear": "清空…",
     "history.clearArmed": "再点一次清空",
+    "log.clear": "清空…",
+    "log.clearArmed": "再点一次清空",
     "history.emptyTitle": "还没有录制过",
     "history.emptyHint": "按 F9 或点「开始录制」，录完的那一段会出现在这里。",
 
@@ -135,6 +137,9 @@ const I18N = {
     "take.deleteArmed": "再点一次删除",
     "take.deleteLabel": "删除这次录制：{when}",
     "log.openDir": "打开目录",
+    "log.delete": "删除",
+    "log.deleteArmed": "再点一次删除",
+    "log.deleteLabel": "删除这条日志：{when}",
 
     "notice.pruned": "已移除 {n} 个不可用的源（窗口已关闭或不在当前桌面）",
     "notice.dropped": "已停止并移除 {n} 个不可用的源（窗口已关闭或不在当前桌面）",
@@ -151,6 +156,8 @@ const I18N = {
     "settings.themeAuto": "跟随系统",
     "settings.themeLight": "浅色",
     "settings.themeDark": "深色",
+    "settings.control": "Agent 控制",
+    "settings.controlHint": "允许本机的 AI Agent 通过本地接口操作面板；关闭后接口下线",
     "settings.note": "各项设置立即生效，并记住到下次启动。",
 
     "tray.stateIdle": "未在录制",
@@ -194,6 +201,8 @@ const I18N = {
 
     "history.clear": "Clear…",
     "history.clearArmed": "Click again to clear",
+    "log.clear": "Clear…",
+    "log.clearArmed": "Click again to clear",
     "history.emptyTitle": "Nothing recorded yet",
     "history.emptyHint":
       "Press F9 or click Start recording — a finished take appears here.",
@@ -301,6 +310,9 @@ const I18N = {
     "take.deleteArmed": "Click again to delete",
     "take.deleteLabel": "Delete this recording: {when}",
     "log.openDir": "Open folder",
+    "log.delete": "Delete",
+    "log.deleteArmed": "Click again to delete",
+    "log.deleteLabel": "Delete this log entry: {when}",
 
     "notice.pruned": "Removed {n} unusable source(s) — the window closed or left this desktop",
     "notice.dropped": "Stopped and removed {n} unusable source(s) — the window closed or left this desktop",
@@ -317,6 +329,8 @@ const I18N = {
     "settings.themeAuto": "System",
     "settings.themeLight": "Light",
     "settings.themeDark": "Dark",
+    "settings.control": "Agent control",
+    "settings.controlHint": "Let local AI agents drive the panel over a loopback API; off closes the door",
     "settings.note": "All settings apply immediately and are remembered.",
 
     "tray.stateIdle": "Not recording",

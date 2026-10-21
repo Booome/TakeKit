@@ -124,7 +124,7 @@
 
     <section class="pane hidden" id="pane-log" role="tabpanel" aria-labelledby="tab-log">
       <div class="section-head">
-        <button class="ghost" id="log-clear" type="button" data-i18n="history.clear">
+        <button class="ghost" id="log-clear" type="button" data-i18n="log.clear">
           清空…
         </button>
       </div>
@@ -255,6 +255,15 @@
                 <option value="light" data-i18n="settings.themeLight">浅色</option>
                 <option value="dark" data-i18n="settings.themeDark">深色</option>
               </select>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="control-value" data-i18n="settings.control">Agent 控制</label>
+              <span class="hint" data-i18n="settings.controlHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="control-value" type="checkbox" role="switch" checked />
             </div>
           </div>
         </div>
@@ -391,13 +400,13 @@
           </button>
         </div>
         <div class="tool-group">
-          <button class="tool wide" id="view-fit" type="button" data-i18n="crop.fit">适应</button>
-          <button class="tool wide" id="view-one" type="button" data-i18n="crop.actual">1:1</button>
-          <button class="tool wide" id="view-reset" type="button" data-i18n="crop.reset">重置视图</button>
+          <button class="tool" id="view-fit" type="button" data-i18n="crop.fit">适应</button>
+          <button class="tool" id="view-one" type="button" data-i18n="crop.actual">1:1</button>
+          <button class="tool" id="view-reset" type="button" data-i18n="crop.reset">重置视图</button>
         </div>
         <div class="tool-group">
           <button
-            class="tool wide"
+            class="tool"
             id="tool-pan"
             type="button"
             aria-pressed="false"

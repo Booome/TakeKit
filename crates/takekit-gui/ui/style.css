@@ -648,10 +648,11 @@ select {
   color: var(--tk-accent);
 }
 
-/* The row's trash. Armed (first click) turns it red: the second click then
-   deletes the take folder and the row together, so the red is the warning
-   that the next click is the irreversible one. */
-.take .row-del {
+/* The row's trash (history takes and log entries). Armed (first click) turns
+   it red: the second click then deletes — for a take the folder and the row
+   together, for a log line just the row — so the red is the warning that the
+   next click is the one that means it. */
+.row-del {
   flex: none;
   width: 24px;
   height: 24px;
@@ -668,23 +669,23 @@ select {
     color var(--tk-dur) var(--tk-ease);
 }
 
-.take .row-del svg {
+.row-del svg {
   width: 15px;
   height: 15px;
   display: block;
 }
 
-.take .row-del:hover {
+.row-del:hover {
   background: rgba(220, 38, 38, 0.08);
   color: var(--tk-rec);
 }
 
-.take .row-del.armed {
+.row-del.armed {
   background: var(--tk-rec);
   color: var(--tk-rec-fg);
 }
 
-.take .row-del:focus-visible {
+.row-del:focus-visible {
   outline-offset: 1px;
 }
 
@@ -1139,23 +1140,20 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   border-radius: 5px;
 }
 
-/* ── Settings entry (tab bar) ───────────────────────────────────────────── */
-
-
-
-
-
 /* ── Hotkey chip (params row) ───────────────────────────────────────────── */
 /* Reads as a value, not a button: the only affordance is the cursor and the
    border, because the thing it holds is the point. */
 
 .chip {
   height: 28px;
-  min-width: 84px;
-  padding: 0 10px;
+  /* 300px like `.set-row select.value`, so the row's control column lines up.
+     Left-aligned like a select's value too — a centred "F9" in a 300px box
+     reads as a label, not a value. */
+  width: 300px;
+  padding: 0 8px;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   font-family: var(--tk-font-mono);
   font-size: 12px;
   color: var(--tk-text);

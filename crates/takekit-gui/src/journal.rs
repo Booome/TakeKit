@@ -179,6 +179,21 @@ impl Journal {
             Pane::Log => self.log.clear(),
         }
     }
+
+    /// One log line out of the register, by the `at` stamp it carries — the
+    /// only identity the record has, and what the row's delete button sends.
+    /// First match wins: two lines written in the same millisecond are
+    /// indistinguishable by design, and a second click takes the other one.
+    /// Returns whether anything was there to remove.
+    pub fn remove_log(&mut self, at: u64) -> bool {
+        match self.log.iter().position(|e| e.at == at) {
+            Some(pos) => {
+                self.log.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch, the stamp every record carries.
@@ -248,6 +263,31 @@ mod tests {
         }
         assert_eq!(j.log.len(), LOG_KEPT);
         assert_eq!(j.log[0].at, LOG_KEPT as u64 + 2);
+    }
+
+    #[test]
+    fn one_log_line_leaves_the_others_alone() {
+        let mut j = Journal::default();
+        j.push_log(entry(100, "a"));
+        j.push_log(entry(200, "b"));
+        j.push_log(entry(300, "c"));
+
+        assert!(j.remove_log(200));
+        assert_eq!(j.log.len(), 2);
+        assert_eq!(j.log[0].at, 300);
+        assert_eq!(j.log[1].at, 100);
+
+        // A stamp nothing carries is a no-op said out loud, not a silent pass.
+        assert!(!j.remove_log(200));
+        assert!(!j.remove_log(999));
+        assert_eq!(j.log.len(), 2);
+
+        // A duplicated stamp takes the first (newest) of the pair — the one
+        // `push_log` put at the front.
+        j.push_log(entry(300, "c2"));
+        assert!(j.remove_log(300));
+        assert_eq!(j.log[0].text, "c");
+        assert_eq!(j.log[1].at, 100);
     }
 
     #[test]

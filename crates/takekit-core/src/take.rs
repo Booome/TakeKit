@@ -148,7 +148,14 @@ pub fn delete_dir(dir: &str) -> Result<(), String> {
     fs::remove_dir_all(path).map_err(|e| format!("删除失败：{e}"))
 }
 
-fn timestamp() -> String {
+/// The take-folder stamp: **local** time as `YYYY-MM-DD-HH-MM-SS`.
+///
+/// Shared by every front end (panel, CLI `record`, CLI `media`) so a folder
+/// name means the same instant everywhere. Local, not UTC: the stamp is read
+/// by people and lined up against the panel's history, and a UTC name on a
+/// UTC+8 machine reads eight hours off (the CLI's media harness once computed
+/// the date from the UNIX epoch by hand and had exactly that skew).
+pub fn timestamp() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;
     // SAFETY: GetLocalTime fills a SYSTEMTIME by value and has no pointer or
     // lifetime preconditions.
@@ -262,5 +269,23 @@ mod tests {
         let dir = root.join("vanished");
         assert!(delete_dir(&dir.to_string_lossy()).is_ok());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The stamp every front end names its folders with: six zero-padded
+    /// numbers, plausible as a date. Guards the CLI's hand-rolled UTC
+    /// version from coming back — it produced names eight hours off the
+    /// panel's history on this machine's timezone.
+    #[test]
+    fn the_stamp_is_a_plausible_local_date_time() {
+        let stamp = timestamp();
+        let digits: Vec<u32> = stamp.split('-').map(|p| p.parse().unwrap()).collect();
+        assert_eq!(digits.len(), 6, "{stamp}");
+        let [y, m, d, h, min, s] = digits.as_slice() else {
+            unreachable!()
+        };
+        assert!((1970..=9999).contains(y), "{stamp}");
+        assert!((1..=12).contains(m), "{stamp}");
+        assert!((1..=31).contains(d), "{stamp}");
+        assert!(h <= &23 && min <= &59 && s <= &59, "{stamp}");
     }
 }

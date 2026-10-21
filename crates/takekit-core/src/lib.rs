@@ -8,6 +8,7 @@ pub mod encoder;
 pub mod ffmpeg;
 pub mod fsx;
 pub mod marks;
+pub mod proc;
 pub mod session;
 pub mod source;
 pub mod take;

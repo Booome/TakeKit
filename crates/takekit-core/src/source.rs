@@ -352,23 +352,36 @@ pub struct Preview {
 pub fn preview(capture: &Capture) -> Preview {
     match capture {
         // One monitor, the same one the recorder points a desktop source at.
-        Capture::Desktop { .. } => match takekit_media::snapshot::monitor(1) {
-            Ok(frame) => Preview {
-                width: frame.width,
-                height: frame.height,
-                frame: Some(frame),
-                reason: None,
-            },
-            Err(e) => {
-                let r = virtual_screen_rect();
-                Preview {
-                    width: r.w,
-                    height: r.h,
-                    frame: None,
-                    reason: Some(e.to_string()),
+        Capture::Desktop { rect, .. } => {
+            // The same monitor the recorder will point this source at — the
+            // one holding the rect's centre, exactly as `start_windows`
+            // resolves it (2026-10-21 多屏). Grabbing monitor 1 here drew the
+            // crop of a second-screen source against the first screen's
+            // picture.
+            let index = rect
+                .as_ref()
+                .and_then(|r| takekit_media::monitor_index_for(r.x, r.y, r.w, r.h))
+                .unwrap_or(1);
+            match takekit_media::snapshot::monitor(index) {
+                Ok(frame) => Preview {
+                    width: frame.width,
+                    height: frame.height,
+                    frame: Some(frame),
+                    reason: None,
+                },
+                Err(e) => {
+                    // The size the take will actually record: the remembered
+                    // rect, else the whole virtual screen.
+                    let r = rect.unwrap_or_else(virtual_screen_rect);
+                    Preview {
+                        width: r.w,
+                        height: r.h,
+                        frame: None,
+                        reason: Some(e.to_string()),
+                    }
                 }
             }
-        },
+        }
         Capture::Window { hwnd, title, .. } => {
             let size = window_capture_size(*hwnd);
             let (width, height) = size.as_ref().map(|(w, h)| (*w, *h)).unwrap_or((0, 0));

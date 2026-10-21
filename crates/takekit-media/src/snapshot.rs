@@ -6,16 +6,16 @@
 //! a frame when the picture *changes*, so a still window can deliver nothing at
 //! all. A still does not need to be fast.
 
-use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HGDIOBJ,
-    MONITORINFO, SRCCOPY,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, HGDIOBJ, MONITORINFO, ReleaseDC,
+    SRCCOPY, SelectObject,
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HMONITOR};
-use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+use windows::core::BOOL;
 
 use crate::{MediaError, Result};
 
@@ -80,8 +80,7 @@ pub fn window(hwnd: isize, frame: Frame) -> Result<Snapshot> {
         let bmp = CreateCompatibleBitmap(screen, width, height);
         let old = SelectObject(mem, HGDIOBJ(bmp.0));
 
-        let painted =
-            PrintWindow(handle, mem, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
+        let painted = PrintWindow(handle, mem, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
         if !painted {
             let _ = BitBlt(
                 mem,
@@ -110,12 +109,17 @@ pub fn window(hwnd: isize, frame: Frame) -> Result<Snapshot> {
 /// Grab one monitor by its one-based index — the same enumeration
 /// `windows_capture::monitor::Monitor::from_index` uses for recording, so the
 /// preview is the screen the take would capture.
-pub fn monitor(index: u32) -> Result<Snapshot> {
-    let index = index.max(1) as usize;
+pub fn monitor(index: usize) -> Result<Snapshot> {
+    let index = index.max(1);
     let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
     let ptr = &mut rects as *mut Vec<(i32, i32, i32, i32)>;
 
-    unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _clip: *mut RECT, lp: LPARAM) -> BOOL {
+    unsafe extern "system" fn collect(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        lp: LPARAM,
+    ) -> BOOL {
         // SAFETY: `lp` is the `&mut rects` above. EnumDisplayMonitors runs the
         // callback synchronously, so the reference cannot outlive it.
         let list = unsafe { &mut *(lp.0 as *mut Vec<(i32, i32, i32, i32)>) };
@@ -165,7 +169,12 @@ pub fn monitor(index: u32) -> Result<Snapshot> {
 ///
 /// SAFETY: the caller passes a bitmap it owns, a DC compatible with it, and
 /// the dimensions the bitmap was created with.
-unsafe fn read_pixels(dc: HDC, bmp: windows::Win32::Graphics::Gdi::HBITMAP, width: i32, height: i32) -> Result<Snapshot> {
+unsafe fn read_pixels(
+    dc: HDC,
+    bmp: windows::Win32::Graphics::Gdi::HBITMAP,
+    width: i32,
+    height: i32,
+) -> Result<Snapshot> {
     let mut info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,

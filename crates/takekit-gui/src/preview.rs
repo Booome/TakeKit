@@ -47,7 +47,9 @@ pub struct Still {
 pub fn still(capture: &Capture) -> Still {
     let p = takekit_core::source::preview(capture);
     let mut note = p.reason;
-    let image = p.frame.as_ref().and_then(|frame| {
+    // By value: a 4K still is 35 MB of BGRA, and taking the snapshot by
+    // reference copied the whole buffer twice on the way to the data URL.
+    let image = p.frame.and_then(|frame| {
         let reduced = shrink(frame, MAX_SIDE);
         match data_url(&reduced) {
             Ok(url) => Some(url),
@@ -65,26 +67,19 @@ pub fn still(capture: &Capture) -> Still {
     }
 }
 
-/// Box-average a snapshot down to `max_side`, or copy it when it already fits.
+/// Box-average a snapshot down to `max_side`, or hand it back untouched when it
+/// already fits.
 ///
 /// Averaging rather than picking every n-th pixel: a screenshot is mostly thin
 /// text and 1px borders, and dropping pixels turns those into garbage that
 /// makes an edge look like it is somewhere it is not.
-fn shrink(snapshot: &Snapshot, max_side: u32) -> Snapshot {
+fn shrink(snapshot: Snapshot, max_side: u32) -> Snapshot {
     let (width, height) = (snapshot.width, snapshot.height);
     if width == 0 || height == 0 {
-        return Snapshot {
-            width,
-            height,
-            bgra: snapshot.bgra.clone(),
-        };
+        return snapshot;
     }
     if width <= max_side && height <= max_side {
-        return Snapshot {
-            width,
-            height,
-            bgra: snapshot.bgra.clone(),
-        };
+        return snapshot;
     }
     let scale = (width.max(height) as f64) / f64::from(max_side);
     let out_w = ((f64::from(width) / scale).round() as u32).max(1);
@@ -105,7 +100,9 @@ fn shrink(snapshot: &Snapshot, max_side: u32) -> Snapshot {
                 let row = y * width as usize * 4;
                 for x in x0..x1.min(width as usize) {
                     let at = row + x * 4;
-                    let Some(px) = src.get(at..at + 4) else { continue };
+                    let Some(px) = src.get(at..at + 4) else {
+                        continue;
+                    };
                     for (slot, byte) in sum.iter_mut().zip(px) {
                         *slot += u32::from(*byte);
                     }
@@ -180,16 +177,16 @@ mod tests {
     #[test]
     fn a_small_snapshot_is_not_resized() {
         let snap = solid(120, 80, [1, 2, 3, 255]);
-        let out = shrink(&snap, 2048);
+        let out = shrink(snap, 2048);
         assert_eq!((out.width, out.height), (120, 80));
-        assert_eq!(out.bgra, snap.bgra);
+        assert_eq!(out.bgra, solid(120, 80, [1, 2, 3, 255]).bgra);
     }
 
     /// The long side is what the cap applies to, and the aspect ratio survives
     /// the division to whole pixels.
     #[test]
     fn a_large_snapshot_keeps_its_aspect_ratio() {
-        let out = shrink(&solid(3840, 2160, [0, 0, 0, 255]), 2048);
+        let out = shrink(solid(3840, 2160, [0, 0, 0, 255]), 2048);
         assert_eq!(out.width, 2048);
         assert_eq!(out.height, 1152);
         assert_eq!(out.bgra.len(), 2048 * 1152 * 4);
@@ -203,9 +200,11 @@ mod tests {
         let snap = Snapshot {
             width: 2,
             height: 2,
-            bgra: vec![0, 0, 0, 255, 40, 40, 40, 255, 80, 80, 80, 255, 120, 120, 120, 255],
+            bgra: vec![
+                0, 0, 0, 255, 40, 40, 40, 255, 80, 80, 80, 255, 120, 120, 120, 255,
+            ],
         };
-        let out = shrink(&snap, 1);
+        let out = shrink(snap, 1);
         assert_eq!((out.width, out.height), (1, 1));
         assert_eq!(out.bgra, vec![60, 60, 60, 255]);
     }

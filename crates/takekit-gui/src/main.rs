@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod control;
 mod journal;
 mod overlay;
 mod place;
@@ -274,6 +275,25 @@ async fn journal_clear(pane: String) -> JournalView {
     .expect("journal_clear task panicked")
 }
 
+/// Delete one log line: the row goes, everything it might point at stays —
+/// a log entry is a note about a take, not the take itself. `at` is the stamp
+/// the entry carries (the row it was rendered from sends its own).
+#[tauri::command]
+async fn log_delete(at: u64) -> Result<JournalView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut removed = false;
+        let _ = journal::Journal::update(|j| removed = j.remove_log(at));
+        if !removed {
+            // Said out loud rather than a quiet no-op: the caller thinks a
+            // row existed, and "it went away first" is the likely story.
+            return Err(format!("no log entry at {at}"));
+        }
+        Ok(journal_view())
+    })
+    .await
+    .expect("log_delete task panicked")
+}
+
 /// Delete one take: the folder on disk, the history row, and the log links
 /// that point at it.
 ///
@@ -429,10 +449,16 @@ async fn preheat_engine(rect: ScreenRect) {
 /// Native folder picker for the output root; `None` when the dialog is
 /// cancelled. Synchronous on purpose: a modal Win32 dialog runs its own
 /// message pump, and the UI behind it is blocked by the modality anyway.
+///
+/// The title arrives **from the panel**, already in its language: a native
+/// dialog is the one surface the webview's i18n cannot reach, so the string
+/// travels into the command instead of Rust keeping its own copy of it. That
+/// keeps the `i18n.js` dictionaries the single source of truth and this crate
+/// free of user-facing sentences (DESIGN §4.12).
 #[tauri::command]
-fn pick_folder() -> Option<String> {
+fn pick_folder(title: &str) -> Option<String> {
     rfd::FileDialog::new()
-        .set_title("Choose output folder")
+        .set_title(title)
         .pick_folder()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -522,13 +548,23 @@ async fn set_finalize_panel(on: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
-/// Put the stop screen away early ("any key", DESIGN §4.6). The take keeps
-/// finalising — the checklist is only the view of it — and `take:done` will
-/// still land; this just stops covering the screen before it does.
+/// Turn the agent's control surface on or off (`docs/agent-control.md`). Off
+/// stops the server and removes the discovery file — a client that finds a
+/// file must be able to trust what is in it. On brings it back on a fresh port
+/// and token, so a copy of an old `control.json` stays useless.
 #[tauri::command]
-async fn overlay_hide(app: tauri::AppHandle) {
-    overlay::hide(&app);
-    show_main_window(&app);
+async fn set_control(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        config::Config::update(|cfg| cfg.control = on)?;
+        if on {
+            control::start(app).map(|_| ())
+        } else {
+            control::stop();
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What the panel starts from: the settings from last time.
@@ -627,17 +663,19 @@ pub(crate) fn ui_script(language: &str, theme: &str) -> String {
     script
 }
 
-/// The colour behind the page until it paints.
+/// The window's own backdrop, which has to equal `--tk-canvas` in the theme
+/// that will paint it: the native background is what shows for the frame
+/// before the page's first paint, and a mismatch there reads as a flash.
 ///
-/// An explicit choice must not flash the opposite palette while the webview is
-/// still loading, so it matches `--tk-canvas`. `auto` keeps the neutral dark
-/// grey: reading the system preference means the registry, and a mid-grey
-/// frame reads as "starting" in either palette.
+/// `auto` cannot be answered before a window exists, so the builder gets the
+/// light canvas (the WebView2 default and the majority system theme) and
+/// `setup` corrects it the moment the real theme can be queried — while the
+/// window is still hidden.
 fn window_background(theme: &str) -> Color {
     match theme {
-        "light" => Color(0xf4, 0xf4, 0xf4, 0xff),
+        "light" => Color(0xf5, 0xf6, 0xf8, 0xff),
         "dark" => Color(0x19, 0x19, 0x19, 0xff),
-        _ => Color(0x20, 0x20, 0x20, 0xff),
+        _ => Color(0xf5, 0xf6, 0xf8, 0xff),
     }
 }
 
@@ -735,7 +773,7 @@ fn main() {
     // uniformity is not optional; see the function.
     webview_browser_args();
     probe("rust:setup");
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(take::AppState::default())
         // The window is built hidden (see `.visible(false)` below) and shown
@@ -844,6 +882,21 @@ fn main() {
             // and docs/webview2-agent-sandbox.md.
 
             let main_window = window.build()?;
+            // `auto` is resolved here rather than at build time: the system
+            // theme can only be asked of a window that exists, and the panel
+            // is still hidden — the answer lands before the first visible
+            // frame. Left unresolved, a dark-themed machine would flash the
+            // light canvas the builder fell back to.
+            if cfg.effective_theme() == "auto" {
+                if let Ok(theme) = main_window.theme() {
+                    let resolved = match theme {
+                        tauri::Theme::Light => "light",
+                        _ => "dark",
+                    };
+                    let _ = main_window.set_background_color(Some(window_background(resolved)));
+                    probe(&format!("theme:auto->{resolved}"));
+                }
+            }
             match main_window.outer_position() {
                 Ok(p) => probe(&format!("place:actual {},{}", p.x, p.y)),
                 Err(e) => probe(&format!("place:unknown {e}")),
@@ -895,6 +948,18 @@ fn main() {
                     );
                 }
             });
+            // The agent's door (docs/agent-control.md): up before the panel
+            // paints, so a client can talk to it the moment it is visible.
+            // A failure here is logged, never fatal — the panel is the product
+            // and a port it cannot bind is not a reason to refuse to record.
+            if cfg.control {
+                match control::start(app.handle().clone()) {
+                    Ok(port) => probe(&format!("control:up port={port}")),
+                    Err(e) => probe(&format!("control:failed {e}")),
+                }
+            } else {
+                probe("control:off");
+            }
             main_window.show()?;
             Ok(())
         })
@@ -920,7 +985,6 @@ fn main() {
             start_recording,
             overlay_finish,
             overlay_cancel,
-            overlay_hide,
             status,
             stop_recording,
             stop_source,
@@ -929,6 +993,7 @@ fn main() {
             set_hotkey,
             set_countdown,
             set_finalize_panel,
+            set_control,
             config_get,
             ui_settings,
             set_language,
@@ -938,11 +1003,21 @@ fn main() {
             journal_get,
             journal_seen,
             journal_clear,
+            log_delete,
             take_delete,
             log_push,
             open_take,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running TakeKit");
+        .build(tauri::generate_context!())
+        .expect("error while building TakeKit");
+    app.run(|_app, event| {
+        // The door closes with the process: a control.json left behind by a
+        // clean exit is a stale file every client then has to second-guess
+        // (and explain with a pid check). Removing it here is the promise
+        // `control::stop` already keeps when the switch goes off.
+        if matches!(event, tauri::RunEvent::Exit) {
+            control::stop();
+        }
+    });
     probe("rust:exit");
 }

@@ -51,6 +51,11 @@ pub struct Config {
     pub language: String,
     /// Palette: `"auto"` (follow the system), `"light"` or `"dark"`.
     pub theme: String,
+    /// The loopback control surface (`docs/agent-control.md`): on by default,
+    /// so an agent can drive the panel without the user having found a switch
+    /// first. Off means the server does not start and no `control.json` is
+    /// written — nothing else changes.
+    pub control: bool,
     /// Tab the user last had open (`"sources"` / `"history"` / `"log"` /
     /// `"settings"`); a restart lands there. Anything else reads as the first.
     pub active_tab: String,
@@ -72,6 +77,7 @@ impl Default for Config {
             raise_sources: false,
             language: "zh".to_string(),
             theme: "auto".to_string(),
+            control: true,
             active_tab: "sources".to_string(),
             window_pos: None,
         }
@@ -81,11 +87,10 @@ impl Default for Config {
 impl Config {
     /// `%APPDATA%\TakeKit\config.json`, falling back to the temp dir when
     /// `APPDATA` is unset (a stripped environment still gets persistence).
+    /// The directory itself is `fsx::app_dir()` — the same one the control
+    /// surface's `control.json` and the CLI client use.
     pub fn path() -> PathBuf {
-        let base = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        base.join("TakeKit").join("config.json")
+        takekit_core::fsx::app_dir().join("config.json")
     }
 
     pub fn load() -> Config {
@@ -372,5 +377,21 @@ mod tests {
         cfg.raise_sources = true;
         cfg.save_to(&path).unwrap();
         assert!(Config::load_from(&path).raise_sources);
+    }
+
+    #[test]
+    fn the_control_surface_is_on_by_default_and_round_trips() {
+        // The opposite case from `raise_sources`: an agent talking to a panel
+        // that was never configured for it is the point of the feature, so a
+        // config from before the field existed must come up with the door open.
+        let path = scratch("control");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"hotkey":"F7"}"#).unwrap();
+        assert!(Config::load_from(&path).control);
+
+        let mut cfg = Config::load_from(&path);
+        cfg.control = false;
+        cfg.save_to(&path).unwrap();
+        assert!(!Config::load_from(&path).control);
     }
 }

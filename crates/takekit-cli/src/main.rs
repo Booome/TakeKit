@@ -230,12 +230,14 @@ fn window_target(spec: &str) -> Result<WindowItem, String> {
 /// carves out of it. Without this the CLI accepted `--crop` and silently
 /// recorded everything.
 fn desktop_capture(crop: Crop) -> Capture {
+    // The region is the crop: `rect` is where the desktop grab starts and how
+    // much of it to take, so storing the edges as well would trim twice.
     if crop.is_zero() {
-        Capture::Desktop { rect: None }
+        Capture::desktop(None)
     } else {
-        Capture::Desktop {
-            rect: Some(crop.cropped(takekit_core::source::virtual_screen_rect())),
-        }
+        Capture::desktop(Some(
+            crop.cropped(takekit_core::source::virtual_screen_rect()),
+        ))
     }
 }
 
@@ -418,8 +420,20 @@ fn media(args: MediaArgs) -> Result<(), String> {
             } else {
                 writer::Sampling::EveryFrame
             };
-            let report = writer::write_stream(rx, &path, fps, bitrate, clock, writer_end, sampling)
-                .map_err(string_of)?;
+            let report = writer::write_stream(
+                rx,
+                &path,
+                writer::Encode {
+                    fps,
+                    bitrate,
+                    // The device harness records the device, not a crop of it.
+                    crop: writer::CropBox::default(),
+                    sampling,
+                },
+                clock,
+                writer_end,
+            )
+            .map_err(string_of)?;
             Ok((name, report.frames))
         });
         (tx, handle)
@@ -705,14 +719,14 @@ mod tests {
             right: 0,
         };
         match desktop_capture(crop) {
-            Capture::Desktop { rect: Some(r) } => {
+            Capture::Desktop { rect: Some(r), .. } => {
                 assert_eq!(r.y, takekit_core::source::virtual_screen_rect().y + 10);
             }
             other => panic!("expected a desktop region, got {other:?}"),
         }
         assert!(matches!(
             desktop_capture(Crop::default()),
-            Capture::Desktop { rect: None }
+            Capture::Desktop { rect: None, .. }
         ));
     }
 }

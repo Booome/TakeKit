@@ -120,6 +120,34 @@ impl Take {
     }
 }
 
+/// Delete one take folder — the disk half of removing a history row.
+///
+/// The `take.json` check is what makes this safe to call with a string that
+/// came off a journal entry: a folder this app did not write a manifest into
+/// is never deleted, so a hand-edited journal cannot aim the command at an
+/// arbitrary directory. Same for a path with no final component (`C:\`).
+///
+/// A path that is already gone returns `Ok`: there is nothing left to
+/// protect, and the caller drops the record instead of keeping a tombstone
+/// row that can never be removed. `Err` always means "did not delete, and
+/// the caller should not drop the record either".
+pub fn delete_dir(dir: &str) -> Result<(), String> {
+    let path = Path::new(dir);
+    if dir.is_empty() || path.file_name().is_none() {
+        return Err(format!("不是可删除的录制目录：{dir}"));
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!("不是录制目录：{dir}"));
+    }
+    if !path.join("take.json").is_file() {
+        return Err(format!("不是录制目录（缺少 take.json）：{dir}"));
+    }
+    fs::remove_dir_all(path).map_err(|e| format!("删除失败：{e}"))
+}
+
 fn timestamp() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;
     // SAFETY: GetLocalTime fills a SYSTEMTIME by value and has no pointer or
@@ -139,7 +167,7 @@ mod tests {
     fn source(id: &str) -> Source {
         Source {
             id: id.to_string(),
-            capture: crate::source::Capture::Desktop { rect: None },
+            capture: crate::source::Capture::desktop(None),
             fps: 30,
             quality: None,
         }
@@ -185,6 +213,54 @@ mod tests {
         let mut take = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
         take.set_duration("missing", Some(1.0));
         assert!(take.manifest.sources[0].duration.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_dir_removes_a_take_folder_whole() {
+        let root = scratch("delete");
+        let take = Take::create(&root, "mkv", Encoder::X264, &[source("screen")]).unwrap();
+        take.save_manifest().unwrap();
+        fs::write(take.dir.join("screen.mkv"), b"x").unwrap();
+
+        delete_dir(&take.dir.to_string_lossy()).unwrap();
+        assert!(!take.dir.exists());
+        // The output root it lived in is not collateral damage.
+        assert!(root.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_dir_refuses_a_folder_without_a_manifest() {
+        let root = scratch("no-manifest");
+        let plain = root.join("not-a-take");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("notes.txt"), b"x").unwrap();
+
+        let err = delete_dir(&plain.to_string_lossy()).unwrap_err();
+        assert!(err.contains("take.json"), "{err}");
+        assert!(plain.exists(), "the folder must survive a refused delete");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_dir_refuses_an_empty_path() {
+        assert!(delete_dir("").is_err());
+    }
+
+    #[test]
+    fn delete_dir_refuses_a_drive_root() {
+        let err = delete_dir(r"C:\").unwrap_err();
+        assert!(err.contains("不是可删除的录制目录"), "{err}");
+    }
+
+    #[test]
+    fn delete_dir_treats_a_folder_already_gone_as_done() {
+        // Already gone = nothing left to protect. The row is the only thing
+        // left to remove, and an error here would trap it in the list forever.
+        let root = scratch("gone");
+        let dir = root.join("vanished");
+        assert!(delete_dir(&dir.to_string_lossy()).is_ok());
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -181,8 +181,9 @@ impl Prepared {
             // timeline reaches the file).
             let writer_out = out.clone();
             let writer_end = end_hint.clone();
+            let writer_crop = src.capture.crop();
             let handle = std::thread::spawn(move || {
-                write_frames(rx, writer_out, fps, bitrate, clock, writer_end)
+                write_frames(rx, writer_out, fps, bitrate, clock, writer_end, writer_crop)
             });
 
             let t_spawn = Instant::now();
@@ -191,11 +192,18 @@ impl Prepared {
             // the captures so the writers drain and finalise), then remove the
             // folder — nothing usable was recorded.
             let started = match &src.capture {
-                Capture::Desktop { .. } => {
-                    // One monitor: the whole-desktop virtual screen the ffmpeg
-                    // backend spans does not exist for WGC, which captures one
-                    // output at a time.
-                    ScreenCapture::start(ScreenTarget::Monitor(1), src.fps, tx.clone(), clock)
+                Capture::Desktop { rect, .. } => {
+                    // WGC captures one output at a time — a "whole virtual
+                    // desktop" does not exist for it. A remembered rect picks
+                    // the monitor holding its centre (that is what the picker
+                    // stored); no rect falls back to the first monitor, which
+                    // is what this used to do unconditionally (2026-10-21 多屏).
+                    let index = match rect {
+                        Some(r) => takekit_media::monitor_index_for(r.x, r.y, r.w, r.h),
+                        None => None,
+                    }
+                    .unwrap_or(1);
+                    ScreenCapture::start(ScreenTarget::Monitor(index), src.fps, tx.clone(), clock)
                         .map(MediaCapture::Screen)
                 }
                 Capture::Window { hwnd, .. } => {
@@ -376,6 +384,8 @@ impl MediaRunning {
                 Ok(WriteReport {
                     seconds: 0.0,
                     frames: 0,
+                    width: 0,
+                    height: 0,
                 })
             }),
         );
@@ -385,16 +395,22 @@ impl MediaRunning {
         let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);
         // A source counts as recorded only if it produced bytes, exactly like
         // an ffmpeg one that exited without writing a frame.
-        let (seconds, frames, error) = match outcome {
-            Ok(report) if bytes > 0 => (Some(report.seconds), Some(report.frames), None),
-            Ok(_) => (None, Some(0), Some("no frames were written".to_string())),
-            Err(e) => (None, None, Some(e)),
+        let (seconds, frames, size, error) = match outcome {
+            Ok(report) if bytes > 0 => (
+                Some(report.seconds),
+                Some(report.frames),
+                Some((report.width, report.height)),
+                None,
+            ),
+            Ok(_) => (None, Some(0), None, Some("no frames were written".to_string())),
+            Err(e) => (None, None, None, Some(e)),
         };
         Collected {
             id: self.id.clone(),
             bytes,
             seconds,
             frames,
+            size,
             error,
         }
     }
@@ -429,6 +445,7 @@ fn write_frames(
     bitrate: u32,
     clock: TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    crop: crate::source::Crop,
 ) -> std::result::Result<WriteReport, String> {
     // One writer loop for every caller (`write_stream` is where a frame
     // channel becomes a file); this path writes every frame the capture
@@ -436,16 +453,29 @@ fn write_frames(
     let report = takekit_media::writer::write_stream(
         rx,
         &out,
-        fps,
-        bitrate,
+        takekit_media::writer::Encode {
+            fps,
+            bitrate,
+            // WGC hands over the whole window or monitor; the edges the editor
+            // picked are cut here, so a cropped source records the same picture
+            // on this backend as it does through ffmpeg's region grab.
+            crop: takekit_media::writer::CropBox {
+                top: crop.top,
+                bottom: crop.bottom,
+                left: crop.left,
+                right: crop.right,
+            },
+            sampling: takekit_media::writer::Sampling::EveryFrame,
+        },
         clock,
         end_hint,
-        takekit_media::writer::Sampling::EveryFrame,
     )
     .map_err(|e| e.to_string())?;
     Ok(WriteReport {
         seconds: report.seconds,
         frames: report.frames,
+        width: report.width,
+        height: report.height,
     })
 }
 
@@ -457,6 +487,9 @@ fn write_frames(
 struct WriteReport {
     seconds: f64,
     frames: u64,
+    /// The size the file was written at; `0 x 0` when nothing was written.
+    width: u32,
+    height: u32,
 }
 
 /// A camera's Media Foundation symbolic link, matched from the name the source
@@ -550,6 +583,12 @@ impl Recording {
         &self.take.dir
     }
 
+    /// How many sources this take is writing — the denominator a stop screen
+    /// counts its checklist against.
+    pub fn source_count(&self) -> usize {
+        self.running.len() + self.media.len()
+    }
+
     pub fn path_for(&self, id: &str) -> PathBuf {
         self.take.path_for(id)
     }
@@ -604,7 +643,23 @@ impl Recording {
     }
 
     /// Finish every file properly and collect the results.
-    pub fn stop(mut self) -> Result<Finished> {
+    pub fn stop(self) -> Result<Finished> {
+        self.stop_with(|_| {})
+    }
+
+    /// Finish every file properly and collect the results, telling
+    /// `on_source` about each one the moment its file lands.
+    ///
+    /// The finalise itself stays parallel — serial ffmpeg shutdown plus one
+    /// ffprobe per source was the bulk of stop latency, and the Windows-API
+    /// writers drain in parallel with them. The per-source checklist a stop
+    /// screen wants is therefore an *event stream* (this callback), not a
+    /// queue to work through (`stop_next` from the old plan would serialise
+    /// the very thing that used to make stop feel slow).
+    ///
+    /// The callback is `Fn`, not `FnMut`: several workers finish at the same
+    /// time and all of them report from their own thread.
+    pub fn stop_with(mut self, on_source: impl Fn(&Outcome) + Sync) -> Result<Finished> {
         // The moment the user pressed stop is the end of the take for every
         // channel alike. Latched before anything is torn down; writers hold
         // their last frame to this instant so the files end together instead
@@ -616,23 +671,25 @@ impl Recording {
         // their durations in parallel. Serial ffmpeg shutdown plus one ffprobe
         // per source was the bulk of stop latency.
         let probe = self.probe.clone();
-        let collected: Vec<Collected> = std::thread::scope(|scope| {
+        let collected: Vec<Outcome> = std::thread::scope(|scope| {
             let mut jobs: Vec<_> = self
                 .running
                 .iter_mut()
                 .map(|r| {
                     let probe = &probe;
+                    let on_source = &on_source;
                     scope.spawn(move || {
                         ffmpeg::stop(&mut r.child);
 
                         let bytes = std::fs::metadata(&r.out).map(|m| m.len()).unwrap_or(0);
-                        if bytes == 0 {
+                        let outcome = if bytes == 0 {
                             let tail = ffmpeg::tail(&r.log, 3);
                             Collected {
                                 id: r.id.clone(),
                                 bytes: 0,
                                 seconds: None,
                                 frames: None,
+                                size: None,
                                 error: Some(if tail.is_empty() {
                                     "ffmpeg exited without writing a frame or a log line".into()
                                 } else {
@@ -645,9 +702,13 @@ impl Recording {
                                 bytes,
                                 seconds: ffmpeg::duration(probe, &r.out),
                                 frames: None,
+                                size: None,
                                 error: None,
                             }
                         }
+                        .into_outcome();
+                        on_source(&outcome);
+                        outcome
                     })
                 })
                 .collect();
@@ -655,7 +716,12 @@ impl Recording {
             // ones: stopping a capture waits for its frames to stop arriving,
             // and doing that serially would be stop latency the user feels.
             for m in self.media.iter_mut() {
-                jobs.push(scope.spawn(move || m.finish()));
+                let on_source = &on_source;
+                jobs.push(scope.spawn(move || {
+                    let outcome = m.finish().into_outcome();
+                    on_source(&outcome);
+                    outcome
+                }));
             }
             jobs.into_iter()
                 .map(|j| j.join().expect("stop worker panicked"))
@@ -663,18 +729,12 @@ impl Recording {
         });
 
         let mut sources = Vec::with_capacity(collected.len());
-        for c in collected {
-            if c.bytes > 0 {
-                self.take.set_duration(&c.id, c.seconds);
-                self.take.set_frames(&c.id, c.frames);
+        for o in collected {
+            if o.bytes > 0 {
+                self.take.set_duration(&o.id, o.seconds);
+                self.take.set_frames(&o.id, o.frames);
             }
-            sources.push(Outcome {
-                id: c.id,
-                seconds: c.seconds,
-                bytes: c.bytes,
-                frames: c.frames,
-                error: c.error,
-            });
+            sources.push(o);
         }
 
         self.take.manifest.duration = self
@@ -706,7 +766,24 @@ struct Collected {
     /// before counting could start; the output's slot count is
     /// `seconds x fps` regardless, since a held frame fills the gap.
     frames: Option<u64>,
+    /// The size the file was written at. `None` when nothing was written or
+    /// the backend cannot say (the ffmpeg path reports through ffprobe's
+    /// duration only).
+    size: Option<(u32, u32)>,
     error: Option<String>,
+}
+
+impl Collected {
+    fn into_outcome(self) -> Outcome {
+        Outcome {
+            id: self.id,
+            seconds: self.seconds,
+            bytes: self.bytes,
+            frames: self.frames,
+            size: self.size,
+            error: self.error,
+        }
+    }
 }
 
 impl Drop for Recording {
@@ -737,6 +814,9 @@ pub struct Outcome {
     /// ffmpeg path, where the child does not report). Compare against
     /// `seconds x fps` to see how much of the take is a held picture.
     pub frames: Option<u64>,
+    /// The size the file was written at (`takekit-media` sources; `None` on
+    /// the ffmpeg path). What a progress checklist shows as the resolution.
+    pub size: Option<(u32, u32)>,
     /// Why nothing was written: the source's log tail, or a stand-in line when
     /// even the log came back empty.
     pub error: Option<String>,
@@ -888,11 +968,11 @@ impl Session {
             match &src.capture {
                 Capture::Desktop { .. } => {
                     // Accepted as-is: `start_windows` points every desktop
-                    // source at the first monitor, where a crop and the
-                    // virtual screen the ffmpeg backend spans do not exist
-                    // for WGC. That limit is worth an error only when a user
-                    // actually relies on the crop, which the panel's default
-                    // (no crop) never does.
+                    // source at the first monitor, so a `rect` picked for the
+                    // virtual screen the ffmpeg backend spans has nothing to
+                    // apply to here. The four crop edges *do* apply — they are
+                    // cut out of the captured frame by the writer — which is
+                    // what the panel's editor writes.
                 }
                 Capture::Window { hwnd, title, .. } => {
                     if let Err(e) = crate::source::window_by_hwnd(*hwnd) {
@@ -975,8 +1055,38 @@ mod tests {
             seconds,
             bytes,
             frames: None,
+            size: None,
             error: None,
         }
+    }
+
+    /// The stop checklist shows resolutions, so the size a writer reported
+    /// must survive the trip into the outcome (and stay `None` when there is
+    /// nothing to show).
+    #[test]
+    fn collected_becomes_an_outcome_with_its_size() {
+        let sized = Collected {
+            id: "a".into(),
+            bytes: 10,
+            seconds: Some(1.0),
+            frames: Some(30),
+            size: Some((1920, 1080)),
+            error: None,
+        }
+        .into_outcome();
+        assert_eq!(sized.size, Some((1920, 1080)));
+
+        let blank = Collected {
+            id: "b".into(),
+            bytes: 0,
+            seconds: None,
+            frames: None,
+            size: None,
+            error: Some("boom".into()),
+        }
+        .into_outcome();
+        assert_eq!(blank.size, None);
+        assert_eq!(blank.error.as_deref(), Some("boom"));
     }
 
     #[test]
@@ -988,7 +1098,7 @@ mod tests {
     }
 
     fn source(id: &str) -> Source {
-        Source::new(id, Capture::Desktop { rect: None }, 30)
+        Source::new(id, Capture::desktop(None), 30)
     }
 
     #[test]
@@ -1042,11 +1152,11 @@ mod tests {
 
     #[test]
     fn quality_prefers_the_source_override() {
-        let mut pinned = Source::new("win", Capture::Desktop { rect: None }, 30);
+        let mut pinned = Source::new("win", Capture::desktop(None), 30);
         pinned.quality = Some(16);
         assert_eq!(effective_quality(&pinned, 20), 16);
 
-        let inherited = Source::new("cam", Capture::Desktop { rect: None }, 30);
+        let inherited = Source::new("cam", Capture::desktop(None), 30);
         assert_eq!(effective_quality(&inherited, 20), 20);
     }
 

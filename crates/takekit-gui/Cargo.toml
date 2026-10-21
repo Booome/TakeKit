@@ -13,10 +13,16 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 takekit-core = { path = "../takekit-core" }
+takekit-media = { path = "../takekit-media" }
 serde.workspace = true
 serde_json.workspace = true
 rfd = "0.17.2"
 tauri-plugin-global-shortcut = "2"
+# The source editor's preview is one still picture carried to the page as a
+# data URL: PNG because a screenshot compresses, and base64 because that is
+# what an <img src> takes.
+png = "0.17"
+base64 = "0.22"
 
 [dependencies.tauri]
 version = "2"

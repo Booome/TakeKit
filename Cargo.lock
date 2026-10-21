@@ -3313,10 +3313,13 @@ dependencies = [
 name = "takekit-gui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "png 0.17.16",
  "rfd",
  "serde",
  "serde_json",
  "takekit-core",
+ "takekit-media",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",

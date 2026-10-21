@@ -108,7 +108,8 @@ takekit media --screen 1 --duration 6 --fps 30
 | 接进 GUI | 未做。目前只有 CLI |
 | 与 `Capture`/`Source` 配置模型对齐 | 未做：媒体层用自己的 `ScreenTarget` / 符号链接 / 端点 ID，还没映回 core 的 `Capture` |
 | 编码器选择 | 由 MF 自己挑（软件 H.264）。没有走 core 的 NVENC/QSV/AMF 探测 |
-| 鼠标光标 | `CursorCaptureSettings::Default`，即**不录光标**（ffmpeg 后端是 `draw_mouse=1`）——要对齐得改 `WithCursor` |
+| 鼠标光标 | ✅ 已对齐（2026-10-21）：`CursorCaptureSettings::WithCursor`（原 `Default` 实测不录光标），与 ffmpeg 的 `draw_mouse=1` 一致。实测：抖动鼠标录 3s，抽帧见白色箭头 |
+| 多显示器 | ✅ 已支持（2026-10-21）：picker 按 `env_info.monitors` 逐屏列出（`Desktop { rect: 屏矩形 }`），`monitor_index_for` 把 rect 映回 `Monitor(index)`；无 rect / 映射落空回落第一屏。**WGC 只能一屏一路**，"整个桌面"行仅 ffmpeg 后端保留 |
 
 ### 要验证摄像头/麦克风，需要什么
 
@@ -129,7 +130,7 @@ takekit media --screen 1 --duration 6 --fps 30
    承担（第 7 节）。
 5. ~~接进 GUI~~ → 已做（第 7 节）。
 6. 决定要不要保留 ffmpeg 后端做回退（WGC 在某些环境会拿不到帧）。
-7. GUI 音频源（麦克风）与多显示器映射（Windows 后端目前只录第一块屏）。
+7. GUI 音频源（麦克风）；~~多显示器映射~~ → 已做（2026-10-21，逐屏 picker + rect→Monitor 映射）。
 
 ---
 

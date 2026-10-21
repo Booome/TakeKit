@@ -224,7 +224,7 @@ mod tests {
         let path = scratch("session");
         let cfg = Config {
             sources: vec![
-                Source::new("screen", Capture::Desktop { rect: None }, 60),
+                Source::new("screen", Capture::desktop(None), 60),
                 Source::new(
                     "win",
                     Capture::Window {

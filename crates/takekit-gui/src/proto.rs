@@ -160,15 +160,45 @@ mod tests {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct OutcomeInfo {
     pub id: String,
     pub seconds: Option<f64>,
     pub bytes: u64,
     pub error: Option<String>,
+    /// The size the file was written at. `0 x 0` when the backend cannot say
+    /// (the ffmpeg path) — the stop checklist shows the resolution when it
+    /// has one and leaves the cell blank when it does not.
+    pub width: u32,
+    pub height: u32,
 }
 
-#[derive(Serialize)]
+impl From<&takekit_core::session::Outcome> for OutcomeInfo {
+    fn from(o: &takekit_core::session::Outcome) -> Self {
+        let (width, height) = o.size.unwrap_or((0, 0));
+        Self {
+            id: o.id.clone(),
+            seconds: o.seconds,
+            bytes: o.bytes,
+            error: o.error.clone(),
+            width,
+            height,
+        }
+    }
+}
+
+/// Payload of `take:finalize`: the stop screen's first frame. `elapsed` is
+/// the take's length at the moment stop was pressed — it freezes here, so
+/// nothing downstream has to keep a clock running while the files drain.
+/// `total` is the denominator the "writing… n/m" state counts against.
+#[derive(Clone, Serialize)]
+pub struct FinalizeInfo {
+    pub dir: String,
+    pub elapsed: f64,
+    pub total: usize,
+}
+
+#[derive(Clone, Serialize)]
 pub struct StopResult {
     pub dir: String,
     pub duration: Option<f64>,

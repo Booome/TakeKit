@@ -93,6 +93,11 @@ pub fn watch_moves(window: &WebviewWindow) {
     let last = Mutex::new(Instant::now() - SAVE_EVERY);
     window.on_window_event(move |event| match event {
         WindowEvent::Moved(pos) => {
+            // The crop workspace grows the panel on purpose; that place is
+            // not where the user keeps the strip and must not be remembered.
+            if in_crop_mode() {
+                return;
+            }
             let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
             if last.elapsed() < SAVE_EVERY {
                 return;
@@ -108,7 +113,7 @@ pub fn watch_moves(window: &WebviewWindow) {
         // Closing does not move the window, so this only catches a move made
         // inside the throttle window above.
         WindowEvent::CloseRequested { .. } => {
-            if let Ok(pos) = handle.outer_position() {
+            if !in_crop_mode() && let Ok(pos) = handle.outer_position() {
                 save(pos.x as f64, pos.y as f64);
             }
         }
@@ -151,6 +156,93 @@ fn onto_a_monitor(x: f64, y: f64, monitors: &[MonitorBox]) -> (f64, f64, f64) {
         y.clamp(m.y, (m.y + m.h - KEEP_VISIBLE).max(m.y)),
         m.scale,
     )
+}
+
+// ── The crop workspace's window ─────────────────────────────────────────────
+//
+// The crop wants as much of the screen as it can get: a 4K frame trimmed to
+// the pixel is not a job for a 900x640 control strip. So the panel grows to
+// 90% of the screen it is on while the workspace is open, and goes back to
+// being the strip afterwards. The remembered position is not touched by the
+// detour (see `CROP_MODE` in `watch_moves`).
+
+/// True while the crop workspace owns the screen.
+static CROP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the panel was before the workspace grew it: where it sat and how big
+/// its client area was — `((x, y), (w, h))` in physical pixels.
+type PanelGeometry = ((i32, i32), (u32, u32));
+
+static PANEL_GEOMETRY: Mutex<Option<PanelGeometry>> = Mutex::new(None);
+
+pub fn in_crop_mode() -> bool {
+    CROP_MODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Grow the panel to 90% of the current monitor's work area, centred.
+///
+/// The work area, not the whole screen: the taskbar is not part of the picture
+/// and a workspace that ends up under it is not 90% of anything.
+pub fn enter_crop_mode(window: &WebviewWindow) -> Result<(), String> {
+    if in_crop_mode() {
+        return Ok(());
+    }
+    let mut saved = PANEL_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
+    if saved.is_some() {
+        return Ok(());
+    }
+    let pos = window
+        .outer_position()
+        .map_err(|e| format!("panel position: {e}"))?;
+    let size = window
+        .inner_size()
+        .map_err(|e| format!("panel size: {e}"))?;
+    *saved = Some(((pos.x, pos.y), (size.width, size.height)));
+
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| format!("monitor: {e}"))?
+        .ok_or_else(|| "no monitor under the panel".to_string())?;
+    let work = monitor.work_area();
+    let (wx, wy) = (work.position.x, work.position.y);
+    let (ww, wh) = (work.size.width, work.size.height);
+    // 90% of the work area.
+    let inner = tauri::PhysicalSize::new(((ww as f64) * 0.9) as u32, ((wh as f64) * 0.9) as u32);
+    window
+        .set_size(inner)
+        .map_err(|e| format!("resize: {e}"))?;
+    // Centred on the work area, using the size the window actually grew to
+    // (the title bar is outside `inner_size` and would otherwise push the
+    // window half a title bar low).
+    let outer = window
+        .outer_size()
+        .map_err(|e| format!("outer size: {e}"))?;
+    let x = wx + ((ww.saturating_sub(outer.width)) / 2) as i32;
+    let y = wy + ((wh.saturating_sub(outer.height)) / 2) as i32;
+    window
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|e| format!("place: {e}"))?;
+    CROP_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// Put the panel back where it was before the workspace grew it.
+pub fn exit_crop_mode(window: &WebviewWindow) -> Result<(), String> {
+    CROP_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let taken = PANEL_GEOMETRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(((x, y), (w, h))) = taken else {
+        return Ok(());
+    };
+    window
+        .set_size(tauri::PhysicalSize::new(w, h))
+        .map_err(|e| format!("resize back: {e}"))?;
+    window
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|e| format!("place back: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -163,7 +163,13 @@ js-error:<msg>
 
 - **让面板"按 F9"**：`tauri-plugin-global-shortcut` 建隐藏窗口（class `global_hotkey_app`）+ `RegisterHotKey`（F9 的 `id = 168`）。用本地 `docs/tools/ui-probe.ps1 -Action hotkey` 投 `WM_HOTKEY`。**`keybd_event` 注入的按键触发不了 `RegisterHotKey`**（实测对照过），别浪费时间。
 - `ui-probe.ps1` 还支持 `-Action shot|click|focus`。合成点击会被前台窗口抢走：先 `-Action focus`；UIA 内容树在当前环境取不到（WebView2 不发布），坐标点击前先 `-Action shot` 拿窗口矩形再算——估偏 50px 会点到面板外，现象是"点了没反应"。
-- 锁屏会话收不到合成点击：点击路径用无头 DOM 测试（本地 `docs/tools/make-ui-harness.py` 用真实 index.html + 桩 IPC 生成页面，Chrome `--dump-dom`）。
+- 🔴 **真机首选 CDP，不点鼠标**（2026-10-20 实证）：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>` 启动 release（`webview_browser_args` 会把外部值并进去），然后
+  `curl --noproxy '*' http://127.0.0.1:<port>/json` 拿 target，用 Node 22 自带的 `WebSocket` 连
+  `webSocketDebuggerUrl` 跑 `Runtime.evaluate` / `Page.captureScreenshot`。**不经过鼠标 → 不会被别的窗口遮挡**，截图是 webview 原像素（比 PrintWindow 干净）。
+  - 面板页的 url 是 `http://tauri.localhost/`，**不含 `index.html`**；`tray`/`overlay` 两个窗口要排除。
+  - 页面里的全局 `const`（如 `state`）和函数声明（如 `openEditor`）在 `Runtime.evaluate` 里可见。
+  - ⚠️ 端口被上一轮残留的 `msedgewebview2.exe` 占了就静默失效：先 `taskkill /F /IM msedgewebview2.exe`，再用新端口。
+- 无头 DOM 测试（纯前端、不启动 app）：`docs/tools/make-editor-harness.py` 用真实 index.html + 桩 IPC 生成页面，Chrome `--dump-dom` 断言 / `--screenshot` 出图（`#still-editor`、`#still-crop`、`#still-crop-drag`，加 `-en` 后缀出英文）。
 - 判据用**像素/JSON**，不要目测截图：录到的画面抽帧比对具体像素值；历史是否落库直接读 `journal.json`。
 - **多路完好性核对**（本地 scratch `tk-analyze.py`）：对每个文件跑三件事——ffmpeg 全解数
   解码错误、`帧数 == 时长×fps`、PTS 间隔直方图；再比跨路帧数/时长差。正常值：错误 0、
@@ -174,7 +180,7 @@ js-error:<msg>
 `docs/tools/` 整目录在 `.gitignore` 里（Win32/UIA 驱动脚本，随环境漂移）：
 `ui-probe.ps1`（探针/截图/点击/F9）、`tk-verify-b3.ps1`（B3 端到端：清场+启动+F9/Esc/开关）、
 `tk-veil-*.ps1`（遮罩动画/透明度验证）、`tk-shot-debug.ps1`、`tk-verify-settings.ps1`、
-`make-ui-harness.py`（无头 DOM 点击路径）。
+`make-editor-harness.py`（无头 DOM + 截图：源行 → 编辑源 → 裁剪工作区 → 保存）。
 
 ---
 
@@ -200,3 +206,30 @@ js-error:<msg>
 18. **serde 枚举上线格式必须显式定死**（2026-10-20 踩坑）：`Backend` 没加 `rename_all = "lowercase"` 时，写出 `"Windows"` 但前端发 `"windows"`，**一个字段解析失败会毒化整个 config**（全部字段静默回退默认，还留下 `config.json.corrupt`）。IPC 枚举一律 lowercase + 往返测试。
 19. **别内联复制 IPC 请求对象**：`start_recording` 的内联 req 曾漏掉 `backend`，serde 默认值让 GUI 悄悄走 ffmpeg 后端、面板却显示"Windows API"。请求体统一用 `sessionParams()` 拼。
 20. **GUI 全链路测试入口**（本地 scratch `tk-gui-drive.py`）：种子 config.json（源/后端/输出目录）→ 起隔离 APPDATA 实例 → 等 `ui:ipc-config-applied:Ns`（Ns=源数，**必须等它**，之前按 F9 会丢 toggle 或 0 源）→ `PostMessage WM_HOTKEY`(id=168) 开停 → 读 journal/take.json + 解码核对。最小化窗口**开录前会自动恢复**（2026-10-20 起；WGC 对最小化窗口 0 帧，不恢复=录空气），回归测试应**故意最小化**目标窗口验证自动恢复链路——早先「prepare 拒绝 0×0 客户区」的旧行为已废。
+
+21. **同一个按键被两层监听各处理一次**（2026-10-20 实证，编辑源 Esc）：裁剪工作区的
+    `keydown` 在 stage 上处理 Esc → `closeWorkspace()` **会先把"工作区开着"的标志清掉**，
+    事件继续冒泡到 window 上那个"关卡片"的监听，它读到标志已经没了 → 一次 Esc 连退两层，
+    `editor` 变 `null`，紧接着的「保存」静默变成 `if (!editor) return`（界面像"保存没反应"）。
+    规则：**谁消费了这个按键就 `stopPropagation()`**；全局兜底监听不要读"会被自己刚做的事改掉"的状态。
+22. **同一个功能的两块 DOM 要各自赋值**：裁剪页有自己的 `<img id="crop-img">`，卡片里是
+    `#editor-img`；只给缩略图设了 `src`，工作区就是一片黑——没有任何报错，用户看到的是"图没出来"。
+    新增一层视图时先问一句"它有没有自己的 img / 输入框 / 按钮"。
+
+23. **窗口源的"画面"是整个窗口，而且只有 DWM 说得准**（2026-10-21 实证，VM 窗同一时刻
+    三个矩形三个答案）：`GetClientRect` 1920×1134（没标题栏）、`GetWindowRect` 1936×1173
+    （多了 Win11 隐形缩放边框，左右下各 7px）、**`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 1922×1166 = WGC 落盘的帧**。
+    还有：`PrintWindow` **默认画整个窗口**（`PW_CLIENTONLY` 才只画客户区），拿客户区尺寸去接
+    整窗渲染 = 右边和底边被切掉。预览/尺寸/ffmpeg 抓取一律走 `source::window_rect`
+    （优先 DWM），裁剪数字因此和落盘画面 1:1。
+24. **最小化窗口连 DWM 也答不对**：`DWMWA_EXTENDED_FRAME_BOUNDS` 和 `GetWindowRect`
+    都返回**任务栏图标矩形**（实测 148×22 / 146×28，看着像个尺寸），`GetClientRect` 0×0。
+    用 `WINDOWPLACEMENT.rcNormalPosition`（恢复后的整窗外框）再减隐形边框
+    （`visible_frame`：`SM_CXSIZEFRAME + SM_CXPADDEDBORDER`，左右下各一份、顶上没有）。
+    全程不移动用户的窗口——`window_by_hwnd` 会 restore，打开个编辑器不该动别人的桌面。
+25. **行内嵌按钮时行本身不能是 `<button>`**（2026-10-21，历史行删除）：按钮套按钮不是合法
+    HTML，行改 `div[role=button]` + `tabIndex=0` 后要注意两件事——① 行级 keydown 要判
+    `e.target === row`，否则垃圾桶上按 Enter 会「删除 + 打开」一起触发（keydown 冒泡）；
+    ② 点击拦截不能只拦 `click`，行的打开监听挂在祖先上，子按钮必须 `stopPropagation`。
+    另：**凡删磁盘内容的命令都要有"这是不是我们的东西"闸门**（`take_delete` 只删含
+    `take.json` 的目录），journal 里的路径是可被手改的输入，不是可信值。

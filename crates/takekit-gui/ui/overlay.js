@@ -132,3 +132,79 @@ function step() {
 // so it never receives keyboard input — that is exactly what keeps the window
 // being recorded active. Esc during the countdown is polled by the Rust side
 // (`take::watch_esc`) and cancels the pending take.
+
+// ── The stop screen (B4) ────────────────────────────────────────────────────
+// `take:finalize` paints STOP and freezes the timer at the moment the button
+// was pressed; `take:source` appends one checklist row per file as it lands;
+// `take:done` ends it — Rust takes the veil down and brings the panel back.
+// There is deliberately no "saved" banner at the end (README B4 note): the
+// fresh history row is the success feedback, and a checklist that completed
+// needs no second ending. The veil is up exactly as long as the finalise
+// takes — no early dismiss, since (focusable(false) + click-through) nothing
+// can reach this window to dismiss it, and the wait is short.
+
+const sub = document.getElementById("sub");
+const list = document.getElementById("list");
+
+const fmtClock = (secs) => {
+  const s = Math.max(0, Math.floor(secs));
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${p2(Math.floor(s / 3600))}:${p2(Math.floor((s % 3600) / 60))}:${p2(s % 60)}`;
+};
+
+window.__TAURI__.event.listen("take:finalize", (e) => {
+  const p = e.payload || {};
+  stopLoop();
+  big.classList.remove("go");
+  big.textContent = "STOP";
+  sub.textContent = fmtClock(Number(p.elapsed) || 0);
+  list.replaceChildren();
+  PROBE(`overlay:finalize total=${p.total ?? "?"}`);
+});
+
+window.__TAURI__.event.listen("take:source", (e) => {
+  const p = e.payload || {};
+  const row = document.createElement("div");
+  row.className = "row";
+  const name = document.createElement("span");
+  name.className = "row-id";
+  name.textContent = String(p.id ?? "");
+  row.append(name);
+  if (p.error) {
+    // cam  ✗  <why> — the reason is the source's own log tail or a stand-in
+    // line, already one sentence in English/Chinese from the backend.
+    const bad = document.createElement("span");
+    bad.className = "row-bad";
+    bad.textContent = "✗";
+    const why = document.createElement("span");
+    why.className = "row-why";
+    why.textContent = String(p.error);
+    row.append(bad, why);
+  } else {
+    const time = document.createElement("span");
+    time.className = "row-num";
+    time.textContent = fmtClock(Number(p.seconds) || 0);
+    row.append(time);
+    const size = document.createElement("span");
+    size.className = "row-num";
+    size.textContent = p.width && p.height ? `${p.width}×${p.height}` : "";
+    row.append(size);
+    const bytes = document.createElement("span");
+    bytes.className = "row-num";
+    bytes.textContent = `${((Number(p.bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
+    row.append(bytes);
+  }
+  list.append(row);
+  PROBE(`overlay:source ${p.id} ok=${!p.error}`);
+});
+
+window.__TAURI__.event.listen("take:done", () => {
+  PROBE("overlay:done");
+});
+
+// The stop screen's two tones arrive like the countdown-off one does on the
+// panel: a synthesised tone, played by whichever surface is visible.
+window.__TAURI__.event.listen("take:beep", (e) => {
+  PROBE(`take:beep-handled audio=${window.audioState()}`);
+  window.beep(e.payload.hz, e.payload.ms);
+});

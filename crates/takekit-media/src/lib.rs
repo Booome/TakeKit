@@ -16,6 +16,7 @@ pub mod mediatype;
 pub mod mic;
 pub mod reader;
 pub mod screen;
+pub mod snapshot;
 pub mod writer;
 
 pub use camera::{CameraCapture, CameraFormat};
@@ -24,5 +25,6 @@ pub use devices::{CameraInfo, DeviceList, MicInfo, ScreenInfo};
 pub use error::{MediaError, Result};
 pub use frame::{AudioChunk, MediaFrame, PixelFormat, VideoFrame};
 pub use mic::{MicCapture, MicFormat};
-pub use screen::{ScreenCapture, ScreenTarget};
+pub use screen::{MonitorRect, ScreenCapture, ScreenTarget, monitor_index_for, monitors};
+pub use snapshot::Snapshot;
 pub use writer::{AudioWriter, VideoWriter};

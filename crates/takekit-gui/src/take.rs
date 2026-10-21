@@ -20,8 +20,8 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 use crate::proto::{
-    BeepInfo, CountdownInfo, LiveSourceInfo, OutcomeInfo, StartRequest, StartResult, StatusInfo,
-    StopResult, UiError,
+    BeepInfo, CountdownInfo, FinalizeInfo, LiveSourceInfo, OutcomeInfo, StartRequest, StartResult,
+    StatusInfo, StopResult, UiError,
 };
 use crate::shortcut;
 
@@ -453,7 +453,13 @@ pub fn stop_source(app: &tauri::AppHandle, id: &str) -> bool {
 
 /// Finish the running take. `announce` is for a stop the panel did not ask
 /// for: the hotkey and the tray both end a take while the panel may be hidden,
-/// so the outcome has to travel as an event instead of a command response.
+/// so the failure has to travel as an event instead of a command response.
+///
+/// The stop itself is told in three broadcast events (B4): `take:finalize`
+/// the moment the button is pressed (the timer freezes at `elapsed`),
+/// `take:source` once per file as it lands, `take:done` when the take is
+/// over. Both surfaces — the full-screen stop screen and the panel's status
+/// bar — read the same stream, so a stop feels the same whoever pressed it.
 pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiError> {
     let state = app.state::<AppState>();
     // From here the recording is out of `recording` and the take is not
@@ -469,13 +475,41 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
         .ok_or_else(|| UiError::new("err.not-recording"))?;
 
     let dir = recording.dir().to_string_lossy().into_owned();
-    let finished = match recording.stop() {
+    // Frozen now: the stop screen shows the take's length as of the button
+    // press, and the files may drain for a while after that.
+    let elapsed = recording.elapsed();
+    let total = recording.source_count();
+    // The full-screen stop screen is a choice (`finalize_panel`); either way
+    // the panel's status bar follows the same events.
+    let panel = crate::config::Config::load().finalize_panel;
+    if panel {
+        // Cover first, then the event that paints STOP on it: the veil must
+        // not come up empty and fill in a frame later.
+        crate::overlay::show(app);
+        let _ = app.emit_to(crate::overlay::LABEL, "take:beep", &BeepInfo { hz: 660, ms: 200 });
+    }
+    let _ = app.emit(
+        "take:finalize",
+        &FinalizeInfo {
+            dir: dir.clone(),
+            elapsed,
+            total,
+        },
+    );
+
+    // Every worker reports its own outcome the moment its file lands — that
+    // is the checklist filling in, without serialising the finalise.
+    let emitter = app.clone();
+    let finished = match recording.stop_with(move |o| {
+        let _ = emitter.emit("take:source", OutcomeInfo::from(o));
+    }) {
         Ok(finished) => finished,
         Err(e) => {
             // The take did not finalise, but its folder is the only way to see
             // what went wrong — it goes in the history as a failure instead of
             // disappearing with the error.
             crate::tray::set_recording(app, false);
+            crate::overlay::hide(app);
             record(&StopResult {
                 dir,
                 duration: None,
@@ -489,8 +523,9 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
             crate::probe(&format!("stop:failed {err}"));
             // The panel that pressed the button gets the error back from its
             // own command; a panel that did not has no other way to learn the
-            // take is over.
-            if announce {
+            // take is over. With the stop screen up there is no command
+            // caller either, so the event goes either way.
+            if announce || panel {
                 let _ = app.emit_to("main", "take:failed", &err);
             }
             return Err(err);
@@ -501,19 +536,19 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     let result = StopResult {
         dir: finished.dir.to_string_lossy().into_owned(),
         duration: finished.duration,
-        sources: finished
-            .sources
-            .into_iter()
-            .map(|o| OutcomeInfo {
-                id: o.id,
-                seconds: o.seconds,
-                bytes: o.bytes,
-                error: o.error,
-            })
-            .collect(),
+        sources: finished.sources.iter().map(OutcomeInfo::from).collect(),
         failed,
     };
     record(&result);
+    // Completion travels the same way the rest of the stop did. There is
+    // deliberately no "saved" banner on the veil (README B4 note): the fresh
+    // history row is the success feedback, and a checklist that finished
+    // needs no second ending.
+    let _ = app.emit("take:done", &result);
+    // The done beep belongs to the panel: it is the window coming back, and
+    // the veil's own audio is going away with the veil.
+    let _ = app.emit_to("main", "take:beep", &BeepInfo { hz: 880, ms: 150 });
+    crate::overlay::hide(app);
     // Same reason as the failure path: the hotkey stops the take while another
     // window is in front, and "it stopped" has to be something the user sees.
     // Stopping from the panel itself is a no-op here — it is already front.
@@ -658,12 +693,16 @@ mod tests {
                     seconds: Some(5.5),
                     bytes: 1000,
                     error: None,
+                    width: 1920,
+                    height: 1080,
                 },
                 OutcomeInfo {
                     id: "b".to_string(),
                     seconds: None,
                     bytes: 0,
                     error: Some("boom".to_string()),
+                    width: 0,
+                    height: 0,
                 },
             ],
             failed: 1,

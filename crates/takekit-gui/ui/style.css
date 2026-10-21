@@ -395,6 +395,21 @@ select {
   box-shadow: var(--tk-shadow-2);
 }
 
+/* The whole row is the button that opens its editor. */
+.row[role="button"] {
+  cursor: pointer;
+}
+
+.row:focus-visible {
+  outline: 2px solid var(--tk-accent);
+  outline-offset: 1px;
+}
+
+/* A take is running: the editor is off limits, and the row says so. */
+.row.busy {
+  cursor: default;
+}
+
 .dot {
   flex: none;
   width: 8px;
@@ -430,16 +445,27 @@ select {
   text-overflow: ellipsis;
 }
 
-.row-meta {
-  /* UI font with tabular figures, not mono: the line mixes prose and numbers
-     and mono made the prose part read like a log dump. */
+/* The size column (2026-10-21 方案 A): source size, `→ cropped size` when a
+   crop is set. Right-aligned tabular figures in a fixed-width column, so the
+   sizes of every row line up and the column compares at a glance. The prose
+   that used to sit under the name is tooltip-only now (see the geo cell's
+   title) — the scanning lane holds numbers and nothing else. */
+.row-geo {
+  flex: none;
+  width: 160px;
+  text-align: right;
   font-family: inherit;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
-  color: var(--tk-text-3);
-  overflow: hidden;
+  color: var(--tk-text-2);
   white-space: nowrap;
+  overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* "—" when the size is not knowable yet (camera before its first frame). */
+.row-geo.dim {
+  color: var(--tk-text-3);
 }
 
 .row-remove {
@@ -464,33 +490,18 @@ select {
   color: var(--tk-rec);
 }
 
-.row-param {
+/* What the row says about a source without opening it: frame rate and quality.
+   Read-only — the numbers are set in the editor, and two dropdowns with no
+   labels ("30", "Q20") had to be guessed at. Fixed width, right-aligned like
+   the size column: two numeric columns that stack down the list. */
+.row-summary {
   flex: none;
-  height: 26px;
-  padding: 0 22px 0 8px;
+  width: 88px;
+  text-align: right;
   font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
   color: var(--tk-text-2);
-  background-color: transparent;
-  background-image: var(--tk-chevron);
-  background-repeat: no-repeat;
-  background-position: right 7px center;
-  border: 1px solid var(--tk-border);
-  border-radius: 999px;
-  appearance: none;
-  cursor: pointer;
-  transition:
-    border-color var(--tk-dur) var(--tk-ease),
-    color var(--tk-dur) var(--tk-ease);
-}
-
-.row-param:hover {
-  border-color: var(--tk-border-strong);
-  color: var(--tk-text);
-  background-color: var(--tk-sunken);
-}
-
-.row-param:focus-visible {
-  outline-offset: -1px;
+  white-space: nowrap;
 }
 
 .empty {
@@ -635,6 +646,46 @@ select {
 .take:hover .open {
   background: var(--tk-accent-soft);
   color: var(--tk-accent);
+}
+
+/* The row's trash. Armed (first click) turns it red: the second click then
+   deletes the take folder and the row together, so the red is the warning
+   that the next click is the irreversible one. */
+.take .row-del {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--tk-text-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.take .row-del svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.take .row-del:hover {
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--tk-rec);
+}
+
+.take .row-del.armed {
+  background: var(--tk-rec);
+  color: var(--tk-rec-fg);
+}
+
+.take .row-del:focus-visible {
+  outline-offset: 1px;
 }
 
 .take .badge {
@@ -900,6 +951,19 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* The failed state (DESIGN §4.5): a filled diamond in the clock's slot —
+   shape *and* text carry the state, never the color alone (§7 rule 3). */
+.fail-icon {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  color: var(--tk-rec);
+}
+
+.hint.fail {
+  color: var(--tk-text);
 }
 
 .rec {
@@ -1223,4 +1287,672 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   margin: 12px 0 0;
   font-size: 11px;
   color: var(--tk-text-3);
+}
+
+/* ── The source editor ──────────────────────────────────────────────────
+   Two layers, one visual language: the card below is the same surface,
+   border, radius and type scale the settings pane uses, and the workspace
+   behind it is the one place on the page with a dark neutral backdrop —
+   a picture is judged against grey, not against the panel's white. */
+
+.modal {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: rgba(12, 14, 20, 0.44);
+}
+
+.modal-card {
+  width: 468px;
+  max-height: calc(100% - 40px);
+  display: flex;
+  flex-direction: column;
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(10, 14, 22, 0.3);
+  overflow: hidden;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 15px 15px 13px;
+  border-bottom: 1px solid var(--tk-border);
+}
+
+.modal-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-title h2 {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modal-title p {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tk-text-3);
+}
+
+.modal-x {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--tk-text-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.modal-x:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+.modal-body {
+  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  /* The card is capped at the window height; on a short window the body is
+     what gives, not the footer's buttons. */
+  overflow-y: auto;
+}
+
+/* 帧率 / 画质: one row, half each. */
+.pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+/* A real `.field` row (same as the settings pane's), so the select underneath
+   is the same 28px control with the same chevron and radius — the one thing
+   this adds is that it fills the half-row it sits in. */
+.edit-field {
+  gap: 6px;
+}
+
+.edit-key {
+  font-size: 11.5px;
+  color: var(--tk-text-2);
+}
+
+.edit-field select.value {
+  width: 100%;
+}
+
+.edit-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.edit-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--tk-text-3);
+}
+
+/* The crop entry point: a picture of what is being recorded, with the
+   current output size pinned to it. The whole thing is the button. */
+.thumb {
+  position: relative;
+  height: 168px;
+  width: 100%;
+  padding: 0;
+  /* Not the native button face: a disabled native button paints its own grey
+     over whatever background the author set, which turned the dark picture
+     area into a grey box whenever the source had no still. */
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--tk-border);
+  border-radius: 10px;
+  background: #17181c;
+  overflow: hidden;
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    box-shadow var(--tk-dur) var(--tk-ease);
+}
+
+.thumb:hover {
+  border-color: var(--tk-border-strong);
+  box-shadow: var(--tk-shadow-2);
+}
+
+/* No still, nothing to crop: the card still shows the picture area (that is
+   where the size badge lives) but it is not a button. */
+.thumb:disabled {
+  /* The global `:disabled` opacity would wash the dark picture area out to
+     grey and hide the reason text — this button is a picture, not a control,
+     so "off" is carried by the cursor and the missing CTA instead. */
+  opacity: 1;
+  cursor: default;
+  border-color: var(--tk-border);
+  box-shadow: none;
+}
+
+.thumb:disabled .thumb-cta {
+  display: none;
+}
+
+.thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+
+.thumb-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #9a9ca4;
+  font-size: 12px;
+}
+
+.thumb-cta {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: #fff;
+  background: rgba(10, 12, 16, 0.46);
+  padding: 6px 12px;
+  opacity: 0;
+  transition: opacity var(--tk-dur) var(--tk-ease);
+}
+
+.thumb:hover .thumb-cta,
+.thumb:focus-visible .thumb-cta {
+  opacity: 1;
+}
+
+.thumb-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 2px 7px;
+  font-size: 11px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.66);
+  color: #fff;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 15px;
+  border-top: 1px solid var(--tk-border);
+}
+
+/* The note is the only thing here that can grow, so it is the only thing that
+   shrinks: without this a long source name squeezed 取消/保存 into two
+   one-character lines (2026-10-21 用户截图). */
+.modal-note {
+  margin-right: auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--tk-text-3);
+}
+
+/* Every button that sits beside a growing note: the dialog's footer and the
+   crop workspace's, both. */
+.ghost.flat,
+.primary {
+  flex: none;
+  white-space: nowrap;
+}
+
+.primary {
+  height: 30px;
+  padding: 0 16px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--tk-accent-fg);
+  background: var(--tk-accent);
+  border: 1px solid transparent;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition: filter var(--tk-dur) var(--tk-ease);
+}
+
+.primary:hover {
+  filter: brightness(1.07);
+}
+
+.primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* `.ghost` carries `margin-left: auto` for the section header; inside a
+   footer the buttons sit next to each other instead. */
+.ghost.flat {
+  margin-left: 0;
+  height: 30px;
+}
+
+/* ── The crop workspace ─────────────────────────────────────────────────
+   Fills the panel. The stage is neutral dark in both themes: the picture's
+   edges are what the eye is judging, and a white surround biases that. */
+
+.crop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  background: var(--tk-canvas);
+}
+
+.crop-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 52px;
+  padding: 0 14px;
+  background: var(--tk-surface);
+  border-bottom: 1px solid var(--tk-border);
+}
+
+.tile.small {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+}
+
+.tile.small svg {
+  width: 15px;
+  height: 15px;
+}
+
+.crop-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.crop-title h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.crop-title p {
+  margin: 1px 0 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tk-text-3);
+}
+
+.badge {
+  flex: none;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--tk-text-2);
+  background: var(--tk-sunken);
+  border: 1px solid var(--tk-border);
+  border-radius: 999px;
+}
+
+.crop-tools {
+  flex: none;
+  display: flex;
+  align-items: center;
+  height: 44px;
+  padding: 0 14px;
+  background: var(--tk-surface);
+  border-bottom: 1px solid var(--tk-border);
+}
+
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 12px;
+  margin-right: 12px;
+  border-right: 1px solid var(--tk-border);
+}
+
+/* The divider belongs between groups, not after the last one. */
+.tool-group:last-of-type {
+  padding-right: 0;
+  margin-right: 0;
+  border-right: none;
+}
+
+.tool {
+  height: 26px;
+  min-width: 26px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--tk-text-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--tk-radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.tool:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text);
+}
+
+.tool[aria-pressed="true"] {
+  color: var(--tk-accent);
+  background: var(--tk-accent-soft);
+}
+
+.tool svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.tool-value {
+  min-width: 44px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--tk-text-2);
+}
+
+.tool-hint {
+  margin: 0 0 0 auto;
+  font-size: 11px;
+  color: var(--tk-text-3);
+}
+
+.crop-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: #17181c;
+  outline: none;
+  cursor: default;
+}
+
+.crop-stage.panning,
+.crop-stage.hand {
+  cursor: grab;
+}
+
+.crop-stage.panning {
+  cursor: grabbing;
+}
+
+.crop-plane {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+}
+
+.crop-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  -webkit-user-drag: none;
+  user-select: none;
+  /* Fitting the whole picture in wants smoothing; zooming into it wants the
+     source's own pixels as blocks. The plane carries which one is in force
+     (`.pixelated` at zoom >= 1), because CSS cannot tell the two apart. */
+  image-rendering: auto;
+}
+
+.crop-plane.pixelated .crop-img {
+  image-rendering: pixelated;
+}
+
+/* The box dims everything outside itself with one absurd spread shadow —
+   cheaper and rounder than four shades, and it can never disagree with the
+   box about where the edge is. */
+.crop-box {
+  position: absolute;
+  outline: 1.5px solid #fff;
+  /* A black hairline under the dim, then the dim: the white edge alone
+     disappears against a white picture, and the edge is the whole point. */
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.6),
+    0 0 0 9999px rgba(8, 9, 12, 0.68);
+  cursor: move;
+}
+
+.crop-box:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--tk-accent),
+    0 0 0 9999px rgba(8, 9, 12, 0.68);
+}
+
+.crop-box.limit {
+  outline-color: var(--tk-rec);
+}
+
+.crop-thirds {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    repeating-linear-gradient(
+      to right,
+      rgba(255, 255, 255, 0.26) 0 1px,
+      transparent 1px 33.3333%
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.26) 0 1px,
+      transparent 1px 33.3333%
+    );
+}
+
+/* 16px of hit area around an 8px dot: WCAG target size, and still reads as
+   a handle rather than a button. */
+.crop-handle {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px;
+}
+
+.crop-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  margin: -4.5px;
+  background: #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+}
+
+/* A handle the keyboard has landed on says so on its dot. */
+.crop-handle:focus-visible {
+  outline: none;
+}
+
+.crop-handle:focus-visible::after {
+  box-shadow:
+    0 0 0 2px var(--tk-accent),
+    0 0 0 3px rgba(0, 0, 0, 0.5);
+}
+
+.crop-handle[data-edge="nw"] {
+  left: 0;
+  top: 0;
+  cursor: nwse-resize;
+}
+.crop-handle[data-edge="n"] {
+  left: 50%;
+  top: 0;
+  cursor: ns-resize;
+}
+.crop-handle[data-edge="ne"] {
+  left: 100%;
+  top: 0;
+  cursor: nesw-resize;
+}
+.crop-handle[data-edge="e"] {
+  left: 100%;
+  top: 50%;
+  cursor: ew-resize;
+}
+.crop-handle[data-edge="se"] {
+  left: 100%;
+  top: 100%;
+  cursor: nwse-resize;
+}
+.crop-handle[data-edge="s"] {
+  left: 50%;
+  top: 100%;
+  cursor: ns-resize;
+}
+.crop-handle[data-edge="sw"] {
+  left: 0;
+  top: 100%;
+  cursor: nesw-resize;
+}
+.crop-handle[data-edge="w"] {
+  left: 0;
+  top: 50%;
+  cursor: ew-resize;
+}
+
+.crop-none {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 0 32px;
+  text-align: center;
+  color: #9a9ca4;
+  font-size: 12.5px;
+  /* A hint over an empty stage, not a layer: the crop box under it is still
+     draggable, and this must not swallow the clicks. */
+  pointer-events: none;
+}
+
+.crop-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 52px;
+  padding: 0 14px;
+  background: var(--tk-surface);
+  border-top: 1px solid var(--tk-border);
+}
+
+.edges {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.edge-key {
+  font-size: 11.5px;
+  color: var(--tk-text-2);
+}
+
+.edge-input {
+  width: 58px;
+  height: 26px;
+  padding: 0 6px;
+  font-family: var(--tk-font-mono);
+  font-size: 12px;
+  text-align: right;
+  color: var(--tk-text);
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-sm);
+  appearance: textfield;
+}
+
+.edge-input::-webkit-outer-spin-button,
+.edge-input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.edge-input:focus-visible {
+  border-color: var(--tk-accent);
+  outline: 2px solid var(--tk-accent-soft);
+  outline-offset: 0;
+}
+
+.edge-unit {
+  font-size: 10.5px;
+  color: var(--tk-text-3);
+}
+
+.crop-out {
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.crop-out-key {
+  font-size: 11.5px;
+  color: var(--tk-text-2);
+}
+
+.crop-out-value {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }

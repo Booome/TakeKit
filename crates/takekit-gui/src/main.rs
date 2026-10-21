@@ -10,6 +10,7 @@ mod config;
 mod journal;
 mod overlay;
 mod place;
+mod preview;
 mod proto;
 mod reveal;
 mod shortcut;
@@ -202,6 +203,16 @@ async fn check_sources(captures: Vec<Capture>) -> Vec<bool> {
         .expect("check_sources task panicked")
 }
 
+/// One still picture of a source, for the editor to draw its crop on. Off the
+/// main thread: a 4K grab plus a PNG encode is real work, and a synchronous
+/// command would run it on the thread that draws.
+#[tauri::command]
+async fn source_preview(capture: Capture) -> preview::Still {
+    tauri::async_runtime::spawn_blocking(move || preview::still(&capture))
+        .await
+        .expect("source_preview task panicked")
+}
+
 /// Everything the two list panes need, plus the unread counts behind the tab
 /// markers. Read as a whole because the panes are redrawn together.
 #[derive(Serialize)]
@@ -263,6 +274,34 @@ async fn journal_clear(pane: String) -> JournalView {
     .expect("journal_clear task panicked")
 }
 
+/// Delete one take: the folder on disk, the history row, and the log links
+/// that point at it.
+///
+/// The folder goes first and its `take.json` guard (see
+/// `takekit_core::take::delete_dir`) is what proves the path is one of ours —
+/// a journal entry pointing anywhere else is refused and keeps its row. A
+/// folder already gone (deleted outside the panel) is not an error: the row
+/// is then a tombstone for nothing and goes with the delete. The log
+/// *entries* stay (they are history too); only their now-dead "open the
+/// folder" link is dropped.
+#[tauri::command]
+async fn take_delete(dir: String) -> Result<JournalView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        takekit_core::take::delete_dir(&dir)?;
+        let _ = journal::Journal::update(|j| {
+            j.takes.retain(|t| t.dir != dir);
+            for e in &mut j.log {
+                if e.dir.as_deref() == Some(dir.as_str()) {
+                    e.dir = None;
+                }
+            }
+        });
+        Ok(journal_view())
+    })
+    .await
+    .expect("take_delete task panicked")
+}
+
 /// Write one warning or error to the log. The text is the same one the notice
 /// showed: the pane is where a dismissed notice is still readable.
 #[tauri::command]
@@ -291,11 +330,36 @@ async fn log_push(
     .expect("log_push task panicked")
 }
 
+/// Grow the panel to 90% of the screen for the crop workspace. Synchronous on
+/// purpose: window geometry calls want the main thread, and the caller is
+/// waiting on the new size before it lays the workspace out.
+#[tauri::command]
+fn enter_crop_mode(window: tauri::WebviewWindow) -> Result<(), UiError> {
+    place::enter_crop_mode(&window).map_err(|e| UiError::with_detail("err.internal", e))
+}
+
+/// Put the panel back where it was before the workspace grew it.
+#[tauri::command]
+fn exit_crop_mode(window: tauri::WebviewWindow) -> Result<(), UiError> {
+    place::exit_crop_mode(&window).map_err(|e| UiError::with_detail("err.internal", e))
+}
+
 /// Open a take folder from the history pane. Synchronous: it only spawns
 /// Explorer, which returns at once.
 #[tauri::command]
 fn open_take(dir: String) -> Result<(), String> {
     reveal::reveal(&reveal::take_dir(&dir)?)
+}
+
+/// One display, as the picker lists it (2026-10-21 多屏). `index` is the
+/// one-based number `ScreenTarget::Monitor` takes.
+#[derive(Serialize)]
+struct MonitorInfo {
+    index: usize,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
 }
 
 /// What the panel needs before it can offer to record at all.
@@ -307,6 +371,9 @@ struct EnvInfo {
     /// rectangle a desktop source captures, so the frontend can preheat the
     /// engine probe for it while the user is still picking sources.
     screen: ScreenRect,
+    /// Every attached display. The Windows backend captures one at a time
+    /// (WGC has no virtual-desktop item), so the picker offers each one.
+    monitors: Vec<MonitorInfo>,
     /// Where a take lands unless the user picks somewhere else: the temp dir.
     default_out_root: String,
 }
@@ -324,10 +391,22 @@ async fn env_info() -> EnvInfo {
             .to_string_lossy()
             .trim_end_matches(['\\', '/'])
             .to_string();
+        let monitors = takekit_media::monitors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| MonitorInfo {
+                index: m.index,
+                x: m.x,
+                y: m.y,
+                w: m.w,
+                h: m.h,
+            })
+            .collect();
         EnvInfo {
             ffmpeg: ffmpeg.map(|p| p.to_string_lossy().into_owned()),
             encoder,
             screen: virtual_screen_rect(),
+            monitors,
             default_out_root,
         }
     })
@@ -428,6 +507,28 @@ async fn set_countdown(secs: u8) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Turn the full-screen stop screen on or off (B4/B6). Same split from
+/// `save_session` as the countdown: the stop screen is not part of the
+/// capture session either. Off means the stop progress lives on the panel's
+/// status bar alone.
+#[tauri::command]
+async fn set_finalize_panel(on: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        config::Config::update(|cfg| cfg.finalize_panel = on)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Put the stop screen away early ("any key", DESIGN §4.6). The take keeps
+/// finalising — the checklist is only the view of it — and `take:done` will
+/// still land; this just stops covering the screen before it does.
+#[tauri::command]
+async fn overlay_hide(app: tauri::AppHandle) {
+    overlay::hide(&app);
+    show_main_window(&app);
 }
 
 /// What the panel starts from: the settings from last time.
@@ -810,12 +911,16 @@ fn main() {
             list_windows,
             list_devices,
             check_sources,
+            source_preview,
+            enter_crop_mode,
+            exit_crop_mode,
             env_info,
             preheat_engine,
             pick_folder,
             start_recording,
             overlay_finish,
             overlay_cancel,
+            overlay_hide,
             status,
             stop_recording,
             stop_source,
@@ -823,6 +928,7 @@ fn main() {
             hide_tray,
             set_hotkey,
             set_countdown,
+            set_finalize_panel,
             config_get,
             ui_settings,
             set_language,
@@ -832,6 +938,7 @@ fn main() {
             journal_get,
             journal_seen,
             journal_clear,
+            take_delete,
             log_push,
             open_take,
         ])

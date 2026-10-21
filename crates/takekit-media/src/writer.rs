@@ -39,7 +39,6 @@ use crate::devices::ensure_media_foundation;
 use crate::error::Result;
 use crate::frame::{AudioChunk, PixelFormat, VideoFrame};
 use crate::mediatype::{pcm_type, video_type};
-
 /// A frame held until the next one says how long it was on screen.
 struct Pending {
     time: i64,
@@ -316,6 +315,107 @@ unsafe fn write_sample(
     Ok(())
 }
 
+/// Which rectangle of a frame to keep, in source pixels.
+///
+/// Four edges rather than an origin and a size: that is how a user drags a
+/// crop, and it is the same shape `takekit_core::source::Crop` serialises, so
+/// the panel's numbers travel here unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CropBox {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
+impl CropBox {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Where the kept rectangle sits inside a `width x height` frame, or
+    /// `None` when nothing is cropped.
+    ///
+    /// A crop that no longer fits — the window was resized since the edges
+    /// were picked — is dropped instead of clamped to a sliver: recording the
+    /// whole picture is the useful answer, and a two-pixel file is not.
+    pub fn rect_in(&self, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+        if self.is_zero() {
+            return None;
+        }
+        let kept_w = width.checked_sub(self.left.checked_add(self.right)?)?;
+        let kept_h = height.checked_sub(self.top.checked_add(self.bottom)?)?;
+        if kept_w < 2 || kept_h < 2 {
+            return None;
+        }
+        Some((self.left, self.top, kept_w, kept_h))
+    }
+}
+
+/// Keep one rectangle of a frame, in the frame's own pixels.
+///
+/// Takes the frame by value and hands the same buffer straight back when
+/// there is nothing to cut, so the common case allocates nothing. A cropped
+/// frame is rebuilt row by row — no scaling, no resampling: a crop has to move
+/// pixel boundaries and nothing else.
+pub fn crop_frame(frame: VideoFrame, crop: CropBox) -> VideoFrame {
+    let Some((x, y, kept_w, kept_h)) = crop.rect_in(frame.width, frame.height) else {
+        return frame;
+    };
+    let (data, width, height) = match frame.format {
+        PixelFormat::Bgra => {
+            let stride = frame.width as usize * 4;
+            let row_bytes = kept_w as usize * 4;
+            let mut out = Vec::with_capacity(row_bytes * kept_h as usize);
+            for row in y..y + kept_h {
+                let at = row as usize * stride + x as usize * 4;
+                match frame.data.get(at..at + row_bytes) {
+                    Some(slice) => out.extend_from_slice(slice),
+                    None => return frame, // torn buffer: the whole frame beats half of one
+                }
+            }
+            (out, kept_w, kept_h)
+        }
+        PixelFormat::Nv12 => {
+            // Chroma is stored at half resolution in both directions, so every
+            // edge has to land on an even pixel or the two planes disagree
+            // about which block they are describing.
+            let (x, y) = (x & !1, y & !1);
+            let (w, h) = (kept_w & !1, kept_h & !1);
+            if w == 0 || h == 0 {
+                return frame;
+            }
+            let stride = frame.width as usize;
+            let row_bytes = w as usize;
+            let luma_at = y as usize * stride;
+            let chroma_at = stride * frame.height as usize;
+            let mut out = Vec::with_capacity(row_bytes * (h as usize + h as usize / 2));
+            for row in 0..h {
+                let at = luma_at + row as usize * stride + x as usize;
+                match frame.data.get(at..at + row_bytes) {
+                    Some(slice) => out.extend_from_slice(slice),
+                    None => return frame,
+                }
+            }
+            for row in 0..h / 2 {
+                let at = chroma_at + (y as usize / 2 + row as usize) * stride + x as usize;
+                match frame.data.get(at..at + row_bytes) {
+                    Some(slice) => out.extend_from_slice(slice),
+                    None => return frame,
+                }
+            }
+            (out, w, h)
+        }
+    };
+    VideoFrame {
+        width,
+        height,
+        format: frame.format,
+        data,
+        time: frame.time,
+    }
+}
+
 /// Trim a frame to even dimensions.
 ///
 /// H.264 stores chroma at half resolution, so a frame with an odd width or
@@ -439,6 +539,7 @@ fn aac_type(sample_rate: u32, channels: u32, bitrate_kbps: u32) -> Result<IMFMed
 }
 
 /// How one source's frames reach the encoder.
+#[derive(Clone, Copy, Debug)]
 pub enum Sampling {
     /// Every frame as it arrives, with the gaps it really had (the take's own
     /// timeline). The encoder expands a held frame across a pause either way;
@@ -458,6 +559,22 @@ pub enum Sampling {
 pub struct StreamReport {
     pub seconds: f64,
     pub frames: u64,
+    /// The size the file was written at (crop applied, even-aligned) — the
+    /// first frame decides it, since that is when the writer opens.
+    /// `0 x 0` when no frame ever arrived.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// What one file is supposed to look like: the four numbers that used to be
+/// four more positional arguments to `write_stream`.
+#[derive(Clone, Copy, Debug)]
+pub struct Encode {
+    pub fps: u32,
+    pub bitrate: u32,
+    /// The rectangle to keep, in the frames' own pixels.
+    pub crop: CropBox,
+    pub sampling: Sampling,
 }
 
 /// Drain one source's frame channel into its own MP4. The writer opens on the
@@ -471,18 +588,24 @@ pub struct StreamReport {
 pub fn write_stream(
     rx: std::sync::mpsc::Receiver<crate::frame::MediaFrame>,
     out: &std::path::Path,
-    fps: u32,
-    bitrate: u32,
+    encode: Encode,
     clock: crate::clock::TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
-    sampling: Sampling,
 ) -> Result<StreamReport> {
     use crate::frame::MediaFrame;
     use std::sync::atomic::Ordering;
 
+    let Encode {
+        fps,
+        bitrate,
+        crop,
+        sampling,
+    } = encode;
     let fps = fps.max(1);
     let interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
     let mut video: Option<VideoWriter> = None;
+    // The output's size: whatever the first kept frame came out as.
+    let mut size = (0u32, 0u32);
     let mut frames = 0u64;
     let mut latest: Option<VideoFrame> = None;
     let mut due_slot = 0u64;
@@ -492,8 +615,9 @@ pub fn write_stream(
             Sampling::EveryFrame => match rx.recv() {
                 Ok(MediaFrame::Video(frame)) => {
                     frames += 1;
-                    let frame = even_frame(frame);
+                    let frame = even_frame(crop_frame(frame, crop));
                     if video.is_none() {
+                        size = (frame.width, frame.height);
                         video = Some(open_for(&frame, out, fps, bitrate)?);
                     }
                     video.as_mut().expect("opened above").write(&frame)?;
@@ -505,7 +629,7 @@ pub fn write_stream(
                 match rx.recv_timeout(interval) {
                     Ok(MediaFrame::Video(frame)) => {
                         frames += 1;
-                        latest = Some(even_frame(frame));
+                        latest = Some(even_frame(crop_frame(frame, crop)));
                     }
                     Ok(_) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -517,6 +641,7 @@ pub fn write_stream(
                 while due_slot < end_slot {
                     if let Some(frame) = latest.as_ref() {
                         if video.is_none() {
+                            size = (frame.width, frame.height);
                             video = Some(open_for(frame, out, fps, bitrate)?);
                         }
                         let slot_time = (due_slot as i64 * 10_000_000) / i64::from(fps);
@@ -535,6 +660,8 @@ pub fn write_stream(
         return Ok(StreamReport {
             seconds: 0.0,
             frames,
+            width: 0,
+            height: 0,
         });
     };
     // How long the last frame was on screen is something only the caller
@@ -549,6 +676,8 @@ pub fn write_stream(
     Ok(StreamReport {
         seconds: end as f64 / 10_000_000.0,
         frames,
+        width: size.0,
+        height: size.1,
     })
 }
 
@@ -610,6 +739,157 @@ mod tests {
         assert_eq!(&trimmed.data[..8], &[1, 2, 3, 4, 6, 7, 8, 9]);
         assert_eq!(trimmed.data.len(), 12, "eight luma bytes plus four chroma");
         assert_eq!(&trimmed.data[8..], &[20, 21, 22, 23]);
+    }
+
+    /// A crop moves pixel boundaries and nothing else: the kept rectangle has
+    /// to be exactly the source pixels inside the four edges, at the original
+    /// scale, top-down.
+    #[test]
+    fn a_crop_keeps_the_pixels_inside_its_edges() {
+        // 4x4 BGRA, each pixel's four bytes carry its index, so a misplaced row
+        // or column shows up as the wrong number rather than a plausible
+        // picture.
+        let data: Vec<u8> = (0..4 * 4 * 4).map(|i| (i / 4) as u8).collect();
+        let frame = VideoFrame {
+            width: 4,
+            height: 4,
+            format: PixelFormat::Bgra,
+            data,
+            time: 7,
+        };
+        let cropped = crop_frame(
+            frame,
+            CropBox {
+                top: 1,
+                bottom: 1,
+                left: 1,
+                right: 1,
+            },
+        );
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(cropped.data.len(), 2 * 2 * 4);
+        // Rows 1 and 2, columns 1 and 2 — pixels 5, 6, 9, 10 of the grid.
+        assert_eq!(&cropped.data[..4], &[5, 5, 5, 5]);
+        assert_eq!(&cropped.data[4..8], &[6, 6, 6, 6]);
+        assert_eq!(&cropped.data[8..12], &[9, 9, 9, 9]);
+        assert_eq!(&cropped.data[12..16], &[10, 10, 10, 10]);
+        assert_eq!(cropped.time, 7, "the timestamp travels with the pixels");
+    }
+
+    /// Nothing to cut must cost nothing: the very same buffer comes back.
+    /// The stop checklist shows each file's resolution, so the report must
+    /// carry the size the writer actually opened at — crop applied and made
+    /// even — not the size the capture delivered.
+    #[test]
+    fn the_report_carries_the_size_the_file_was_written_at() {
+        let dir = std::env::temp_dir().join("takekit-writer-size");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.mp4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in [0i64, 333_333] {
+            tx.send(crate::frame::MediaFrame::Video(VideoFrame {
+                width: 100,
+                height: 50,
+                format: PixelFormat::Bgra,
+                data: vec![0; 100 * 50 * 4],
+                time: t,
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let report = write_stream(
+            rx,
+            &path,
+            Encode {
+                fps: 30,
+                bitrate: 2_000,
+                crop: CropBox {
+                    top: 0,
+                    bottom: 0,
+                    left: 0,
+                    right: 4,
+                },
+                sampling: Sampling::EveryFrame,
+            },
+            crate::clock::TakeClock::start(),
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        )
+        .unwrap();
+        assert_eq!((report.width, report.height), (96, 50), "crop right=4 kept");
+        assert_eq!(report.frames, 2);
+    }
+
+    #[test]
+    fn a_zero_crop_hands_the_frame_back_untouched() {
+        let frame = VideoFrame {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Bgra,
+            data: vec![9; 16],
+            time: 1,
+        };
+        let same = crop_frame(frame, CropBox::default());
+        assert_eq!((same.width, same.height), (2, 2));
+        assert_eq!(same.data.len(), 16);
+    }
+
+    /// A window that shrank after its edges were picked would leave a crop
+    /// wider than the frame: the whole picture is the useful answer, and the
+    /// alternative is a two-pixel file or a panic.
+    #[test]
+    fn a_crop_wider_than_the_frame_is_dropped() {
+        let box_too_big = CropBox {
+            left: 100,
+            right: 100,
+            ..CropBox::default()
+        };
+        assert_eq!(box_too_big.rect_in(120, 80), None);
+        let sliver = CropBox {
+            left: 0,
+            right: 79,
+            top: 0,
+            bottom: 0,
+        };
+        assert_eq!(sliver.rect_in(80, 80), None, "one pixel is not a crop");
+        let fits = CropBox {
+            left: 10,
+            right: 20,
+            top: 5,
+            bottom: 15,
+        };
+        assert_eq!(fits.rect_in(100, 80), Some((10, 5, 70, 60)));
+    }
+
+    /// NV12 keeps chroma at half resolution, so an odd edge would put the two
+    /// planes half a block apart — every edge lands on an even pixel instead.
+    #[test]
+    fn an_nv12_crop_aligns_both_planes() {
+        let (w, h) = (6u32, 4u32);
+        let mut data = vec![0u8; (w * h + w * h / 2) as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let frame = VideoFrame {
+            width: w,
+            height: h,
+            format: PixelFormat::Nv12,
+            data,
+            time: 0,
+        };
+        let cropped = crop_frame(
+            frame,
+            CropBox {
+                top: 1,
+                bottom: 1,
+                left: 1,
+                right: 1,
+            },
+        );
+        // Edges rounded down to even: the 4x2 rectangle starting at (0, 0).
+        assert_eq!((cropped.width, cropped.height), (4, 2));
+        assert_eq!(cropped.data.len(), 4 * 2 + 4, "luma plus a half-height chroma");
+        assert_eq!(&cropped.data[..4], &[0, 1, 2, 3]);
     }
 
     /// 48 kHz stereo 16-bit is 192,000 bytes a second, so a 1920-byte chunk is

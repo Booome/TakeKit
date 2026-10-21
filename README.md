@@ -112,19 +112,17 @@ takekit record --desktop --crop 33,0,0,0
 
 **待办**（大致按优先级）：
 
-1. **B4 收尾流程**：停止时逐源 finalize 清单 + `take:finalize|source|done` 事件。
-   实施前先读本地工作区 `.superpowers/sdd/overlay-tray-plan/plan.md` 的 Task B4，
-   并对照 `docs/api-recording.md`——API 后端下收尾语义已经变了。注意：**不要再补
-   "已保存"横幅**，成功反馈由历史行承担。
-2. **音频通道补全**：系统声音（WASAPI loopback）尚未实现；麦克风与摄像头代码就绪
+1. **音频通道补全**：系统声音（WASAPI loopback）尚未实现；麦克风与摄像头代码就绪
    但本机无设备未验证（`docs/api-recording.md` §5）。有设备后跑
    `takekit media --list` → `takekit media --camera <名> --mic <名>`。
-3. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
+2. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
    视结果决定是否做 slew 校正（设计讨论见 2026-10-20 工作日志）。
-4. **状态条 failed 态**：`StatusInfo.error` 与 `last_error` 已就位，只差 UI。
-5. **B6**：`finalize_panel == false` 的停止路径。
-6. 待拍板：单实例保护；提示层创建失败降级为"无提示层 + 记探针"（现在会拖垮整个
+3. 待拍板：单实例保护；提示层创建失败降级为"无提示层 + 记探针"（现在会拖垮整个
    app）；历史/日志「清空」是否连磁盘文件一起删；CLI `--marks` 与 UI「鼠标效果」
    文案对齐；ffmpeg 路径可配置。
-7. 未实测：150% 缩放、多显示器、深色主题下历史页浮窗/徽章观感；历史行双击会开
+4. 未实测：150% 缩放、多显示器双屏真机、深色主题下历史页浮窗/徽章观感；历史行双击会开
    两个资源管理器窗口（未节流）。
+5. ~~B4 收尾流程~~ ✅（2026-10-21：`take:finalize|source|done` 事件流 + 提示层逐源
+   清单 + 状态条 `正在写入… n/m`，「已保存」横幅按口径不做；`finalize_panel` 开关已进设置）。
+6. ~~状态条 failed 态~~ ✅（2026-10-21：菱形 + 原因单行 + 查看日志）。
+7. ~~光标/多屏对齐~~ ✅（2026-10-21：`WithCursor` 实测光标进画；picker 逐屏 + rect→Monitor）。

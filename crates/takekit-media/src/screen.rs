@@ -110,7 +110,11 @@ where
 {
     Handler::start_free_threaded(Settings::new(
         item,
-        CursorCaptureSettings::Default,
+        // `WithCursor`, not `Default`: the ffmpeg backend records with
+        // `draw_mouse=1`, and a tutorial recording without a pointer is a
+        // different product (2026-10-21 对齐). `Default` leaves visibility to
+        // the system — for a monitor that has meant no cursor at all.
+        CursorCaptureSettings::WithCursor,
         DrawBorderSettings::Default,
         SecondaryWindowSettings::Default,
         interval,
@@ -119,6 +123,75 @@ where
         flags,
     ))
     .map_err(|e| MediaError::message(e.to_string()))
+}
+
+/// One display, as the picker lists them. `index` is the one-based number
+/// `ScreenTarget::Monitor` takes — the position in `Monitor::enumerate`,
+/// which is the same order `Monitor::from_index` uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub index: usize,
+    /// The monitor's rectangle in desktop coordinates (physical pixels).
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Every display currently attached, in `Monitor` index order.
+pub fn monitors() -> Result<Vec<MonitorRect>> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+
+    Monitor::enumerate()
+        .map_err(|e| MediaError::message(e.to_string()))?
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            // GetMonitorInfoW needs the raw handle the wrapper hides; the
+            // rectangle is the one thing the wrapper does not expose.
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let ok = unsafe {
+                GetMonitorInfoW(
+                    windows::Win32::Graphics::Gdi::HMONITOR(m.as_raw_hmonitor() as _),
+                    &mut info,
+                )
+            };
+            if !ok.as_bool() {
+                return Err(MediaError::message(format!(
+                    "monitor {}: GetMonitorInfoW failed",
+                    i + 1
+                )));
+            }
+            let RECT {
+                left,
+                top,
+                right,
+                bottom,
+            } = info.rcMonitor;
+            Ok(MonitorRect {
+                index: i + 1,
+                x: left,
+                y: top,
+                w: (right - left) as u32,
+                h: (bottom - top) as u32,
+            })
+        })
+        .collect()
+}
+
+/// Which monitor a desktop rectangle belongs to: the one holding its centre.
+/// `None` when nothing does (a stale rect for a display that went away) —
+/// the caller falls back to the first monitor rather than failing the take.
+pub fn monitor_index_for(x: i32, y: i32, w: u32, h: u32) -> Option<usize> {
+    let cx = x + (w as i32 / 2);
+    let cy = y + (h as i32 / 2);
+    monitors().ok()?.into_iter().find(|m| {
+        cx >= m.x && cx < m.x + m.w as i32 && cy >= m.y && cy < m.y + m.h as i32
+    }).map(|m| m.index)
 }
 
 type HandlerFlags = (std::sync::Arc<AtomicBool>, Sender<MediaFrame>, TakeClock);

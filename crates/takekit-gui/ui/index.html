@@ -201,6 +201,15 @@
           </div>
           <div class="set-row">
             <div class="txt">
+              <label class="title" for="finalize-value" data-i18n="params.finalizePanel">收尾面板</label>
+              <span class="hint" data-i18n="params.finalizePanelHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="finalize-value" type="checkbox" role="switch" checked />
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="txt">
               <label class="title" for="raise-value" data-i18n="params.raise">窗口置前</label>
               <span class="hint" data-i18n="params.raiseHint"></span>
             </div>
@@ -278,10 +287,178 @@
     </section>
 
     <footer class="bar">
+      <!-- The failed state swaps the clock for a diamond and offers the log
+           (DESIGN §4.5): the reason stays one line with the whole text in
+           the title, and nothing is hidden behind the ellipsis. -->
+      <svg id="bar-fail-icon" class="fail-icon" viewBox="0 0 10 10" aria-hidden="true" hidden>
+        <path d="M5 0 10 5 5 10 0 5z" fill="currentColor" />
+      </svg>
       <span class="clock mono" id="clock">00:00:00</span>
       <span class="hint" id="hint">0 个源</span>
+      <button class="ghost flat" id="logs-btn" type="button" hidden data-i18n="bar.viewLogs">查看日志</button>
       <button class="rec" id="rec-btn" type="button" disabled data-i18n="bar.rec">开始录制</button>
     </footer>
+
+    <!-- ── The source editor ─────────────────────────────────────────────
+         One source, opened by clicking its row. Two layers: this card, and
+         the crop workspace that takes over the whole panel (a 4K frame needs
+         more room than a dialog has, and every edge nudge there is one source
+         pixel). Everything here is a draft until 保存. -->
+    <div class="modal hidden" id="editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <div class="modal-card">
+        <header class="modal-head">
+          <span class="tile" id="editor-tile" aria-hidden="true"></span>
+          <div class="modal-title">
+            <h2 id="editor-title">源</h2>
+            <p id="editor-sub">1920 × 1080</p>
+          </div>
+          <button
+            class="modal-x"
+            id="editor-close"
+            type="button"
+            title="关闭"
+            data-i18n-title="editor.close"
+          >
+            ✕
+          </button>
+        </header>
+
+        <div class="modal-body">
+          <div class="pair">
+            <label class="field edit-field">
+              <span class="edit-key" data-i18n="row.fpsLabel">帧率</span>
+              <select class="value" id="editor-fps"></select>
+            </label>
+            <label class="field edit-field">
+              <span class="edit-key" data-i18n="row.qualityLabel">画质</span>
+              <select class="value" id="editor-quality"></select>
+            </label>
+          </div>
+
+          <div class="edit-section">
+            <p class="edit-label" data-i18n="editor.crop">裁剪</p>
+            <button class="thumb" id="editor-thumb" type="button">
+              <img id="editor-img" alt="" />
+              <span class="thumb-empty hidden" id="editor-thumb-empty"></span>
+              <span class="thumb-cta" data-i18n="editor.cropOpen">调整裁剪…</span>
+              <span class="thumb-badge mono" id="editor-size">—</span>
+            </button>
+          </div>
+        </div>
+
+        <footer class="modal-foot">
+          <span class="modal-note" id="editor-note"></span>
+          <button class="ghost flat" id="editor-cancel" type="button" data-i18n="editor.cancel">
+            取消
+          </button>
+          <button class="primary" id="editor-save" type="button" data-i18n="editor.save">
+            保存
+          </button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- ── The crop workspace ────────────────────────────────────────────
+         Fills the panel. The picture pans and zooms; the four numbers stay in
+         source pixels, so a nudge is a nudge at 4K as much as at 720p. -->
+    <section class="crop hidden" id="crop" aria-labelledby="crop-title">
+      <header class="crop-head">
+        <span class="tile small" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <path d="M4.5 1.5v13M11.5 1.5v13M1.5 4.5h13M1.5 11.5h13" stroke-linecap="round" />
+          </svg>
+        </span>
+        <div class="crop-title">
+          <h2 id="crop-title" data-i18n="crop.title">裁剪</h2>
+          <p id="crop-sub">—</p>
+        </div>
+        <span class="badge" data-i18n="crop.oneToOne">1 px = 源 1 px</span>
+        <button class="ghost flat" id="crop-back" type="button" data-i18n="crop.back">返回</button>
+      </header>
+
+      <div class="crop-tools">
+        <div class="tool-group">
+          <button class="tool" id="zoom-out" type="button" title="缩小" data-i18n-title="crop.zoomOut">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M3.5 8h9" stroke-linecap="round" />
+            </svg>
+          </button>
+          <span class="tool-value mono" id="zoom-value">100%</span>
+          <button class="tool" id="zoom-in" type="button" title="放大" data-i18n-title="crop.zoomIn">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M3.5 8h9M8 3.5v9" stroke-linecap="round" />
+            </svg>
+          </button>
+        </div>
+        <div class="tool-group">
+          <button class="tool wide" id="view-fit" type="button" data-i18n="crop.fit">适应</button>
+          <button class="tool wide" id="view-one" type="button" data-i18n="crop.actual">1:1</button>
+          <button class="tool wide" id="view-reset" type="button" data-i18n="crop.reset">重置视图</button>
+        </div>
+        <div class="tool-group">
+          <button
+            class="tool wide"
+            id="tool-pan"
+            type="button"
+            aria-pressed="false"
+            data-i18n="crop.pan"
+          >
+            平移
+          </button>
+        </div>
+        <p class="tool-hint" data-i18n="crop.hint">滚轮缩放 · 空格拖动 · 方向键微调</p>
+      </div>
+
+      <div class="crop-stage" id="crop-stage" tabindex="0">
+        <div class="crop-plane" id="crop-plane">
+          <img class="crop-img" id="crop-img" alt="" draggable="false" />
+          <div class="crop-box" id="crop-box" tabindex="0">
+            <span class="crop-thirds" aria-hidden="true"></span>
+            <span class="crop-handle" data-edge="nw"></span>
+            <span class="crop-handle" data-edge="n"></span>
+            <span class="crop-handle" data-edge="ne"></span>
+            <span class="crop-handle" data-edge="e"></span>
+            <span class="crop-handle" data-edge="se"></span>
+            <span class="crop-handle" data-edge="s"></span>
+            <span class="crop-handle" data-edge="sw"></span>
+            <span class="crop-handle" data-edge="w"></span>
+          </div>
+        </div>
+        <p class="crop-none hidden" id="crop-none"></p>
+      </div>
+
+      <footer class="crop-foot">
+        <div class="edges">
+          <label class="edge">
+            <span class="edge-key" data-i18n="crop.top">上</span>
+            <input class="edge-input mono" id="edge-top" type="number" min="0" step="1" />
+            <span class="edge-unit">px</span>
+          </label>
+          <label class="edge">
+            <span class="edge-key" data-i18n="crop.bottom">下</span>
+            <input class="edge-input mono" id="edge-bottom" type="number" min="0" step="1" />
+            <span class="edge-unit">px</span>
+          </label>
+          <label class="edge">
+            <span class="edge-key" data-i18n="crop.left">左</span>
+            <input class="edge-input mono" id="edge-left" type="number" min="0" step="1" />
+            <span class="edge-unit">px</span>
+          </label>
+          <label class="edge">
+            <span class="edge-key" data-i18n="crop.right">右</span>
+            <input class="edge-input mono" id="edge-right" type="number" min="0" step="1" />
+            <span class="edge-unit">px</span>
+          </label>
+        </div>
+        <div class="crop-out">
+          <span class="crop-out-key" data-i18n="crop.output">输出</span>
+          <span class="crop-out-value mono" id="crop-output">—</span>
+        </div>
+        <button class="ghost flat" id="crop-clear" type="button" data-i18n="crop.clear">
+          恢复全幅
+        </button>
+      </footer>
+    </section>
 
     <div class="notice hidden" id="notice" role="status">
       <span class="dot warn" id="notice-dot"></span>

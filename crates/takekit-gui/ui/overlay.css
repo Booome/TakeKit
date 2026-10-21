@@ -7,6 +7,10 @@
      over whatever is on screen), so the light-theme green would be invisible on
      it — this is the one accent that must not follow the system theme. */
   --tk-ok: #6ccb5f;
+  /* Same reason for the failure cross: the panel's #dc2626 goes muddy under
+     62% black, this is its light-on-dark twin. Shape (✗) and the reason text
+     also carry "failed", so the state never rests on color alone. */
+  --tk-bad: #ff7b72;
 }
 
 * {
@@ -52,4 +56,57 @@ body {
 
 .go {
   color: var(--tk-ok);
+}
+
+/* The frozen timer under STOP: the take's length as of the button press. */
+#sub {
+  font: 400 32px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: #fff;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The stop checklist: one row per file as it lands (DESIGN §4.6). Numbers
+   share one tabular column width so the rows line up; the failure row swaps
+   them for a cross and the reason. */
+#list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 420px;
+}
+
+#list .row {
+  display: flex;
+  align-items: baseline;
+  gap: 22px;
+  font: 400 16px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: #fff;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+
+#list .row-id {
+  flex: none;
+  min-width: 64px;
+}
+
+#list .row-num {
+  flex: none;
+  min-width: 84px;
+  text-align: right;
+}
+
+#list .row-bad {
+  flex: none;
+  color: var(--tk-bad);
+}
+
+#list .row-why {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }

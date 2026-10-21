@@ -2,11 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_HWNDNEXT, GW_OWNER, GWL_EXSTYLE, GetClientRect, GetTopWindow, GetWindow,
-    GetWindowLongW, GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW,
+    EnumWindows, GW_HWNDNEXT, GW_OWNER, GWL_EXSTYLE, GetTopWindow, GetWindow, GetWindowLongW,
+    GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow,
     IsWindowVisible, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPlacement,
     SetWindowPos, WINDOWPLACEMENT, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -58,9 +57,20 @@ impl Crop {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capture {
     /// The whole desktop, or a region of it.
-    Desktop { rect: Option<ScreenRect> },
+    ///
+    /// `rect` is a region the source was *created* with (the CLI's `--crop`),
+    /// while `crop` is the four edges the editor trims — the two ways of saying
+    /// "not all of it" that predate each other. Both are honoured; the editor
+    /// on the panel only ever writes `crop`, so the same edges mean the same
+    /// picture on either backend.
+    Desktop {
+        rect: Option<ScreenRect>,
+        #[serde(default)]
+        crop: Crop,
+    },
     /// A window, addressed by handle. Two windows can share a title, so the
-    /// title is display metadata, not the identity. Its client area is used.
+    /// title is display metadata, not the identity. What is recorded is the
+    /// whole window, frame included — the picture it makes on screen.
     Window {
         hwnd: isize,
         title: String,
@@ -68,6 +78,51 @@ pub enum Capture {
     },
     /// A DirectShow video device, e.g. a phone acting as a webcam.
     Camera { device: String, crop: Crop },
+}
+
+impl Capture {
+    /// The whole desktop, or a region of it.
+    ///
+    /// A constructor rather than a literal because the variant also carries a
+    /// crop, and `Desktop { rect: None, crop: Crop::default() }` written out at
+    /// a dozen call sites is a dozen places to update the next time it grows.
+    pub fn desktop(rect: Option<ScreenRect>) -> Self {
+        Capture::Desktop {
+            rect,
+            crop: Crop::default(),
+        }
+    }
+
+    /// The four edges this capture wants trimmed off, in the pixels of the
+    /// picture it captures.
+    pub fn crop(&self) -> Crop {
+        match self {
+            Capture::Desktop { crop, .. }
+            | Capture::Window { crop, .. }
+            | Capture::Camera { crop, .. } => *crop,
+        }
+    }
+
+    /// The same capture, cropping a different rectangle. Used by the editor:
+    /// a source keeps its identity (handle, device, title) and only its edges
+    /// move.
+    pub fn with_crop(&self, edges: Crop) -> Self {
+        match self {
+            Capture::Desktop { rect, .. } => Capture::Desktop {
+                rect: *rect,
+                crop: edges,
+            },
+            Capture::Window { hwnd, title, .. } => Capture::Window {
+                hwnd: *hwnd,
+                title: title.clone(),
+                crop: edges,
+            },
+            Capture::Camera { device, .. } => Capture::Camera {
+                device: device.clone(),
+                crop: edges,
+            },
+        }
+    }
 }
 
 /// How the desktop is captured.
@@ -116,7 +171,9 @@ impl Source {
     /// fail at another, so the probe has to use the real geometry.
     pub fn screen_rect(&self) -> Option<ScreenRect> {
         match &self.capture {
-            Capture::Desktop { rect } => Some(rect.unwrap_or_else(virtual_screen_rect)),
+            Capture::Desktop { rect, crop } => {
+                Some(crop.cropped(rect.unwrap_or_else(virtual_screen_rect)))
+            }
             Capture::Window { hwnd, title, crop } => resolve_window(*hwnd, title)
                 .ok()
                 .map(|w| crop.cropped(w.rect)),
@@ -128,8 +185,8 @@ impl Source {
     /// cropping filter that runs before encoding.
     pub fn input_args(&self, engine: Engine) -> Result<(Vec<String>, Option<String>), String> {
         match &self.capture {
-            Capture::Desktop { rect } => {
-                let r = rect.unwrap_or_else(virtual_screen_rect);
+            Capture::Desktop { rect, crop } => {
+                let r = crop.cropped(rect.unwrap_or_else(virtual_screen_rect));
                 let mut args = screen_args(engine, r, self.fps);
                 let filters: Vec<String> = download_filter(engine)
                     .map(str::to_string)
@@ -269,6 +326,132 @@ pub struct WindowItem {
     pub rect: ScreenRect,
 }
 
+/// What the editor needs to draw a crop: the size the take will record, and a
+/// still to draw it against when one could be grabbed.
+pub struct Preview {
+    /// The size every crop value is counted in. Reported even when there is no
+    /// picture — a crop is numbers first, and refusing to open because a grab
+    /// failed would hide numbers that are perfectly usable.
+    pub width: u32,
+    pub height: u32,
+    pub frame: Option<takekit_media::Snapshot>,
+    /// Why there is no picture, when there is none.
+    pub reason: Option<String>,
+}
+
+/// One still picture of a source, for the editor to draw its crop on.
+///
+/// Deliberately not a frame from the recorder: Windows Graphics Capture only
+/// delivers a frame when the picture *changes*, so asking it for a still of an
+/// idle window answers with nothing at all. GDI answers immediately and a
+/// preview does not need to be fast.
+///
+/// The size comes from `window_capture_size`, not from the grab: a grab can
+/// fail (a minimized window, a window that refuses `PrintWindow`) and the crop
+/// is still perfectly well defined against the frame the take will record.
+pub fn preview(capture: &Capture) -> Preview {
+    match capture {
+        // One monitor, the same one the recorder points a desktop source at.
+        Capture::Desktop { .. } => match takekit_media::snapshot::monitor(1) {
+            Ok(frame) => Preview {
+                width: frame.width,
+                height: frame.height,
+                frame: Some(frame),
+                reason: None,
+            },
+            Err(e) => {
+                let r = virtual_screen_rect();
+                Preview {
+                    width: r.w,
+                    height: r.h,
+                    frame: None,
+                    reason: Some(e.to_string()),
+                }
+            }
+        },
+        Capture::Window { hwnd, title, .. } => {
+            let size = window_capture_size(*hwnd);
+            let (width, height) = size.as_ref().map(|(w, h)| (*w, *h)).unwrap_or((0, 0));
+            if width == 0 || height == 0 {
+                let why = size
+                    .err()
+                    .unwrap_or_else(|| format!("window {hwnd} has no area"));
+                return Preview {
+                    width: 0,
+                    height: 0,
+                    frame: None,
+                    reason: Some(format!("{title}: {why}")),
+                };
+            }
+            let frame = window_rect(HWND(*hwnd as *mut core::ffi::c_void));
+            match takekit_media::snapshot::window(
+                *hwnd,
+                takekit_media::snapshot::Frame {
+                    x: frame.x,
+                    y: frame.y,
+                    width,
+                    height,
+                },
+            ) {
+                // A minimized window's cached surface is mostly black — a
+                // picture that lies. The size is right (see
+                // `window_capture_size`) and the crop works against it; the
+                // editor is told why there is no picture instead.
+                Ok(_) if is_minimized(*hwnd) => Preview {
+                    width,
+                    height,
+                    frame: None,
+                    reason: Some("preview.minimized".into()),
+                },
+                Ok(frame) => Preview {
+                    width: frame.width,
+                    height: frame.height,
+                    frame: Some(frame),
+                    reason: None,
+                },
+                Err(e) => Preview {
+                    width,
+                    height,
+                    frame: None,
+                    reason: Some(format!("{title}: {e}")),
+                },
+            }
+        }
+        Capture::Camera { .. } => Preview {
+            width: 0,
+            height: 0,
+            frame: None,
+            reason: Some("a camera has no still preview".into()),
+        },
+    }
+}
+
+/// Whether a window is currently minimized.
+pub fn is_minimized(hwnd: isize) -> bool {
+    // SAFETY: one state query on a handle; a dead handle answers `false`.
+    unsafe { IsIconic(HWND(hwnd as *mut core::ffi::c_void)).as_bool() }
+}
+
+/// The size of the picture a take of this window will record — without moving
+/// the window.
+///
+/// That is the whole window, frame included (see `window_rect`). A minimized
+/// window reports its restored size, because the take restores it before
+/// capturing; the window itself is never touched — opening an editor must not
+/// reshuffle the user's desktop.
+pub fn window_capture_size(hwnd: isize) -> Result<(u32, u32), String> {
+    let handle = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: one state query plus a stack rect the call fills.
+    if !unsafe { IsWindow(Some(handle)).as_bool() } {
+        return Err(format!("window {hwnd} is gone"));
+    }
+    let rect = window_rect(handle);
+    if rect.w == 0 || rect.h == 0 {
+        return Err(format!("window {hwnd} has no area"));
+    }
+    Ok((rect.w, rect.h))
+}
+
 /// Screen bounds of the whole virtual screen (all monitors).
 pub fn virtual_screen_rect() -> ScreenRect {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -354,9 +537,9 @@ pub fn window_by_hwnd(hwnd: isize) -> Result<WindowItem, String> {
         }
     }
     restore(handle);
-    let rect = client_rect(handle);
+    let rect = window_rect(handle);
     if rect.w == 0 || rect.h == 0 {
-        return Err(format!("window {hwnd} has no client area"));
+        return Err(format!("window {hwnd} has no area"));
     }
     Ok(WindowItem {
         hwnd,
@@ -704,7 +887,7 @@ fn capture_target(hwnd: HWND) -> Option<WindowItem> {
     if title.is_empty() {
         return None;
     }
-    let rect = client_rect(hwnd);
+    let rect = window_rect(hwnd);
     if rect.w == 0 || rect.h == 0 {
         return None;
     }
@@ -741,13 +924,58 @@ fn window_title(hwnd: HWND) -> String {
     }
 }
 
-/// Client area of a window, in screen coordinates (physical pixels).
-fn client_rect(hwnd: HWND) -> ScreenRect {
-    // SAFETY: `rc` is a stack-owned RECT that the call fills in; it is also
-    // passed to ClientToScreen below while still borrowed by this frame.
+/// The window as it is drawn, in screen coordinates (physical pixels): title
+/// bar, visible borders and client area, and nothing else.
+///
+/// This is the picture a window source records — measured 1922x1166 against a
+/// 1920x1134 client and a 1936x1173 `GetWindowRect` on a VirtualBox window
+/// (2026-10-21). Three rectangles, three answers:
+///
+/// * `GetClientRect` is the client area: no title bar, so the bottom of the
+///   window went missing from the crop tool's picture and the crops came out
+///   wrong;
+/// * `GetWindowRect` is the client area *plus* Windows 11's invisible resize
+///   borders (7px left, right and bottom) — bigger than the recording;
+/// * `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` is what DWM
+///   composes, which is exactly what Windows Graphics Capture delivers and
+///   what ffmpeg's screen rectangle has to cover.
+fn window_rect(hwnd: HWND) -> ScreenRect {
+    use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+
+    let rect_of = |rc: RECT| ScreenRect {
+        x: rc.left,
+        y: rc.top,
+        w: (rc.right - rc.left).max(0) as u32,
+        h: (rc.bottom - rc.top).max(0) as u32,
+    };
+    // SAFETY: `rc` is a stack RECT the calls fill in.
     unsafe {
+        if IsIconic(hwnd).as_bool() {
+            // A minimized window's DWM bounds and GetWindowRect are both its
+            // taskbar icon (measured 146x28, which looks like a size and is
+            // not one). The take restores the window first, so the restored
+            // placement is the frame to report.
+            let mut placement = WINDOWPLACEMENT {
+                length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if GetWindowPlacement(hwnd, &mut placement).is_ok() {
+                return rect_of(visible_frame(placement.rcNormalPosition));
+            }
+        }
         let mut rc = RECT::default();
-        if GetClientRect(hwnd, &mut rc).is_err() {
+        let size = core::mem::size_of::<RECT>() as u32;
+        let dwm = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            std::ptr::addr_of_mut!(rc).cast(),
+            size,
+        );
+        if dwm.is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+            return rect_of(rc);
+        }
+        let mut outer = RECT::default();
+        if GetWindowRect(hwnd, &mut outer).is_err() {
             return ScreenRect {
                 x: 0,
                 y: 0,
@@ -755,14 +983,31 @@ fn client_rect(hwnd: HWND) -> ScreenRect {
                 h: 0,
             };
         }
-        let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-        let _ = ClientToScreen(hwnd, &mut origin);
-        ScreenRect {
-            x: origin.x,
-            y: origin.y,
-            w: (rc.right - rc.left).max(0) as u32,
-            h: (rc.bottom - rc.top).max(0) as u32,
-        }
+        rect_of(visible_frame(outer))
+    }
+}
+
+/// `GetWindowRect` with Windows' invisible resize borders taken off.
+///
+/// They sit *inside* the rect but are not part of the picture: 7px on the
+/// left, right and bottom (measured against DWM's frame bounds on Windows 11),
+/// and none on the top, where the visible title bar edge is. Without this a
+/// "restored" size taken from a placement is a few pixels wider than the
+/// recording.
+fn visible_frame(rc: RECT) -> RECT {
+    // SAFETY: two system metrics, no pointers.
+    let dx = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXSIZEFRAME,
+        ) + windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXPADDEDBORDER,
+        )
+    };
+    RECT {
+        left: rc.left + dx,
+        top: rc.top,
+        right: (rc.right - dx).max(rc.left + dx),
+        bottom: (rc.bottom - dx).max(rc.top),
     }
 }
 
@@ -971,7 +1216,7 @@ mod tests {
     /// found out by the take itself, which reports the device properly.
     #[test]
     fn a_desktop_or_camera_source_is_taken_on_trust() {
-        assert!(is_recordable(&Capture::Desktop { rect: None }));
+        assert!(is_recordable(&Capture::desktop(None)));
         assert!(is_recordable(&Capture::Camera {
             device: "unplugged anyway".to_string(),
             crop: Crop::default(),
@@ -1334,14 +1579,12 @@ mod tests {
     fn only_the_desktop_duplication_engine_asks_for_a_d3d_frame() {
         let source = Source::new(
             "screen",
-            Capture::Desktop {
-                rect: Some(ScreenRect {
-                    x: 0,
-                    y: 0,
-                    w: 640,
-                    h: 480,
-                }),
-            },
+            Capture::desktop(Some(ScreenRect {
+                x: 0,
+                y: 0,
+                w: 640,
+                h: 480,
+            })),
             30,
         );
 
@@ -1361,14 +1604,12 @@ mod tests {
     fn every_source_trims_its_frames_to_even_dimensions() {
         let source = Source::new(
             "screen",
-            Capture::Desktop {
-                rect: Some(ScreenRect {
-                    x: 0,
-                    y: 0,
-                    w: 640,
-                    h: 561,
-                }),
-            },
+            Capture::desktop(Some(ScreenRect {
+                x: 0,
+                y: 0,
+                w: 640,
+                h: 561,
+            })),
             30,
         );
 

@@ -27,10 +27,22 @@ const state = {
   // toggling it twice does not lose a value B5's number input once allows.
   countdownSecs: 3,
   lastCountdownSecs: 3,
+  // The full-screen stop screen while a take finalises (B4/B6). Off means
+  // the stop progress lives on this panel's status bar alone.
+  finalizePanel: true,
   recording: false,
   // True between "begin accepted" and the veil saying GO: the panel is hidden
   // and the take is not running yet. F9 again in that window cancels it.
   countdown: false,
+  // The stop in progress: between `take:finalize` and `take:done` the files
+  // are draining and the clock is frozen at the button press (B4).
+  finalizing: false,
+  finalizeTotal: 0,
+  finalized: 0,
+  // The bar's failed state (DESIGN §4.5): why the last begin/spawn/stop did
+  // not work. Cleared by the next take, not by the 3s timer — the reason is
+  // worth reading at the user's pace.
+  error: null,
   elapsed: 0,
   screen: null,
   sourcesLoaded: false,
@@ -43,6 +55,9 @@ const state = {
   // Seeded by Rust before load; applySaved() confirms it from the file.
   language: window.__TAKEKIT_LANG__ === "en" ? "en" : "zh",
   theme: "auto",
+  // Attached displays (`env_info.monitors`), in the picker's order. A desktop
+  // source's rect is matched back against these for its name and size.
+  monitors: [],
   // What `env_info` said the automatic encoder resolves to, so the option can
   // read "自动（NVENC）" in whichever language is current.
   encoderName: null,
@@ -90,23 +105,72 @@ function truncate(text, n) {
 
 // A remembered source carries no display text — only what the core needs — so
 // the row labels are derived back from the capture spec.
-function labelFor(capture) {
-  const bg = state.backend === "windows" ? ` · ${t("picker.bgCapable")}` : "";
+// The size of the picture a take of this source records — the same pixels the
+// crop's numbers are counted in. `null` when it cannot be known yet: a camera
+// only reports one once it has delivered a frame.
+function frameSize(capture) {
   if (capture.Desktop) {
-    return {
-      name: t("label.desktop"),
-      meta: state.backend === "windows" ? "WGC" : "ddagrab / gdigrab",
-    };
+    // A remembered per-monitor desktop source records that monitor, not the
+    // whole virtual screen (2026-10-21 多屏): the row must show its size.
+    if (capture.Desktop.rect) return { w: capture.Desktop.rect.w, h: capture.Desktop.rect.h };
+    return state.screen ? { w: state.screen.w, h: state.screen.h } : null;
   }
   if (capture.Window) {
     const live = state.windows.find((x) => x.hwnd === capture.Window.hwnd);
-    const size = live ? t("label.windowMeta", { w: live.w, h: live.h }) : t("label.window");
+    return live ? { w: live.w, h: live.h } : null;
+  }
+  return null;
+}
+
+// `1922×1166` on its own, or `1922×1166 → 1920×1094` when the source is
+// cropped. Both numbers are worth showing: what goes in is as interesting as
+// what comes out, and the arrow says "cropped" without a word.
+function geometryOf(capture) {
+  const size = frameSize(capture);
+  if (!size) return "";
+  const crop = cropOf(capture);
+  const cropped = crop.top || crop.bottom || crop.left || crop.right;
+  if (!cropped) return `${size.w}×${size.h}`;
+  return `${size.w}×${size.h} → ${size.w - crop.left - crop.right}×${size.h - crop.top - crop.bottom}`;
+}
+
+// What the row says (2026-10-21 方案 A): identity on the left, comparable
+// numbers in fixed columns on the right. So the label carries three things —
+// the full name (the row truncates it, the tooltip does not), the geometry
+// string for the size column, and the hover-only note (engine, background
+// capability). The old `meta` mixed geometry and prose in one line under the
+// name; the prose is now tooltip-only and the numbers have their own column.
+// The monitor a desktop rect belongs to (its centre), or null. The row's
+// name comes from this: a per-monitor source says which screen it is, not
+// just "desktop" (2026-10-21 多屏).
+function monitorFor(rect) {
+  if (!rect) return null;
+  const cx = rect.x + rect.w / 2;
+  const cy = rect.y + rect.h / 2;
+  return (
+    (state.monitors || []).find(
+      (m) => cx >= m.x && cx < m.x + m.w && cy >= m.y && cy < m.y + m.h,
+    ) || null
+  );
+}
+
+function labelFor(capture) {
+  const geo = geometryOf(capture);
+  const bg = state.backend === "windows" ? t("picker.bgCapable") : "";
+  if (capture.Desktop) {
+    // The tile and the name already say "desktop"; what is left to say is how
+    // big the picture is (or, when that is unknown, which engine grabs it).
+    const mon = monitorFor(capture.Desktop.rect);
     return {
-      name: truncate(capture.Window.title, 48),
-      meta: state.backend === "windows" ? `${size}${bg}` : size,
+      name: mon ? t("label.monitor", { n: mon.index }) : t("label.desktop"),
+      geo,
+      note: state.backend === "windows" ? "WGC" : "ddagrab / gdigrab",
     };
   }
-  return { name: truncate(capture.Camera.device, 48), meta: "Media Foundation" };
+  if (capture.Window) {
+    return { name: capture.Window.title, geo, note: bg };
+  }
+  return { name: capture.Camera.device, geo, note: "Media Foundation" };
 }
 
 // What makes two sources the same source: the handle, the device, or the
@@ -144,8 +208,10 @@ function persist() {
   }, 300);
 }
 
-function addSource(id, capture, name, meta) {
-  state.sources.push({ id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY, name, meta });
+// No display text is stored: the row derives its label from the capture spec
+// on every render (see `labelFor`), so a language switch relabels as it goes.
+function addSource(id, capture) {
+  state.sources.push({ id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY });
   preheatFor(capture);
   persist();
   render();
@@ -224,20 +290,14 @@ async function dropUnusable(sources) {
   notify("warn", t("notice.dropped", { n: dead.length }));
 }
 
-function sourceSelect(label, options, prefix, current, apply, disabled) {
-  const sel = document.createElement("select");
-  sel.className = "row-param";
-  sel.setAttribute("aria-label", label);
-  sel.disabled = disabled;
-  for (const v of options) {
-    const opt = document.createElement("option");
-    opt.value = String(v);
-    opt.textContent = `${prefix}${v}`;
-    opt.selected = v === current;
-    sel.append(opt);
-  }
-  sel.addEventListener("change", (e) => apply(Number(e.target.value)));
-  return sel;
+// What the row says about a source without opening it: the two numbers that
+// decide what the file looks like, and a word when its frame is trimmed.
+// "30 Q20" (the old two bare dropdowns) named neither number; these do.
+// The row's right-hand numbers: what the file is encoded at. The picture's
+// geometry (source size, and the size it is cropped to) has the line below the
+// name to itself — see `geometryOf`.
+function summaryOf(source) {
+  return `${source.fps}fps · Q${source.quality}`;
 }
 
 // Source-row tile icons (outline, 1.4 stroke — one family, three kinds).
@@ -251,12 +311,17 @@ const SOURCE_ICONS = {
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="4" width="9.5" height="8" rx="1.6"/><path d="M11 7.2 14.2 5.4v5.2L11 8.8z" stroke-linejoin="round"/></svg>',
 };
 
+// Which of the three kinds this capture is — the one place that decides it,
+// because the row tile and the editor's header tile must agree.
+function kindOf(capture) {
+  return capture.Desktop ? "desktop" : capture.Window ? "window" : "camera";
+}
+
 function sourceTile(capture) {
   const tile = document.createElement("span");
   tile.className = "tile";
   tile.setAttribute("aria-hidden", "true");
-  const kind = capture.Desktop ? "desktop" : capture.Window ? "window" : "camera";
-  tile.innerHTML = SOURCE_ICONS[kind];
+  tile.innerHTML = SOURCE_ICONS[kindOf(capture)];
   return tile;
 }
 
@@ -264,11 +329,20 @@ function render() {
   // While a take is running the transport bar stays on every tab: a timer and
   // a stop button you cannot see are how a recording gets forgotten.
   document.body.classList.toggle("recording", state.recording);
+  // A take closes the editor: a source's numbers must not change under a
+  // recording that already read them, and the row it belongs to is disabled.
+  if (state.recording && editor) closeEditor();
   listEl.replaceChildren();
 
   for (const s of state.sources) {
     const row = document.createElement("div");
     row.className = "row";
+    // The whole row opens the source's editor. Before this, the row carried
+    // two bare dropdowns whose values ("30", "Q20") said nothing about what
+    // they were, and there was no room left for a third thing to set.
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.classList.toggle("busy", state.recording);
 
     const tile = sourceTile(s.capture);
 
@@ -279,34 +353,27 @@ function render() {
     main.className = "row-main";
     const name = document.createElement("div");
     name.className = "row-name";
-    name.textContent = label.name;
-    const meta = document.createElement("div");
-    meta.className = "row-meta";
-    meta.textContent = label.meta;
-    main.append(name, meta);
+    name.textContent = truncate(label.name, 48);
+    // The ellipsis must have a path to the whole string: the tooltip carries
+    // the untruncated name (Essential Text Truncation).
+    name.title = label.name;
+    main.append(name);
 
-    const fpsSel = sourceSelect(
-      t("row.fps", { name: label.name }),
-      FPS_OPTIONS,
-      "",
-      s.fps,
-      (v) => {
-        s.fps = v;
-        persist();
-      },
-      state.recording,
-    );
-    const qualitySel = sourceSelect(
-      t("row.quality", { name: label.name }),
-      QUALITY_OPTIONS,
-      "Q",
-      s.quality,
-      (v) => {
-        s.quality = v;
-        persist();
-      },
-      state.recording,
-    );
+    // The size column: right-aligned tabular figures so every row's size
+    // lines up and the column compares at a glance. "—" when the size is not
+    // knowable yet (a camera reports one only once it has delivered a frame).
+    const geo = document.createElement("div");
+    geo.className = label.geo ? "row-geo" : "row-geo dim";
+    geo.textContent = label.geo || "—";
+    // The prose that used to sit under the name now lives here: same column,
+    // same tooltip, never in the scanning lane.
+    if (label.note || !label.geo) {
+      geo.title = [label.geo || t("row.sizeUnknown"), label.note].filter(Boolean).join(" · ");
+    }
+
+    const summary = document.createElement("div");
+    summary.className = "row-summary";
+    summary.textContent = summaryOf(s);
 
     const remove = document.createElement("button");
     remove.className = "row-remove";
@@ -318,7 +385,23 @@ function render() {
       removeSource(s.id);
     });
 
-    row.append(tile, main, fpsSel, qualitySel, remove);
+    const open = () => {
+      if (state.recording) return;
+      openEditor(s.id);
+    };
+    row.addEventListener("click", (e) => {
+      // A click on the × is a removal, not an invitation to edit.
+      if (e.target.closest(".row-remove")) return;
+      open();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      open();
+    });
+    row.setAttribute("aria-label", t("row.editLabel", { name: label.name }));
+
+    row.append(tile, main, geo, summary, remove);
     listEl.append(row);
   }
 
@@ -332,6 +415,9 @@ function render() {
   // A take outlives its last source: one can be dropped mid-recording, and the
   // button has to stay live so the take can still be stopped.
   $("rec-btn").disabled = n === 0 && !state.recording;
+  // Failed overrides the hint and swaps in the diamond + log button (§4.5);
+  // every repaint has to agree, or a render() would wipe the reason away.
+  paintStatus();
 }
 
 // ── The journal panes ───────────────────────────────────────────────────────
@@ -385,9 +471,66 @@ function renderTabs() {
   logTab.classList.toggle("error", journal.unread_log_level === "error");
 }
 
+// The trash on a history row. Same two-step rule as Clear (`bindClear`): the
+// first click arms, the second deletes — a delete that happens on one click is
+// a delete that happens by accident. The folder on disk goes with the row
+// (take_delete), so the arm state is the only thing standing between a slip
+// and an unrecoverable file.
+function takeDeleteButton(take) {
+  const btn = document.createElement("button");
+  btn.className = "row-del";
+  btn.type = "button";
+  const label = () => t("take.deleteLabel", { when: timeLabel(take.at) });
+  const stamp = () => {
+    // While armed the name says what the second click will do; `title` is the
+    // only text an icon button has, so it carries both halves of the story.
+    const text = btn.classList.contains("armed") ? t("take.deleteArmed") : t("take.delete");
+    btn.title = text;
+    btn.setAttribute("aria-label", `${label()} — ${text}`);
+  };
+  stamp();
+  btn.innerHTML = TRASH_ICON;
+  let armed = null;
+  btn.addEventListener("click", (e) => {
+    // A click on the trash is a delete, never an invitation to open the take.
+    e.stopPropagation();
+    if (!armed) {
+      btn.classList.add("armed");
+      stamp();
+      armed = setTimeout(() => {
+        armed = null;
+        btn.classList.remove("armed");
+        stamp();
+      }, 3000);
+      return;
+    }
+    clearTimeout(armed);
+    armed = null;
+    invoke("take_delete", { dir: take.dir })
+      .then((view) => {
+        journal = view;
+        renderJournal();
+        renderTabs();
+      })
+      .catch((e) => {
+        btn.classList.remove("armed");
+        stamp();
+        showNotice("error", String(e));
+      });
+  });
+  return btn;
+}
+
+// Outline trash, same 16px / 1.4 family as SOURCE_ICONS (Phosphor `trash`).
+const TRASH_ICON =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 4.5h11M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.2 4.5l.55 8.1a1.2 1.2 0 0 0 1.2 1.1h4.1a1.2 1.2 0 0 0 1.2-1.1l.55-8.1" stroke-linejoin="round"/><path d="M6.6 7v4.2M9.4 7v4.2" stroke-linecap="round"/></svg>';
+
 function takeRow(take, fresh) {
-  const row = document.createElement("button");
-  row.type = "button";
+  // A div with a button role, not a <button>: the row hosts the trash button
+  // inside it, and a button inside a button is not HTML.
+  const row = document.createElement("div");
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
   row.className = fresh ? "take fresh" : "take";
   row.title = take.dir;
 
@@ -419,8 +562,17 @@ function takeRow(take, fresh) {
     badge.textContent = t("take.new");
     row.append(badge);
   }
-  row.append(path, open);
+  row.append(path, open, takeDeleteButton(take));
   row.addEventListener("click", () => openTake(take.dir));
+  row.addEventListener("keydown", (e) => {
+    // Enter/Space on the row's own focus opens the take; on the trash button
+    // inside it, they are the button's own activation and must not bubble
+    // into "open the take" alongside the delete.
+    if (e.target !== row) return;
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    openTake(take.dir);
+  });
   return row;
 }
 
@@ -611,22 +763,43 @@ function buildPicker() {
   };
 
   const gDesktop = group(t("picker.desktop"));
-  item(
-    gDesktop,
-    t("picker.desktopAll"),
-    t("picker.allDisplays"),
-    // Matches in either language: the search box is not a language test.
-    (q) =>
-      "desktop".includes(q) || "桌面".includes(q) || t("picker.desktop").toLowerCase().includes(q),
-    () =>
-      addSource(
-        uniqueId("screen"),
-        { Desktop: { rect: null } },
-        t("picker.desktopAll"),
-        "ddagrab / gdigrab",
-      ),
-    { Desktop: { rect: null } },
-  );
+  // The Windows backend captures one output at a time (WGC has no
+  // virtual-desktop item), so it offers each monitor instead of one "whole
+  // desktop" that would only ever be the first screen (2026-10-21 多屏). The
+  // ffmpeg backend can span every output, so it keeps that row as well.
+  const monitors = state.monitors || [];
+  // The "whole desktop" row goes only when there are monitors to show in its
+  // place: an empty list (enumeration failed) must not leave the group blank.
+  if (state.backend !== "windows" || monitors.length === 0) {
+    item(
+      gDesktop,
+      t("picker.desktopAll"),
+      t("picker.allDisplays"),
+      // Matches in either language: the search box is not a language test.
+      (q) =>
+        "desktop".includes(q) ||
+        "桌面".includes(q) ||
+        t("picker.desktop").toLowerCase().includes(q),
+      () => addSource(uniqueId("screen"), { Desktop: { rect: null, crop: CROP() } }),
+      { Desktop: { rect: null } },
+    );
+  }
+  for (const m of monitors) {
+    const rect = { x: m.x, y: m.y, w: m.w, h: m.h };
+    item(
+      gDesktop,
+      t("label.monitor", { n: m.index }),
+      `${m.w}×${m.h}`,
+      (q) =>
+        "desktop".includes(q) ||
+        "display".includes(q) ||
+        "monitor".includes(q) ||
+        "桌面".includes(q) ||
+        "显示器".includes(q),
+      () => addSource(uniqueId("screen"), { Desktop: { rect, crop: CROP() } }),
+      { Desktop: { rect } },
+    );
+  }
 
   const gWindows = group(t("picker.windows"));
   for (const w of state.windows) {
@@ -641,12 +814,7 @@ function buildPicker() {
       meta,
       (q) => w.title.toLowerCase().includes(q),
       () =>
-        addSource(
-          uniqueId("win"),
-          { Window: { hwnd: w.hwnd, title: w.title, crop: CROP() } },
-          name,
-          t("label.windowMeta", { w: w.w, h: w.h }),
-        ),
+        addSource(uniqueId("win"), { Window: { hwnd: w.hwnd, title: w.title, crop: CROP() } }),
       { Window: { hwnd: w.hwnd } },
     );
   }
@@ -659,13 +827,7 @@ function buildPicker() {
       name,
       "DirectShow",
       (q) => d.toLowerCase().includes(q),
-      () =>
-        addSource(
-          uniqueId("cam"),
-          { Camera: { device: d, crop: CROP() } },
-          name,
-          t("label.camera"),
-        ),
+      () => addSource(uniqueId("cam"), { Camera: { device: d, crop: CROP() } }),
       { Camera: { device: d } },
     );
   }
@@ -749,6 +911,9 @@ function notify(level, text, detail = null, dir = null) {
 function resetToIdle() {
   state.recording = false;
   state.countdown = false;
+  state.finalizing = false;
+  state.error = null;
+  clearTimeout(doneTimer);
   tickLogged = false;
   // Idle means the clock shows zero, not the length of the take that just
   // ended: `tick` stops as soon as this runs, so nothing else would clear it.
@@ -781,6 +946,50 @@ function showSaved(result) {
   refreshJournal();
 }
 
+// The bar's "done" beat (DESIGN §4.5): the take's length and size read for
+// three seconds, then the bar falls back to idle on its own.
+let doneTimer = null;
+function showDone(result) {
+  resetToIdle();
+  const secs = result.duration ? clock(result.duration) : t("take.unknown");
+  const mb = (result.sources.reduce((a, s) => a + s.bytes, 0) / (1024 * 1024)).toFixed(1);
+  $("clock").textContent = result.duration ? clock(result.duration) : t("take.unknown");
+  $("hint").textContent = t("bar.done", { secs, mb });
+  clearTimeout(doneTimer);
+  doneTimer = setTimeout(() => {
+    $("clock").textContent = clock(0);
+    render();
+  }, 3000);
+}
+
+// The bar's failed state (DESIGN §4.5): diamond where the clock was, the
+// reason on one line with the whole text in the title, and the log one click
+// away. It stays until the next take — a reason is worth reading at the
+// user's pace, and the ellipsis must never be the only copy of the text.
+function showFailed(reason) {
+  resetToIdle();
+  state.error = reason;
+  paintStatus();
+}
+
+// One place that says what the bar's right-hand text and slots read as. The
+// idle/recording text is painted by render()/tick(); this owns the failed
+// overrides and the two slots that come with them.
+function paintStatus() {
+  const fail = Boolean(state.error) && !state.recording && !state.finalizing;
+  $("bar-fail-icon").hidden = !fail;
+  $("logs-btn").hidden = !fail;
+  $("clock").hidden = fail;
+  const hint = $("hint");
+  hint.classList.toggle("fail", fail);
+  if (fail) {
+    hint.textContent = state.error;
+    hint.title = state.error;
+  } else {
+    hint.title = "";
+  }
+}
+
 async function toggleRecording() {
   const btn = $("rec-btn");
 
@@ -797,6 +1006,7 @@ async function toggleRecording() {
     // Last take's report is stale the moment a new one starts; the log keeps
     // it either way.
     hideNotice();
+    state.error = null;
     const dropped = await pruneSources();
     if (dropped) {
       render();
@@ -837,6 +1047,7 @@ async function toggleRecording() {
       // with the low beep that says "this did not start" (DESIGN §4.9).
       window.beep(220, 300);
       notify("error", uiErrorText(e));
+      showFailed(uiErrorText(e));
     } finally {
       btn.disabled = false;
     }
@@ -845,24 +1056,31 @@ async function toggleRecording() {
 
   btn.disabled = true;
   try {
-    const res = await invoke("stop_recording");
-    showSaved(res);
+    await invoke("stop_recording");
+    // Completion is owned by `take:done` (it fires for every stop, this one
+    // included): the bar shows its "done" beat and falls back to idle on its
+    // own. The command's value is only here for the error path.
   } catch (e) {
     // A failed finalise is one of the codes Rust sends, so it reads in the
     // panel's language like every other failure.
     notify("error", uiErrorText(e));
-  } finally {
     // Rust takes the recording out of its state before stop() can fail, so the
-    // take is over either way — reset the UI even when the invoke rejected.
-    resetToIdle();
+    // take is over either way — fall back to the failed bar state (take:failed
+    // may not have fired: it is skipped when the panel is the command caller
+    // and the stop screen is off).
+    showFailed(uiErrorText(e));
+  } finally {
     btn.disabled = false;
   }
 }
 
 async function tick() {
   // During the countdown the take is not running yet and this window is
-  // hidden: polling would only show a clock that has not started.
-  if (!state.recording || state.countdown) return;
+  // hidden: polling would only show a clock that has not started. While the
+  // take is finalising the clock is frozen at the button press (take:finalize
+  // set it) and the bar shows the checklist count — a status poll would
+  // zero both.
+  if (!state.recording || state.countdown || state.finalizing) return;
   if (!tickLogged) {
     // Once per take: the first tick is the observable proof that the countdown
     // flag was cleared (a stuck flag freezes the clock for the whole take).
@@ -882,6 +1100,9 @@ async function tick() {
           }`,
       )
       .join(" · ");
+    // A failure the events did not announce (StatusInfo.error carries the
+    // Rust-side last_error either way) still lands on the bar.
+    if (s.error && !state.error) showFailed(s.error);
   } catch (e) {
     console.error("status", e);
   }
@@ -901,6 +1122,10 @@ pickerSearch.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closePicker();
 });
 $("rec-btn").addEventListener("click", toggleRecording);
+// The failed state's own action (DESIGN §4.5): the log is where the notice's
+// detail lines and the technical half went. In-app pane, not a folder — the
+// log rows already link to a take's folder when one is involved.
+$("logs-btn").addEventListener("click", () => selectTab("log"));
 
 const TAB_ORDER = ["sources", "history", "log", "settings"];
 
@@ -965,11 +1190,38 @@ window.__TAURI__.event.listen("hotkey:toggle", () => {
   if (!$("rec-btn").disabled) toggleRecording();
 });
 
-// A take can be stopped from the tray popover, which leaves this window with
-// neither the response nor a reason to still say "recording".
-window.__TAURI__.event.listen("take:stopped", (e) => {
-  resetToIdle();
+// The stop, told in three events (B4): the same stream feeds the full-screen
+// stop screen and this bar, so a stop reads the same whoever pressed it.
+//
+// `take:finalize` — the button was pressed; the timer freezes here.
+window.__TAURI__.event.listen("take:finalize", (e) => {
+  const p = e.payload || {};
+  state.finalizing = true;
+  state.finalized = 0;
+  state.finalizeTotal = Number(p.total) || 0;
+  state.elapsed = Number(p.elapsed) || 0;
+  $("clock").textContent = clock(state.elapsed);
+  $("hint").textContent = t("bar.writing", { n: 0, m: state.finalizeTotal });
+  $("rec-btn").disabled = true;
+  PROBE(`take:finalize total=${state.finalizeTotal}`);
+});
+
+// `take:source` — one file landed; the checklist count moves up.
+window.__TAURI__.event.listen("take:source", () => {
+  state.finalized += 1;
+  if (state.finalizing) {
+    $("hint").textContent = t("bar.writing", { n: state.finalized, m: state.finalizeTotal });
+  }
+});
+
+// `take:done` — the take is over, whoever stopped it (the hotkey and the tray
+// leave this window with no command response to read it from). No "saved"
+// banner: the fresh history row is the success feedback; only a take that
+// lost a source interrupts (showSaved), and the bar reads "done" for a beat.
+window.__TAURI__.event.listen("take:done", (e) => {
+  state.finalizing = false;
   showSaved(e.payload);
+  showDone(e.payload);
 });
 
 // The countdown-off path hides this window before the take starts, so the
@@ -997,7 +1249,9 @@ window.__TAURI__.event.listen("take:cancelled", () => {
 // and this window is back, with the reason to show.
 window.__TAURI__.event.listen("take:failed", (e) => {
   notify("error", uiErrorText(e.payload));
-  resetToIdle();
+  // The bar keeps the reason (diamond + one line + log button) after the
+  // notice fades — the notice is the interruption, the bar is the receipt.
+  showFailed(uiErrorText(e.payload));
 });
 
 // Language or palette changed — from this panel or anywhere else. The payload
@@ -1017,7 +1271,7 @@ function setParamsDisabled(off) {
   // Recording controls by name — the language/theme selects share .set-row
   // but are UI settings and stay usable while a take runs.
   for (const el of document.querySelectorAll(
-    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #raise-value, #hotkey-btn",
+    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn",
   )) {
     el.disabled = off;
   }
@@ -1065,6 +1319,14 @@ function bindParams() {
       console.error("set_countdown", e),
     );
   });
+  $("finalize-value").addEventListener("change", (e) => {
+    state.finalizePanel = e.target.checked;
+    // Same split from save_session as the countdown: the stop screen is not
+    // part of the capture session either.
+    invoke("set_finalize_panel", { on: state.finalizePanel }).catch((e) =>
+      console.error("set_finalize_panel", e),
+    );
+  });
 }
 bindParams();
 
@@ -1101,15 +1363,15 @@ function applySaved(cfg) {
   state.countdownSecs = typeof cfg.countdown_secs === "number" ? cfg.countdown_secs : 3;
   if (state.countdownSecs > 0) state.lastCountdownSecs = state.countdownSecs;
   $("countdown-value").checked = state.countdownSecs > 0;
+  // An old config has no field: the stop screen defaults to on (DESIGN §4.6).
+  state.finalizePanel = cfg.finalize_panel !== false;
+  $("finalize-value").checked = state.finalizePanel;
   for (const s of savedSources) {
-    const l = labelFor(s.capture);
     state.sources.push({
       id: s.id,
       capture: s.capture,
       fps: s.fps,
       quality: s.quality,
-      name: l.name,
-      meta: l.meta,
     });
     // Warm the engine probe for restored sources too. The picker preheats on
     // add, but a source that came back from config would otherwise leave the
@@ -1279,8 +1541,612 @@ chip.addEventListener("click", () => {
   else beginHotkeyCapture();
 });
 
+
+// ── The source editor ──────────────────────────────────────────────────────
+//
+// A row is a summary; the editor is where a source's numbers are set. Two
+// layers, because they answer different questions: the card says *which*
+// source and what it will produce, and the crop workspace gives a 4K frame
+// the room to be trimmed to the pixel.
+//
+// Nothing is written until 保存. Both layers edit `editor.draft`, and the list
+// only learns about it at the end — a dialog you can back out of is the whole
+// point of a dialog.
+
+const MIN_OUT = 16; // source pixels; below this there is nothing left to see
+const ZOOM_STEPS = [0.05, 0.1, 0.17, 0.25, 0.33, 0.5, 0.67, 1, 1.5, 2, 3, 4, 6, 8];
+const EDGES = ["top", "bottom", "left", "right"];
+// Which edges a handle drags. The data-edge values are compass points; the
+// crop stores the four insets.
+const HANDLE_EDGES = {
+  nw: ["top", "left"],
+  n: ["top"],
+  ne: ["top", "right"],
+  e: ["right"],
+  se: ["bottom", "right"],
+  s: ["bottom"],
+  sw: ["bottom", "left"],
+  w: ["left"],
+};
+
+// `editor` is null when nothing is open. Draft, size and picture all live
+// here so a second open cannot inherit the first one's numbers.
+let editor = null;
+const view = { zoom: 1, panX: 0, panY: 0, hand: false };
+let drag = null;
+let spaceDown = false;
+let limitTimer = null;
+
+function cropOf(capture) {
+  const c = capture.Desktop?.crop || capture.Window?.crop || capture.Camera?.crop;
+  if (!c) return CROP();
+  return {
+    top: Math.max(0, Math.round(c.top || 0)),
+    bottom: Math.max(0, Math.round(c.bottom || 0)),
+    left: Math.max(0, Math.round(c.left || 0)),
+    right: Math.max(0, Math.round(c.right || 0)),
+  };
+}
+
+// The capture with different edges. Identity (handle, device, title) is kept:
+// only the four insets move.
+function withCrop(capture, crop) {
+  if (capture.Desktop) return { Desktop: { rect: capture.Desktop.rect ?? null, crop } };
+  if (capture.Window) return { Window: { ...capture.Window, crop } };
+  return { Camera: { ...capture.Camera, crop } };
+}
+
+// Whether the crop can be edited at all: the size is what defines it. A
+// failed picture grab still leaves a croppable frame.
+function editorCroppable() {
+  return Boolean(editor && editor.width > 0 && editor.height > 0);
+}
+
+// Rust sends prose for OS failures and a code for the ones we describe
+// ourselves; a code has to come back in the user's language.
+function noteText(note) {
+  if (note === "preview.minimized") return t("preview.minimized");
+  return note || t("editor.noStill");
+}
+
+function outputSize(crop, width, height) {
+  return {
+    w: Math.max(0, width - crop.left - crop.right),
+    h: Math.max(0, height - crop.top - crop.bottom),
+  };
+}
+
+// One edge, in source pixels, clamped so the box never collapses and never
+// leaves the frame. `clamped` tells the caller the drag hit a wall.
+function setEdge(crop, edge, value, width, height) {
+  const opposite =
+    edge === "left" ? "right" : edge === "right" ? "left" : edge === "top" ? "bottom" : "top";
+  const span = edge === "left" || edge === "right" ? width : height;
+  const max = Math.max(0, span - crop[opposite] - MIN_OUT);
+  const wanted = Math.round(value);
+  const kept = Math.max(0, Math.min(max, wanted));
+  return { crop: { ...crop, [edge]: kept }, clamped: kept !== wanted };
+}
+
+// A whole drag, as one function: the pointer and the arrow keys both come
+// through here, so a nudge and a drag can never disagree about the limits.
+function applyDelta(base, edges, dx, dy, width, height) {
+  if (!edges) {
+    // The box itself: its width is fixed, so the room to move is exactly the
+    // two insets on the axis — sliding right spends the right one.
+    const nx = Math.max(-base.left, Math.min(base.right, dx));
+    const ny = Math.max(-base.top, Math.min(base.bottom, dy));
+    return {
+      crop: {
+        top: base.top + ny,
+        bottom: base.bottom - ny,
+        left: base.left + nx,
+        right: base.right - nx,
+      },
+      clamped: nx !== dx || ny !== dy,
+    };
+  }
+  let crop = { ...base };
+  let clamped = false;
+  for (const edge of edges) {
+    const delta = edge === "top" ? dy : edge === "bottom" ? -dy : edge === "left" ? dx : -dx;
+    const r = setEdge(crop, edge, crop[edge] + delta, width, height);
+    crop = r.crop;
+    clamped = clamped || r.clamped;
+  }
+  return { crop, clamped };
+}
+
+function flashLimit() {
+  const box = $("crop-box");
+  box.classList.add("limit");
+  clearTimeout(limitTimer);
+  limitTimer = setTimeout(() => box.classList.remove("limit"), 200);
+}
+
+// ── The card ───────────────────────────────────────────────────────────────
+
+async function openEditor(id) {
+  const source = state.sources.find((s) => s.id === id);
+  if (!source || state.recording) return;
+  editor = {
+    id,
+    name: labelFor(source.capture).name,
+    // The draft is the only copy: nothing reaches the source until 保存.
+    draft: cropOf(source.capture),
+    width: 0,
+    height: 0,
+    image: null,
+    note: null,
+    loading: true,
+  };
+  $("editor-fps").value = String(source.fps);
+  $("editor-quality").value = String(source.quality ?? DEFAULT_QUALITY);
+  $("editor").classList.remove("hidden");
+  renderEditor();
+  const shot = invoke("source_preview", { capture: source.capture }).catch((e) => ({
+    image: null,
+    width: 0,
+    height: 0,
+    note: uiErrorText(e),
+  }));
+  const still = await shot;
+  // Closed, or opened on another source, while the grab was in flight.
+  if (!editor || editor.id !== id) return;
+  editor.loading = false;
+  editor.width = still.width || 0;
+  editor.height = still.height || 0;
+  editor.image = still.image || null;
+  editor.note = still.note || null;
+  renderEditor();
+  PROBE(`editor-open ${id} still=${editor.width}x${editor.height} ok=${Boolean(editor.image)}`);
+}
+
+function renderEditor() {
+  if (!editor) return;
+  // Re-stamp the dialog's static text in the language in force *now*. The
+  // global pass runs on a language change, but a dialog that survived one (or
+  // a build that skipped a key) would otherwise show whatever it was born
+  // with — and a half-translated dialog reads as a bug, not as a setting.
+  applyI18n($("editor"));
+  applyI18n($("crop"));
+  const source = state.sources.find((s) => s.id === editor.id);
+  $("editor-title").textContent = editor.name;
+  $("editor-tile").innerHTML = source ? SOURCE_ICONS[kindOf(source.capture)] : "";
+  const out = outputSize(editor.draft, editor.width || 0, editor.height || 0);
+  const size = editor.width
+    ? t("editor.size", { w: out.w, h: out.h })
+    : t("editor.sizeUnknown");
+  $("editor-sub").textContent = editor.width
+    ? `${editor.width} × ${editor.height}`
+    : t("editor.sizeUnknown");
+  $("editor-size").textContent = editor.width ? `${out.w} × ${out.h}` : "—";
+  const img = $("editor-img");
+  img.classList.toggle("hidden", !editor.image);
+  if (editor.image) img.src = editor.image;
+  $("editor-thumb-empty").classList.toggle("hidden", Boolean(editor.image));
+  $("editor-thumb-empty").textContent = editor.loading
+    ? t("editor.loading")
+    : noteText(editor.note);
+  // Croppable when the *size* is known, picture or not: a crop is four numbers
+  // against the frame the take will record, and a grab that failed (a
+  // minimized window, a window that refuses PrintWindow) does not make those
+  // numbers unknowable. Only a source with no size at all has nothing to edit.
+  const cropable = editor.width > 0 && editor.height > 0;
+  $("editor-thumb").disabled = !cropable;
+  // The reason lives on the picture area (it wraps there); the footer keeps
+  // one short line. A sentence here is what squeezed 取消/保存 into two
+  // one-character lines on a long source name (2026-10-21).
+  $("editor-note").textContent = cropable ? size : "";
+  $("editor-thumb").title = editor.note || "";
+}
+
+function closeEditor() {
+  editor = null;
+  $("editor").classList.add("hidden");
+  $("crop").classList.add("hidden");
+  delete document.body.dataset.view;
+  // Even from crop mode — a take starting closes the editor under the
+  // workspace, and the panel would otherwise stay screen-sized for good.
+  invoke("exit_crop_mode").catch((e) => console.error("exit_crop_mode", e));
+}
+
+function saveEditor() {
+  if (!editor) return;
+  const source = state.sources.find((s) => s.id === editor.id);
+  if (!source) {
+    closeEditor();
+    return;
+  }
+  source.fps = Number($("editor-fps").value) || source.fps;
+  source.quality = Number($("editor-quality").value) || source.quality;
+  // Without a picture there is nothing to have cropped: leave the edges as
+  // they were rather than writing a draft against a size of zero.
+  if (editor.width && editor.height) {
+    let crop = { ...editor.draft };
+    for (const edge of EDGES) {
+      crop = setEdge(crop, edge, crop[edge], editor.width, editor.height).crop;
+    }
+    source.capture = withCrop(source.capture, crop);
+  }
+  const id = editor.id;
+  persist();
+  render();
+  closeEditor();
+  PROBE(`editor-saved ${id} fps=${source.fps} q=${source.quality}`);
+}
+
+// ── The crop workspace ─────────────────────────────────────────────────────
+
+function stageSize() {
+  const stage = $("crop-stage");
+  return { w: stage.clientWidth, h: stage.clientHeight };
+}
+
+function fitCropView() {
+  const { w, h } = stageSize();
+  if (!editor || !editor.width || !editor.height || !w || !h) return;
+  const z = Math.min((w - 24) / editor.width, (h - 24) / editor.height);
+  view.zoom = Math.max(ZOOM_STEPS[0], Math.min(8, z));
+  view.panX = Math.round((w - editor.width * view.zoom) / 2);
+  view.panY = Math.round((h - editor.height * view.zoom) / 2);
+}
+
+function renderCrop() {
+  if (!editor) return;
+  const stage = $("crop-stage");
+  const plane = $("crop-plane");
+  const box = $("crop-box");
+  const has = Boolean(editor.image);
+  // The reason rides on the empty stage as a hint. `pointer-events: none` in
+  // the stylesheet keeps it from swallowing the box's drags underneath.
+  $("crop-none").classList.toggle("hidden", has);
+  if (!has) $("crop-none").textContent = noteText(editor.note);
+  stage.classList.toggle("hand", view.hand);
+  $("tool-pan").setAttribute("aria-pressed", String(view.hand));
+  $("zoom-value").textContent = `${Math.round(view.zoom * 100)}%`;
+  $("crop-sub").textContent = editor.width
+    ? t("crop.source", { w: editor.width, h: editor.height })
+    : t("crop.noSource");
+  // The plane is the frame the take will record — pixels or not, the crop box
+  // sits in the same rectangle and the numbers move the same way.
+  plane.classList.toggle("hidden", !editor.width);
+  if (!editor.width) {
+    $("crop-output").textContent = "—";
+    return;
+  }
+  // The stage has its own <img>; the card's is only for the thumbnail.
+  const img = $("crop-img");
+  img.classList.toggle("hidden", !has);
+  if (has && img.getAttribute("src") !== editor.image) img.src = editor.image;
+  // Fitting in wants smoothing; zooming into the picture wants its pixels as
+  // blocks. One class, one answer.
+  plane.classList.toggle("pixelated", view.zoom >= 1);
+  plane.style.width = `${editor.width * view.zoom}px`;
+  plane.style.height = `${editor.height * view.zoom}px`;
+  plane.style.transform = `translate(${view.panX}px, ${view.panY}px)`;
+  const c = editor.draft;
+  const out = outputSize(c, editor.width, editor.height);
+  box.style.left = `${c.left * view.zoom}px`;
+  box.style.top = `${c.top * view.zoom}px`;
+  box.style.width = `${out.w * view.zoom}px`;
+  box.style.height = `${out.h * view.zoom}px`;
+  for (const edge of EDGES) {
+    const field = $(`edge-${edge}`);
+    // The field being typed into keeps every keystroke; the others follow.
+    if (document.activeElement !== field) field.value = String(Math.round(c[edge]));
+  }
+  // Re-labelled here rather than once at startup: switching language has to
+  // reach these too, and there are eight of them.
+  for (const handle of box.querySelectorAll(".crop-handle")) {
+    const id = handle.dataset.edge;
+    handle.setAttribute("aria-label", t(`crop.handle.${id}`));
+  }
+  $("crop-output").textContent = `${out.w} × ${out.h}`;
+}
+
+function zoomAt(next, cx, cy) {
+  const z = Math.max(ZOOM_STEPS[0], Math.min(8, next));
+  if (Math.abs(z - view.zoom) < 1e-6) return;
+  // Keep the pixel under the cursor under the cursor: pan is where the
+  // picture's top-left corner sits, so it scales with the zoom about `cx`.
+  view.panX = cx - (cx - view.panX) * (z / view.zoom);
+  view.panY = cy - (cy - view.panY) * (z / view.zoom);
+  view.zoom = z;
+  renderCrop();
+}
+
+function stepZoom(dir) {
+  const { w, h } = stageSize();
+  let next;
+  if (dir > 0) {
+    next = ZOOM_STEPS.find((z) => z > view.zoom + 1e-6) || ZOOM_STEPS[ZOOM_STEPS.length - 1];
+  } else {
+    const below = ZOOM_STEPS.filter((z) => z < view.zoom - 1e-6);
+    next = below.length ? below[below.length - 1] : ZOOM_STEPS[0];
+  }
+  zoomAt(next, w / 2, h / 2);
+}
+
+// Wait out a window resize: the layout is only true once the browser has
+// reflowed, and measuring the stage a frame early fits the picture to the
+// size the panel used to be.
+async function nextLayout() {
+  await new Promise((res) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener("resize", finish);
+      res();
+    };
+    window.addEventListener("resize", finish);
+    setTimeout(finish, 250);
+  });
+  // Two frames so the reflow is done — but never *only* frames: a hidden or
+  // occluded window does not paint, and `requestAnimationFrame` would not
+  // fire at all (headless runs hit the same thing).
+  await Promise.race([
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))),
+    new Promise((r) => setTimeout(r, 120)),
+  ]);
+}
+
+async function openWorkspace() {
+  if (!editorCroppable()) return;
+  $("editor").classList.add("hidden");
+  $("crop").classList.remove("hidden");
+  document.body.dataset.view = "crop";
+  // As much of the screen as the monitor can give: trimming a 4K frame to the
+  // pixel is not a job for a 900x640 control strip. The panel grows to 90% of
+  // the work area and goes back to the strip when the workspace closes.
+  await invoke("enter_crop_mode").catch((e) => console.error("enter_crop_mode", e));
+  await nextLayout();
+  fitCropView();
+  renderCrop();
+  // The stage, not the box: arrows on the stage move the whole crop, and the
+  // box's focus ring is for when the keyboard actually lands on it.
+  $("crop-stage").focus({ preventScroll: true });
+  PROBE("crop-open");
+}
+
+async function closeWorkspace() {
+  const mine = editor;
+  $("crop").classList.add("hidden");
+  delete document.body.dataset.view;
+  await invoke("exit_crop_mode").catch((e) => console.error("exit_crop_mode", e));
+  await nextLayout();
+  // The window is still shrinking while this runs, and the dialog is not
+  // guaranteed to survive it: a save, a cancel or a take starting all close
+  // it in the meantime, and bringing it back would be a dialog the user just
+  // dismissed (this is how 保存 looked like it did nothing).
+  if (editor !== mine) return;
+  $("editor").classList.remove("hidden");
+  renderEditor();
+  $("editor-thumb").focus({ preventScroll: true });
+}
+
+function cropPointerDown(e) {
+  if (!editorCroppable()) return;
+  const handle = e.target.closest(".crop-handle");
+  const box = e.target.closest(".crop-box");
+  const stage = $("crop-stage");
+  // Panning: the hand tool, the middle button, or space held down — the three
+  // habits image editors share.
+  if (e.button === 1 || view.hand || (spaceDown && e.button === 0)) {
+    e.preventDefault();
+    drag = { mode: "pan", x: e.clientX, y: e.clientY, panX: view.panX, panY: view.panY };
+    stage.classList.add("panning");
+    window.addEventListener("pointermove", cropPointerMove);
+    window.addEventListener("pointerup", cropPointerUp, { once: true });
+    return;
+  }
+  if (e.button !== 0 || (!handle && !box)) return;
+  e.preventDefault();
+  if (handle) handle.focus({ preventScroll: true });
+  else box.focus({ preventScroll: true });
+  drag = {
+    mode: handle ? handle.dataset.edge : "move",
+    edges: handle ? HANDLE_EDGES[handle.dataset.edge] : null,
+    x: e.clientX,
+    y: e.clientY,
+    base: { ...editor.draft },
+  };
+  window.addEventListener("pointermove", cropPointerMove);
+  window.addEventListener("pointerup", cropPointerUp, { once: true });
+}
+
+function cropPointerMove(e) {
+  if (!drag || !editor) return;
+  if (drag.mode === "pan") {
+    view.panX = drag.panX + (e.clientX - drag.x);
+    view.panY = drag.panY + (e.clientY - drag.y);
+    renderCrop();
+    return;
+  }
+  // Display pixels become source pixels here: the picture is a scaled
+  // rendering of the frame, and the numbers are the frame's.
+  const dx = (e.clientX - drag.x) / view.zoom;
+  const dy = (e.clientY - drag.y) / view.zoom;
+  const r = applyDelta(drag.base, drag.edges, dx, dy, editor.width, editor.height);
+  editor.draft = r.crop;
+  if (r.clamped) flashLimit();
+  renderCrop();
+}
+
+function cropPointerUp() {
+  window.removeEventListener("pointermove", cropPointerMove);
+  $("crop-stage").classList.remove("panning");
+  if (drag && drag.mode !== "pan" && editor) {
+    // Landing on whole pixels: a crop is a count of pixels, and half of one
+    // is a number the encoder cannot honour.
+    const snapped = {};
+    for (const edge of EDGES) snapped[edge] = Math.round(editor.draft[edge]);
+    editor.draft = snapped;
+    renderCrop();
+  }
+  drag = null;
+}
+
+function cropKeyDown(e) {
+  if (!editor) return;
+  const dir = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+  }[e.key];
+  if (dir) {
+    e.preventDefault();
+    const step = e.shiftKey ? 10 : 1;
+    const handle = e.target.closest?.(".crop-handle");
+    const edges = handle ? HANDLE_EDGES[handle.dataset.edge] : null;
+    const r = applyDelta(
+      editor.draft,
+      edges,
+      dir[0] * step,
+      dir[1] * step,
+      editor.width,
+      editor.height,
+    );
+    editor.draft = r.crop;
+    if (r.clamped) flashLimit();
+    renderCrop();
+    return;
+  }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    // Consumed here, or the window-level Esc (which closes the card) would
+    // act on the same keystroke: `closeWorkspace` has already taken the
+    // "workspace is up" flag down by the time the event reaches it, so one
+    // Esc would take down both layers and drop the draft.
+    e.stopPropagation();
+    // Layered: the first Esc leaves the handle, the second leaves the
+    // workspace. Esc that closed everything at once is how a careful crop
+    // gets thrown away.
+    const handle = e.target.closest?.(".crop-handle");
+    if (handle) {
+      $("crop-box").focus({ preventScroll: true });
+      return;
+    }
+    closeWorkspace();
+    return;
+  }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    e.stopPropagation();
+    closeWorkspace();
+  }
+}
+
+// ── Wiring ─────────────────────────────────────────────────────────────────
+
+function initEditor() {
+  for (const [id, options, prefix] of [
+    ["editor-fps", FPS_OPTIONS, ""],
+    ["editor-quality", QUALITY_OPTIONS, "Q"],
+  ]) {
+    const sel = $(id);
+    for (const v of options) {
+      const opt = document.createElement("option");
+      opt.value = String(v);
+      opt.textContent = `${prefix}${v}`;
+      sel.append(opt);
+    }
+  }
+  $("editor-close").addEventListener("click", closeEditor);
+  $("editor-cancel").addEventListener("click", closeEditor);
+  // Clicking the dimmed area is a cancel. Only the backdrop itself: a click
+  // that started inside the card and ended outside is not one.
+  $("editor").addEventListener("click", (e) => {
+    if (e.target === $("editor")) closeEditor();
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !editor) return;
+    // The workspace owns Esc while it is up (see cropKeyDown). Asked of the
+    // element rather than of `body.dataset.view`: a workspace that closed on
+    // this very keystroke has already cleared the flag.
+    if (!$("crop").classList.contains("hidden")) return;
+    closeEditor();
+  });
+  $("editor-save").addEventListener("click", saveEditor);
+  $("editor-thumb").addEventListener("click", openWorkspace);
+  $("crop-back").addEventListener("click", closeWorkspace);
+
+  $("zoom-in").addEventListener("click", () => stepZoom(1));
+  $("zoom-out").addEventListener("click", () => stepZoom(-1));
+  $("view-fit").addEventListener("click", () => {
+    fitCropView();
+    renderCrop();
+  });
+  $("view-one").addEventListener("click", () => {
+    const { w, h } = stageSize();
+    zoomAt(1, w / 2, h / 2);
+  });
+  $("view-reset").addEventListener("click", () => {
+    view.hand = false;
+    fitCropView();
+    renderCrop();
+  });
+  $("tool-pan").addEventListener("click", () => {
+    view.hand = !view.hand;
+    renderCrop();
+  });
+  $("crop-clear").addEventListener("click", () => {
+    if (!editorCroppable()) return;
+    editor.draft = CROP();
+    renderCrop();
+  });
+
+  // Every handle is in the tab order: dragging is one way to move an edge,
+  // and the keyboard is the other (WCAG 2.2 · Dragging Movements).
+  for (const handle of document.querySelectorAll(".crop-handle")) {
+    handle.tabIndex = 0;
+  }
+
+  const stage = $("crop-stage");
+  stage.addEventListener("pointerdown", cropPointerDown);
+  stage.addEventListener("keydown", cropKeyDown);
+  stage.addEventListener(
+    "wheel",
+    (e) => {
+      if (!editorCroppable()) return;
+      e.preventDefault();
+      const rect = stage.getBoundingClientRect();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      zoomAt(view.zoom * factor, e.clientX - rect.left, e.clientY - rect.top);
+    },
+    { passive: false },
+  );
+
+  for (const edge of EDGES) {
+    $(`edge-${edge}`).addEventListener("input", (e) => {
+      if (!editorCroppable()) return;
+      const v = Number(e.target.value);
+      if (!Number.isFinite(v)) return;
+      const r = setEdge(editor.draft, edge, v, editor.width, editor.height);
+      editor.draft = r.crop;
+      renderCrop();
+      if (r.clamped) e.target.value = String(editor.draft[edge]);
+    });
+  }
+
+  // Space is a held modifier here, the way it is in every image editor.
+  window.addEventListener("keydown", (e) => {
+    if (!editor || !document.body.dataset.view) return;
+    if (e.code === "Space" && e.target === document.body) {
+      spaceDown = true;
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space") spaceDown = false;
+  });
+}
+
 async function init() {
   PROBE("js-main-eval");
+  initEditor();
   // Parallel on purpose: the source lists do not depend on the environment
   // probe, and the picker is usable as soon as they land — gating them behind
   // the encoder probe would leave the picker empty for its first second.
@@ -1296,6 +2162,7 @@ async function init() {
     const env = await invoke("env_info");
     PROBE("ipc-env-ok:" + JSON.stringify(env));
     state.screen = env.screen;
+    state.monitors = env.monitors || [];
     // The temp directory is only a first-run default: a directory the user
     // picked themselves outranks it.
     if (!saved || !saved.out_root) {

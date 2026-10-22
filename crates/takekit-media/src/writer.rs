@@ -36,7 +36,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::core::PCWSTR;
 
 use crate::devices::ensure_media_foundation;
-use crate::error::Result;
+use crate::error::{MediaError, Result};
 use crate::frame::{AudioChunk, PixelFormat, VideoFrame};
 use crate::mediatype::{pcm_type, video_type};
 /// A frame held until the next one says how long it was on screen.
@@ -228,12 +228,20 @@ impl AudioWriter {
     pub fn create(path: &Path, sample_rate: u32, channels: u32, bitrate_kbps: u32) -> Result<Self> {
         // SAFETY: owned objects, integer stream index, as above.
         unsafe {
-            let writer = sink(path)?;
-            let output = aac_type(sample_rate, channels, bitrate_kbps)?;
-            let stream = writer.AddStream(&output)?;
-            let input = pcm_type(sample_rate, channels)?;
-            writer.SetInputMediaType(stream, &input, None)?;
-            writer.BeginWriting()?;
+            let writer = sink(path).map_err(|e| e.context("AudioWriter::sink"))?;
+            let output = aac_type(sample_rate, channels, bitrate_kbps)
+                .map_err(|e| e.context("AudioWriter::aac_type"))?;
+            let stream = writer
+                .AddStream(&output)
+                .map_err(|e| MediaError::from(e).context("AudioWriter::AddStream"))?;
+            let input =
+                pcm_type(sample_rate, channels).map_err(|e| e.context("AudioWriter::pcm_type"))?;
+            writer
+                .SetInputMediaType(stream, &input, None)
+                .map_err(|e| MediaError::from(e).context("AudioWriter::SetInputMediaType"))?;
+            writer
+                .BeginWriting()
+                .map_err(|e| MediaError::from(e).context("AudioWriter::BeginWriting"))?;
             Ok(Self {
                 writer,
                 stream,
@@ -271,7 +279,8 @@ impl AudioWriter {
         // SAFETY: the chunk is borrowed for the duration of the call, which
         // copies it into the sample's own buffer.
         unsafe {
-            write_sample(&self.writer, self.stream, &chunk.data, start, duration)?;
+            write_sample(&self.writer, self.stream, &chunk.data, start, duration)
+                .map_err(|e| e.context("AudioWriter::write"))?;
         }
         self.next = Some(start + duration);
         Ok(())
@@ -279,7 +288,8 @@ impl AudioWriter {
 
     pub fn finish(self) -> Result<()> {
         // SAFETY: as `VideoWriter::finish`.
-        unsafe { self.writer.Finalize() }.map_err(Into::into)
+        unsafe { self.writer.Finalize() }
+            .map_err(|e| MediaError::from(e).context("AudioWriter::finish"))
     }
 }
 

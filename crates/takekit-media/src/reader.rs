@@ -22,11 +22,14 @@ pub const AUDIO_STREAM: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
 /// The bit set on a sample that says the stream has ended.
 const END_OF_STREAM: u32 = MF_SOURCE_READERF_ENDOFSTREAM.0 as u32;
 
-/// A source reader for one device, with `media_type` asked of `stream`.
-pub fn open_reader(
+/// Create a source reader without choosing a media type yet.
+///
+/// A source reader shuts down the media source it was created from when it is
+/// dropped, so exactly one reader may exist per source: a throwaway reader
+/// used to peek at the native type would leave the real one reading a shut
+/// down source (`MF_E_SHUTDOWN`).
+pub fn create_reader(
     source: &windows::Win32::Media::MediaFoundation::IMFMediaSource,
-    stream: u32,
-    media_type: &IMFMediaType,
 ) -> Result<IMFSourceReader> {
     // COM has to be initialised on the thread that touches Media Foundation,
     // and a thread that already did it answers with a benign error.
@@ -34,7 +37,6 @@ pub fn open_reader(
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-
     // SAFETY: `attributes` and the reader are owned by this frame and the
     // function's return value respectively; no pointer outlives either.
     unsafe {
@@ -42,9 +44,14 @@ pub fn open_reader(
         MFCreateAttributes(&mut attributes, 0)?;
         let attributes = attributes.ok_or_else(|| MediaError::message("no attribute store"))?;
         let reader = MFCreateSourceReaderFromMediaSource(source, &attributes)?;
-        reader.SetCurrentMediaType(stream, None, media_type)?;
         Ok(reader)
     }
+}
+
+/// The type `stream` produces before any conversion is asked for.
+pub fn native_type(reader: &IMFSourceReader, stream: u32) -> Result<IMFMediaType> {
+    // SAFETY: the reader is borrowed and the returned type is reference-counted.
+    unsafe { reader.GetNativeMediaType(stream, 0).map_err(Into::into) }
 }
 
 /// The next sample and the device timestamp it carries.
@@ -52,26 +59,34 @@ pub fn open_reader(
 /// `None` means the stream ended — a camera that was unplugged, a microphone
 /// that was disabled — which is a stop, not an error: the take so far is still
 /// worth keeping.
+///
+/// A read can also come back empty without the stream having ended: the type
+/// changed, or the device had nothing new yet. Those just read again — only
+/// the end-of-stream flag means stop.
 pub fn next_sample(reader: &IMFSourceReader, stream: u32) -> Result<Option<(IMFSample, i64)>> {
-    // SAFETY: every out-parameter is a live local on this frame, and the sample
-    // comes back reference-counted.
-    unsafe {
-        let mut sample: Option<IMFSample> = None;
-        let mut flags = 0u32;
-        let mut time = 0i64;
-        reader.ReadSample(
-            stream,
-            0,
-            None,
-            Some(&mut flags),
-            Some(&mut time),
-            Some(&mut sample),
-        )?;
+    loop {
+        // SAFETY: every out-parameter is a live local on this frame, and the
+        // sample comes back reference-counted.
+        unsafe {
+            let mut sample: Option<IMFSample> = None;
+            let mut flags = 0u32;
+            let mut time = 0i64;
+            reader.ReadSample(
+                stream,
+                0,
+                None,
+                Some(&mut flags),
+                Some(&mut time),
+                Some(&mut sample),
+            )?;
 
-        if flags & END_OF_STREAM != 0 {
-            return Ok(None);
+            if flags & END_OF_STREAM != 0 {
+                return Ok(None);
+            }
+            if let Some(sample) = sample {
+                return Ok(Some((sample, time)));
+            }
         }
-        Ok(sample.map(|s| (s, time)))
     }
 }
 

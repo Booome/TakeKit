@@ -114,9 +114,9 @@ takekit record --desktop --crop 33,0,0,0
 
 **待办**（大致按优先级）：
 
-1. **音频通道补全**：系统声音（WASAPI loopback）尚未实现；麦克风与摄像头代码就绪
-   但本机无设备未验证（`docs/api-recording.md` §5）。有设备后跑
-   `takekit media --list` → `takekit media --camera <名> --mic <名>`。
+1. **音频通道已补全**（2026-10-23）：麦克风 / 系统声音（WASAPI loopback）/ 单窗口
+   声音均已实现并实测通过（`docs/api-recording.md` §8），GUI 选择器同步跟进；摄像头
+   仍缺 MF 可见设备未验证。
 2. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
    视结果决定是否做 slew 校正（设计讨论见 2026-10-20 工作日志）。
 3. 待拍板：单实例保护；提示层创建失败降级为"无提示层 + 记探针"（现在会拖垮整个

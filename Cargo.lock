@@ -3366,6 +3366,7 @@ dependencies = [
  "serde_json",
  "windows",
  "windows-capture",
+ "windows-core",
 ]
 
 [[package]]

@@ -88,7 +88,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 | 方法 & 路径 | 复用 | 请求体 | 返回 |
 |---|---|---|---|
 | `GET /state` | `status` + `config_get` + `journal_get` | — | 全量快照（§5.2） |
-| `GET /devices?kind=window\|desktop\|camera\|mic` | `list_windows` / `list_devices` | — | 可加入的候选列表 |
+| `GET /devices?kind=window\|desktop\|camera\|mic\|system-audio\|window-audio` | `list_windows` / `list_devices` / `list_mics` | — | 可加入的候选列表 |
 | `POST /sources` | `save_session` 的单源版 | 原生 `Source` JSON，或便捷 spec（`{kind, target?, monitor?, crop?, fps?, quality?}`，服务端解析 hwnd）；**带 `capture` 字段即按原生 Shape 解析**，否则按 spec | 新快照 |
 | `DELETE /sources/{index}` | 同上 | — | 新快照 |
 | `PUT /sources` | `save_session` | `Source[]` | 新快照 |

@@ -14,18 +14,18 @@ use crate::client::Client;
 pub enum Ctl {
     /// Show settings, sources, live status and history as one JSON snapshot
     State,
-    /// List windows, monitors, cameras or microphones that can be added
+    /// List windows, monitors, cameras, microphones or sound kinds that can be added
     Devices {
-        /// window | desktop | camera | mic (all four when omitted)
+        /// window | desktop | camera | mic | system-audio | window-audio (all groups when omitted)
         #[arg(long)]
         kind: Option<String>,
     },
     /// Add one source to the list
     Add {
-        /// window | desktop | camera
+        /// window | desktop | camera | mic | system-audio | window-audio
         #[arg(long, value_name = "KIND")]
         kind: String,
-        /// What to capture: a window title substring or a camera name
+        /// What to capture: a window title substring, a camera name or a mic name
         #[arg(long)]
         target: Option<String>,
         /// Monitor number for --kind desktop (from `devices`); whole desktop when omitted

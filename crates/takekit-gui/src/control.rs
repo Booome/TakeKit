@@ -452,17 +452,21 @@ fn trail_level(status: u16) -> journal::Level {
 // ── devices ─────────────────────────────────────────────────────────────────
 
 /// What can be added, as the pickers see it. `kind` narrows it (`window` /
-/// `desktop` / `camera` / `mic`); anything else returns all four groups.
+/// `desktop` / `camera` / `mic` / `system-audio` / `window-audio`); anything
+/// else returns all four groups.
 ///
 /// Each group is built only when it is asked for: the camera and microphone
 /// walk is the slow one, and an agent listing windows should not pay for it.
+/// The two sound-only kinds pick from the same lists as their picture twins
+/// (`window-audio` chooses a window; `system-audio` chooses nothing at all).
 fn devices(query: &str) -> Value {
     let kind = query_param(query, "kind").unwrap_or_default();
     match kind.as_str() {
-        "window" | "windows" => json!(window_group()),
+        "window" | "windows" | "window-audio" | "window_audio" => json!(window_group()),
         "desktop" | "monitor" | "screen" => json!(desktop_group()),
         "camera" => json!(camera_group()),
         "mic" | "microphone" => json!(mic_group()),
+        "system-audio" | "system_audio" => json!([]),
         _ => json!({
             "windows": window_group(),
             "desktops": desktop_group(),
@@ -652,10 +656,9 @@ fn bounded_quality(body: &Value) -> Result<Option<u8>, Fail> {
 
 /// Turn the convenience spec into a `Source`, or say exactly why not.
 fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
-    let kind = body
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| bad("need `kind` (window/desktop/camera) or a raw `capture`"))?;
+    let kind = body.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        bad("need `kind` (window/desktop/camera/mic/system-audio/window-audio) or a raw `capture`")
+    })?;
     let fps = bounded_fps(body)?;
     let quality = bounded_quality(body)?;
     let crop = match body.get("crop") {
@@ -664,7 +667,10 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
     };
 
     let mut source = match kind {
-        "window" => {
+        "window" | "window-audio" => {
+            // Picture or just the sound of that window's process tree: the
+            // same title match and the same ambiguity refusal, only the
+            // capture differs — so one arm keeps both honest.
             let target = body
                 .get("target")
                 .and_then(Value::as_str)
@@ -678,13 +684,21 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
                 ))),
                 1 => {
                     let w = &matches[0];
-                    Ok(Source::new(
-                        unique_id(existing, "win"),
+                    let capture = if kind == "window" {
                         Capture::Window {
                             hwnd: w.hwnd,
                             title: w.title.clone(),
                             crop,
-                        },
+                        }
+                    } else {
+                        Capture::WindowAudio {
+                            hwnd: w.hwnd,
+                            title: w.title.clone(),
+                        }
+                    };
+                    Ok(Source::new(
+                        unique_id(existing, if kind == "window" { "win" } else { "win-audio" }),
+                        capture,
                         fps,
                     ))
                 }
@@ -765,8 +779,52 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
                 )),
             }
         }
+        "mic" | "microphone" => {
+            let target = body
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("a mic source needs `target` (a name substring)"))?;
+            let list = takekit_media::devices::list();
+            let hits: Vec<_> = list
+                .mics
+                .iter()
+                .filter(|m| m.name.contains(target) || m.endpoint.contains(target))
+                .collect();
+            match hits.len() {
+                1 => Ok(Source::new(
+                    unique_id(existing, "mic"),
+                    Capture::Mic {
+                        device: hits[0].name.clone(),
+                    },
+                    fps,
+                )),
+                0 => Err(not_found(format!(
+                    "no microphone name or endpoint contains {target:?}"
+                ))),
+                n => Err(fail(
+                    409,
+                    "ambiguous",
+                    format!(
+                        "{n} microphones match {target:?}: {}",
+                        hits.iter()
+                            .map(|m| m.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )),
+            }
+        }
+        "system-audio" => {
+            // No target and no device pick: the default render endpoint is
+            // the one thing a WASAPI loopback can mean.
+            Ok(Source::new(
+                unique_id(existing, "sys-audio"),
+                Capture::SystemAudio {},
+                fps,
+            ))
+        }
         other => Err(bad(format!(
-            "unknown kind {other:?}; window, desktop and camera are the three"
+            "unknown kind {other:?}; window, desktop, camera, mic, system-audio and window-audio are the six"
         ))),
     }?;
     // The per-source quality override, only when asked for: `None` means the

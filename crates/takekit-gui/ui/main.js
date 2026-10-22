@@ -3,7 +3,9 @@
 // No bundler and no npm: Tauri injects window.__TAURI__.core, so invoke() is
 // available directly. Source specs mirror the serde shape of
 // takekit_core::source::{Source, Capture, Crop} — an externally tagged enum,
-// so `{"Window": {...}}`, `{"Camera": {...}}`, `{"Desktop": {"rect": null}}`.
+// so `{"Window": {...}}`, `{"Camera": {...}}`, `{"Desktop": {"rect": null}}`,
+// and for sound `{"Mic": {"device": "..."}}`, `{"SystemAudio": {}}`,
+// `{"WindowAudio": {"hwnd": 123, "title": "..."}}`.
 //
 // `invoke`, `PROBE`, `$` and `clock` come from shared.js, which loads first.
 
@@ -11,6 +13,9 @@ const state = {
   sources: [],
   windows: [],
   devices: [],
+  // Microphones for the picker's sound groups (`list_mics`), kept apart from
+  // `devices` which is the camera list the ffmpeg probe returns.
+  mics: [],
   outRoot: "takes",
   encoder: null,
   // "windows" captures in-process through WGC/Media Foundation and keeps
@@ -103,11 +108,18 @@ function truncate(text, n) {
   return text.length > n ? text.slice(0, n - 1) + "…" : text;
 }
 
+// Whether this capture records sound rather than picture. Mirrors
+// `Capture::is_audio` in the core — the one place that decides, because the
+// row, the editor and the picker all branch on it.
+function isAudio(capture) {
+  return Boolean(capture.Mic || capture.SystemAudio || capture.WindowAudio);
+}
+
 // A remembered source carries no display text — only what the core needs — so
 // the row labels are derived back from the capture spec.
 // The size of the picture a take of this source records — the same pixels the
 // crop's numbers are counted in. `null` when it cannot be known yet: a camera
-// only reports one once it has delivered a frame.
+// only reports one once it has delivered a frame, and sound has none at all.
 function frameSize(capture) {
   if (capture.Desktop) {
     // A remembered per-monitor desktop source records that monitor, not the
@@ -170,16 +182,30 @@ function labelFor(capture) {
   if (capture.Window) {
     return { name: capture.Window.title, geo, note: bg };
   }
+  if (capture.Mic) {
+    return { name: capture.Mic.device, geo, note: "WASAPI" };
+  }
+  if (capture.SystemAudio) {
+    return { name: t("label.systemAudio"), geo, note: "WASAPI" };
+  }
+  if (capture.WindowAudio) {
+    return { name: capture.WindowAudio.title, geo, note: t("label.windowSound") };
+  }
   return { name: capture.Camera.device, geo, note: "Media Foundation" };
 }
 
 // What makes two sources the same source: the handle, the device, or the
-// desktop. Not the label — two windows can share a title.
+// desktop. Not the label — two windows can share a title. A window's picture
+// and its sound are different sources and get different keys, so both can sit
+// in the list at once.
 function captureKey(capture) {
   if (capture.Desktop) {
     return capture.Desktop.rect ? `d:${JSON.stringify(capture.Desktop.rect)}` : "d:all";
   }
   if (capture.Window) return `w:${capture.Window.hwnd}`;
+  if (capture.Mic) return `m:${capture.Mic.device}`;
+  if (capture.SystemAudio) return "sys";
+  if (capture.WindowAudio) return `wa:${capture.WindowAudio.hwnd}`;
   return `c:${capture.Camera.device}`;
 }
 
@@ -297,10 +323,16 @@ async function dropUnusable(sources) {
 // geometry (source size, and the size it is cropped to) has the line below the
 // name to itself — see `geometryOf`.
 function summaryOf(source) {
-  return `${source.fps}fps · Q${source.quality}`;
+  // `quality: null` means the session-wide default (that is what an
+  // agent-added source carries) — say the number that will actually be used.
+  const q = source.quality ?? DEFAULT_QUALITY;
+  // Sound has no fps to speak of; quality is all there is (it picks the AAC
+  // bitrate), so the column says that and nothing more.
+  if (isAudio(source.capture)) return `AAC · Q${q}`;
+  return `${source.fps}fps · Q${q}`;
 }
 
-// Source-row tile icons (outline, 1.4 stroke — one family, three kinds).
+// Source-row tile icons (outline, 1.4 stroke — one family, six kinds).
 // Decorative: the row-name beside the tile already says what it is.
 const SOURCE_ICONS = {
   desktop:
@@ -309,12 +341,23 @@ const SOURCE_ICONS = {
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="11" rx="1.4"/><path d="M1.5 5.5h13"/><circle cx="4" cy="4" r="0.6" fill="currentColor" stroke="none"/></svg>',
   camera:
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="4" width="9.5" height="8" rx="1.6"/><path d="M11 7.2 14.2 5.4v5.2L11 8.8z" stroke-linejoin="round"/></svg>',
+  mic:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="6" y="1.5" width="4" height="7" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5" stroke-linecap="round"/></svg>',
+  sysaudio:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 6h2.2L7.5 3.2v9.6L4.2 10H2z" stroke-linejoin="round"/><path d="M10 6.2a2.4 2.4 0 0 1 0 3.6M12 4.5a5 5 0 0 1 0 7" stroke-linecap="round"/></svg>',
+  winaudio:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2.5" width="13" height="11" rx="1.4"/><path d="M1.5 5.5h13"/><path d="M5.5 11h1.2L8.2 9.4v3.2L6.7 11H5.5z" stroke-linejoin="round"/><path d="M9.8 10.2a1.3 1.3 0 0 1 0 1.6" stroke-linecap="round"/></svg>',
 };
 
-// Which of the three kinds this capture is — the one place that decides it,
+// Which of the six kinds this capture is — the one place that decides it,
 // because the row tile and the editor's header tile must agree.
 function kindOf(capture) {
-  return capture.Desktop ? "desktop" : capture.Window ? "window" : "camera";
+  if (capture.Desktop) return "desktop";
+  if (capture.Window) return "window";
+  if (capture.Mic) return "mic";
+  if (capture.SystemAudio) return "sysaudio";
+  if (capture.WindowAudio) return "winaudio";
+  return "camera";
 }
 
 function sourceTile(capture) {
@@ -724,7 +767,7 @@ function selectTab(name) {
 }
 
 async function refreshSources() {
-  const [windows, devices] = await Promise.all([
+  const [windows, devices, mics] = await Promise.all([
     invoke("list_windows", { filter: "" }).catch((e) => {
       console.error("list_windows", e);
       return [];
@@ -733,11 +776,16 @@ async function refreshSources() {
       console.error("list_devices", e);
       return [];
     }),
+    invoke("list_mics").catch((e) => {
+      console.error("list_mics", e);
+      return [];
+    }),
   ]);
   state.windows = windows;
   state.devices = devices;
+  state.mics = mics;
   state.sourcesLoaded = true;
-  PROBE(`ipc-sources:${windows.length}w/${devices.length}d`);
+  PROBE(`ipc-sources:${windows.length}w/${devices.length}d/${mics.length}m`);
   buildPicker();
   // A row's size comes from these lists (a window's live w×h), and the first
   // paint runs before they land — redraw so the size column fills in instead
@@ -854,6 +902,56 @@ function buildPicker() {
       (q) => d.toLowerCase().includes(q),
       () => addSource(uniqueId("cam"), { Camera: { device: d, crop: CROP() } }),
       { Camera: { device: d } },
+    );
+  }
+
+  // Sound sources. A mic is picked by name; the system is one row; a window's
+  // sound is picked from the same window list as its picture — separate rows,
+  // because a take can want one without the other.
+  const gMics = group(t("picker.mics"));
+  for (const m of state.mics) {
+    const name = truncate(m.name, 48);
+    item(
+      gMics,
+      name,
+      t("picker.micMeta"),
+      (q) =>
+        m.name.toLowerCase().includes(q) ||
+        "mic".includes(q) ||
+        "microphone".includes(q) ||
+        "麦克风".includes(q),
+      () => addSource(uniqueId("mic"), { Mic: { device: m.name } }),
+      { Mic: { device: m.name } },
+    );
+  }
+
+  const gSound = group(t("picker.sound"));
+  item(
+    gSound,
+    t("picker.systemAudio"),
+    t("picker.systemAudioMeta"),
+    (q) =>
+      "system audio".includes(q) ||
+      "audio".includes(q) ||
+      "sound".includes(q) ||
+      "系统声音".includes(q) ||
+      "声音".includes(q) ||
+      t("picker.systemAudio").toLowerCase().includes(q),
+    () => addSource(uniqueId("sys-audio"), { SystemAudio: {} }),
+    { SystemAudio: {} },
+  );
+  for (const w of state.windows) {
+    const name = truncate(w.title, 48);
+    item(
+      gSound,
+      name,
+      t("picker.windowSound"),
+      (q) => w.title.toLowerCase().includes(q) || "window audio".includes(q) || "窗口声音".includes(q),
+      () =>
+        addSource(uniqueId("win-audio"), {
+          WindowAudio: { hwnd: w.hwnd, title: w.title },
+        }),
+      { WindowAudio: { hwnd: w.hwnd } },
     );
   }
 
@@ -1636,7 +1734,7 @@ let limitTimer = null;
 
 function cropOf(capture) {
   const c = capture.Desktop?.crop || capture.Window?.crop || capture.Camera?.crop;
-  if (!c) return CROP();
+  if (!c || isAudio(capture)) return CROP();
   return {
     top: Math.max(0, Math.round(c.top || 0)),
     bottom: Math.max(0, Math.round(c.bottom || 0)),
@@ -1646,8 +1744,10 @@ function cropOf(capture) {
 }
 
 // The capture with different edges. Identity (handle, device, title) is kept:
-// only the four insets move.
+// only the four insets move. Sound has no edges and comes back unchanged,
+// mirroring `Capture::with_crop` in the core.
 function withCrop(capture, crop) {
+  if (isAudio(capture)) return capture;
   if (capture.Desktop) return { Desktop: { rect: capture.Desktop.rect ?? null, crop } };
   if (capture.Window) return { Window: { ...capture.Window, crop } };
   return { Camera: { ...capture.Camera, crop } };
@@ -1663,6 +1763,8 @@ function editorCroppable() {
 // ourselves; a code has to come back in the user's language.
 function noteText(note) {
   if (note === "preview.minimized") return t("preview.minimized");
+  if (note === "preview.camera") return t("preview.camera");
+  if (note === "preview.audio") return t("preview.audio");
   return note || t("editor.noStill");
 }
 
@@ -1739,6 +1841,11 @@ async function openEditor(id) {
   };
   $("editor-fps").value = String(source.fps);
   $("editor-quality").value = String(source.quality ?? DEFAULT_QUALITY);
+  // Sound has no frame rate and no edges to trim: the fps half of the pair
+  // and the whole crop section would only offer controls that do nothing.
+  const audio = isAudio(source.capture);
+  $("editor-fps").closest(".edit-field").classList.toggle("hidden", audio);
+  $("editor-thumb").closest(".edit-section").classList.toggle("hidden", audio);
   $("editor").classList.remove("hidden");
   renderEditor();
   const shot = invoke("source_preview", { capture: source.capture }).catch((e) => ({

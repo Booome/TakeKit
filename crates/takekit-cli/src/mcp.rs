@@ -248,10 +248,12 @@ fn tool_list() -> Vec<Value> {
         }),
         json!({
             "name": "takekit_list_devices",
-            "description": "List what can be recorded: windows (hwnd + title), monitors, \
-                            cameras, microphones.",
+            "description": "List what can be recorded: windows (hwnd + title), desktops, \
+                            cameras, microphones. `system-audio` records everything the \
+                            speakers play and needs no device; `window-audio` picks from \
+                            the windows list.",
             "inputSchema": object(
-                json!({ "kind": prop("window | desktop | camera | mic; all four when omitted", "string") }),
+                json!({ "kind": prop("window | desktop | camera | mic | window-audio | system-audio; the four groups when omitted", "string") }),
                 &[],
             ),
         }),
@@ -259,13 +261,14 @@ fn tool_list() -> Vec<Value> {
             "name": "takekit_add_source",
             "description": "Add one source. Windows and cameras are matched by a name/title \
                             substring; a unique hit is added, several hits are listed back. \
+                            mics match a device name; system-audio needs no target. \
                             The panel shows the source the moment it is added.",
             "inputSchema": object(
                 json!({
-                    "kind": prop("window | desktop | camera", "string"),
-                    "target": prop("window title substring or camera name substring", "string"),
+                    "kind": prop("window | desktop | camera | mic | system-audio | window-audio", "string"),
+                    "target": prop("window title, camera name or mic name substring (unused for system-audio)", "string"),
                     "monitor": prop("monitor number for kind=desktop (see list_devices)", "number"),
-                    "crop": prop("edges to trim: {top,bottom,left,right} in pixels", "object"),
+                    "crop": prop("edges to trim: {top,bottom,left,right} in pixels (pictures only)", "object"),
                     "fps": prop("frames per second, default 30", "number"),
                     "quality": prop("per-source quality override", "number"),
                 }),

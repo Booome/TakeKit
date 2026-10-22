@@ -18,6 +18,12 @@ impl MediaError {
     pub fn message(text: impl Into<String>) -> Self {
         Self::Message(text.into())
     }
+
+    /// Prefix the error with where it happened, so a bare HRESULT can be
+    /// traced back to the call that produced it.
+    pub fn context(self, where_: &str) -> Self {
+        Self::Message(format!("{where_}: {self}"))
+    }
 }
 
 impl fmt::Display for MediaError {

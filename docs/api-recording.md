@@ -5,6 +5,9 @@
 >
 > **2026-10-20 更新：已接进 core 与 GUI**（见第 7 节）。窗口源与后台录制已实测
 > 成立；摄像头 / 麦克风链路仍待设备验证。
+>
+> **2026-10-23 更新：麦克风已实测通过；新增系统声音与窗口声音捕获**
+> （WASAPI loopback，见第 8 节）。摄像头仍无 MF 可见设备。
 
 ---
 
@@ -36,13 +39,15 @@ crates/takekit-media/
 ├─ screen.rs     WGC 抓屏 / 抓窗口，逐帧带时间戳
 ├─ camera.rs     Media Foundation 读摄像头，要 NV12
 ├─ mic.rs        Media Foundation 读麦克风，要 PCM 16 位
+├─ loopback.rs   WASAPI loopback：系统声音 / 单窗口声音（进程树）
 ├─ mediatype.rs  媒体类型的构建与拆解（尺寸/帧率打包成 u64）
 ├─ reader.rs     Source Reader 的读循环
 ├─ writer.rs     Sink Writer：H.264+AAC 写 MP4
 └─ frame.rs      帧与音频块的公共类型
 ```
 
-CLI：`takekit media --list`、`takekit media --screen 1 --camera <名> --mic <名> --duration 5`。
+CLI：`takekit media --list`、`takekit media --screen 1 --camera <名> --mic <名>
+--system-audio --window-audio <hwnd> --duration 5`。
 
 ### 三条链路各自的取数方式
 
@@ -103,8 +108,9 @@ takekit media --screen 1 --duration 6 --fps 30
 | 项 | 状态 |
 |---|---|
 | **摄像头链路** | 代码写完，**本机没验证**：Media Foundation 枚举到 0 个摄像头（DirectShow 能看到的都是虚拟摄像头，MF 看不见） |
-| **麦克风链路** | 同上。WASAPI 复核：采集端点共 5 个，但 **`DEVICE_STATE_ACTIVE` 的是 0 个** —— 当前没有可用的麦克风 |
+| **麦克风链路** | ✅ 已实测（2026-10-23，Focusrite USB 声卡）：AAC 48kHz 立体声，多源同录稳定。两个实测坑见第 8 节 |
 | **窗口源** | `ScreenTarget::Window` 已接上，未实测 |
+| 系统声音 / 窗口声音 | ✅ 已实测（2026-10-23，`loopback.rs`）：见第 8 节 |
 | 接进 GUI | 未做。目前只有 CLI |
 | 与 `Capture`/`Source` 配置模型对齐 | 未做：媒体层用自己的 `ScreenTarget` / 符号链接 / 端点 ID，还没映回 core 的 `Capture` |
 | 编码器选择 | 由 MF 自己挑（软件 H.264）。没有走 core 的 NVENC/QSV/AMF 探测 |
@@ -121,16 +127,15 @@ takekit media --screen 1 --duration 6 --fps 30
 
 ## 6. 下一步（按价值排序）
 
-1. **验证摄像头与麦克风**（有设备就能跑，代码已就绪）。
-2. **系统声音（WASAPI loopback）未实现**——音频通道需求的另一半，现在的 `mic.rs`
-   只走 Media Foundation 采集端点。
+1. **验证摄像头**（有 MF 能看见的设备就能跑，代码已就绪）。
+2. ~~系统声音（WASAPI loopback）未实现~~ → ✅ 已做并实测（2026-10-23，见第 8 节）。
 3. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
    视结果决定是否做 slew 校正（音频为主时钟是候选方案）。
 4. ~~把"按帧率补齐"从 CLI 搬进 `takekit-media`~~ → 已由 core 的 `write_frames`
    承担（第 7 节）。
 5. ~~接进 GUI~~ → 已做（第 7 节）。
 6. 决定要不要保留 ffmpeg 后端做回退（WGC 在某些环境会拿不到帧）。
-7. GUI 音频源（麦克风）；~~多显示器映射~~ → 已做（2026-10-21，逐屏 picker + rect→Monitor 映射）。
+7. GUI 音频源（麦克风 + 系统声音/窗口声音）；~~多显示器映射~~ → 已做（2026-10-21，逐屏 picker + rect→Monitor 映射）。
 
 ---
 
@@ -240,3 +245,81 @@ MP4 sink 会把轨道重定基到首样本，所以共享原点以**前导填充
 | 光标 | ~~仍不录（`CursorCaptureSettings::Default`）~~ → ✅ 已对齐（2026-10-21，`WithCursor`，见 §5） |
 | 摄像头 / 麦克风 | 代码就绪，本机无设备未验证 |
 | 编码器 | MF 自选（软件 H.264），quality 映射为分档 bitrate（`bitrate_for`） |
+
+---
+
+## 8. 2026-10-23：麦克风实测 + 系统声音 / 窗口声音（WASAPI loopback）
+
+### 实测结果
+
+| 实验 | 结果 |
+|---|---|
+| 麦克风（Focusrite USB） | `mic: 123 frames delivered`，AAC 48kHz 立体声 5.14s ✓ |
+| 系统声音 `--system-audio` | sine 440Hz 对照：370 帧 / 3.73s，mean −24.7 dB（非静音）✓ |
+| 窗口声音 `--window-audio <hwnd>` | sine 880Hz 对照：498 帧 / 5.01s，mean −5.2 dB ✓ |
+| 窗口声音隔离性 | 放着 sine、录无声窗口 → −91 dB 纯静音；只收目标进程树 ✓ |
+| 多源同录 `--mic --system-audio` | mic 98 帧 + loopback 402 帧，AAC 各 ~4.1s ✓ |
+
+### Media Foundation 三个实测坑（麦克风/摄像头通用）
+
+1. **source reader 析构会 shutdown 它的 media source**：用临时 reader 偷看
+   native media type 会让后续 reader 报 `MF_E_SHUTDOWN`。解法：**一个 source 只建
+   一个 reader**（`reader::create_reader`），native type 从 reader 上取。
+2. **`ReadSample` 返回空 sample ≠ EOS**：类型变更 / 流 tick 都会交空 sample，
+   必须循环重读，只有 EOS flag 才算完（`reader::next_sample`）。否则
+   `MF_E_SINK_NO_SAMPLES_PROCESSED`——pump 零帧的假死。
+3. **`--window-audio` 的崩溃（heap corruption `0xC0000374`）**：windows-rs 的
+   `PROPVARIANT` 带 `Drop`（析构 `PropVariantClear` → `CoTaskMemFree`），blob 数据
+   若指向栈上结构，函数返回即对栈地址 free → 进程 fail-fast 无输出。blob 必须
+   `CoTaskMemAlloc` 分配。
+
+### 进程回环（per-process loopback）要点
+
+- 全局回环：`IMMDevice::Activate` + `AUDCLNT_STREAMFLAGS_LOOPBACK`，收全喇叭混音。
+- 单窗口回环：`ActivateAudioInterfaceAsync` + `PROPVARIANT` blob 装
+  `AUDIOCLIENT_ACTIVATION_PARAMS`（`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`）。
+  两个必知点：
+  - 设备 ID 必须用**虚拟设备** `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`
+    （`"VAD\Process_Loopback"`），传默认输出设备 ID 会报
+    `0x80070002 ERROR_FILE_NOT_FOUND`。
+  - 窗口 handle 先 `GetWindowThreadProcessId` 转成 PID，过滤以**进程树**为单位
+    （窗口所属进程 + 其子进程），这也是"一个窗口"在用户心智里的真实范围。
+- 两路都开 `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` 统一到 PCM16 48kHz 立体声，
+  编码器不用猜格式。
+
+---
+
+## 9. 2026-10-23：GUI 与 MCP 接入音频源（实测 23/23）
+
+### 接入面
+
+- **core**：`Capture` 新增 `Mic{device}` / `SystemAudio{}` / `WindowAudio{hwnd,title}`；
+  音频源两个后端都走进程内采集（ffmpeg 无 WASAPI loopback），产物强制 `.mp4`
+  （MF sink writer 按扩展名选容器、不认 Matroska）。
+- **控制面** `resolve_spec`：`kind=mic|system-audio|window-audio`（window-audio 用
+  `target` 标题子串解析窗口，歧义拒绝策略与视频窗口一致）。
+- **MCP**：`takekit_add_source` kind 扩到六种；`takekit_list_devices` 同步。
+- **GUI**：picker 新增「麦克风」「声音」两组（声音组 = 系统声音 + 各窗口声音行）；
+  `list_mics` 命令供麦克风列表；音频行图标/摘要（`AAC · Qn`）/编辑器隐藏帧率与裁剪。
+
+### E2E（`_scratch/e2e-audio.mjs`，23/23）
+
+| 环节 | 结果 |
+|---|---|
+| MCP initialize / tools/list | 13 tools，kind 描述含音频 ✓ |
+| list_devices kind=mic | Focusrite USB Audio ✓ |
+| add_source ×3 音频 + 重复添加 | 全部成功（重复自动编号 sys-audio-2）✓ |
+| start→7s sine→stop（windows 后端） | 4 文件：mic / sys-audio / sys-audio-2 / win-audio ✓ |
+| volumedetect | mic −8.7dB，sys-audio −6.6dB，win-audio −24.2dB（均非静音）✓ |
+| GUI 行渲染（CDP 截图） | 图标/标签/AAC·Q20 摘要正确 ✓ |
+| picker（CDP） | 5 组 15 项，含「麦克风」「声音」组 ✓ |
+
+### 实测踩坑（测试工具侧）
+
+1. **ffmpeg volumedetect 的统计行在 stderr**——`execFileSync` 只回 stdout 时解析为空，
+   要用 `spawnSync` 合并两路。
+2. **WebView2 CDP 端口 9222 被本机占用**（`/json/list` 返回 404 空 body，curl/node
+   fetch 皆然）→ 换 9233 即好。target 匹配用 `tauri.localhost`（Tauri 的页面 URL），
+   不是 `index.html`。
+3. **MCP 添加的源 `quality: null`**（会话级默认）→ GUI 摘要曾显示 `Qnull`；
+   已回落 `DEFAULT_QUALITY` 显示实际生效值。

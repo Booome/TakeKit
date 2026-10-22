@@ -78,6 +78,14 @@ pub enum Capture {
     },
     /// A DirectShow video device, e.g. a phone acting as a webcam.
     Camera { device: String, crop: Crop },
+    /// A microphone, named as the pickers list it (or its endpoint id).
+    Mic { device: String },
+    /// Everything the speakers play. WASAPI loopback, so this reaches the
+    /// take on either backend — ffmpeg has no way to say it.
+    SystemAudio {},
+    /// The sound of one window's process tree, e.g. a game with its own music
+    /// while a tutorial plays in the browser. Same loopback route, filtered.
+    WindowAudio { hwnd: isize, title: String },
 }
 
 impl Capture {
@@ -94,18 +102,21 @@ impl Capture {
     }
 
     /// The four edges this capture wants trimmed off, in the pixels of the
-    /// picture it captures.
+    /// picture it captures. Audio has no picture, hence no edges.
     pub fn crop(&self) -> Crop {
         match self {
             Capture::Desktop { crop, .. }
             | Capture::Window { crop, .. }
             | Capture::Camera { crop, .. } => *crop,
+            Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. } => {
+                Crop::default()
+            }
         }
     }
 
     /// The same capture, cropping a different rectangle. Used by the editor:
     /// a source keeps its identity (handle, device, title) and only its edges
-    /// move.
+    /// move. An audio source has no edges to move and comes back unchanged.
     pub fn with_crop(&self, edges: Crop) -> Self {
         match self {
             Capture::Desktop { rect, .. } => Capture::Desktop {
@@ -121,7 +132,27 @@ impl Capture {
                 device: device.clone(),
                 crop: edges,
             },
+            Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. } => {
+                self.clone()
+            }
         }
+    }
+
+    /// Whether this source records sound rather than picture.
+    pub fn is_audio(&self) -> bool {
+        matches!(
+            self,
+            Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. }
+        )
+    }
+
+    /// The extension this source's file is written with. Video follows the
+    /// take's container (`.mkv` through ffmpeg, `.mp4` in-process); audio is
+    /// always `.mp4` because Media Foundation's sink writer — the only route
+    /// that can do loopback — names its container after the extension and does
+    /// not know Matroska at all.
+    pub fn output_ext(&self, take_ext: &'static str) -> &'static str {
+        if self.is_audio() { "mp4" } else { take_ext }
     }
 }
 
@@ -177,7 +208,10 @@ impl Source {
             Capture::Window { hwnd, title, crop } => resolve_window(*hwnd, title)
                 .ok()
                 .map(|w| crop.cropped(w.rect)),
-            Capture::Camera { .. } => None,
+            Capture::Camera { .. }
+            | Capture::Mic { .. }
+            | Capture::SystemAudio {}
+            | Capture::WindowAudio { .. } => None,
         }
     }
 
@@ -231,6 +265,13 @@ impl Source {
                 args.insert(0, "-use_wallclock_as_timestamps".into());
                 args.insert(1, "1".into());
                 Ok((args, Some(filter_chain(filters))))
+            }
+            // Audio never travels through ffmpeg — not even here. Loopback
+            // (system sound, one window's sound) has no ffmpeg input on Windows
+            // at all, and one in-process route for every kind of sound beats
+            // two that disagree. `session` routes these to the capture APIs.
+            Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. } => {
+                Err("an audio source is recorded in-process, not through ffmpeg".into())
             }
         }
     }
@@ -434,7 +475,15 @@ pub fn preview(capture: &Capture) -> Preview {
             width: 0,
             height: 0,
             frame: None,
-            reason: Some("a camera has no still preview".into()),
+            reason: Some("preview.camera".into()),
+        },
+        // Sound has no picture to draw a crop on; the editor treats the source
+        // as uncroppable exactly as it does a camera.
+        Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. } => Preview {
+            width: 0,
+            height: 0,
+            frame: None,
+            reason: Some("preview.audio".into()),
         },
     }
 }
@@ -799,7 +848,17 @@ pub fn resolve_window(hwnd: isize, title: &str) -> Result<WindowItem, String> {
 pub fn is_recordable(capture: &Capture) -> bool {
     match capture {
         Capture::Window { hwnd, .. } => live_window(HWND(*hwnd as *mut core::ffi::c_void)),
-        Capture::Desktop { .. } | Capture::Camera { .. } => true,
+        // Sound keeps playing from a window that is covered, minimized or on
+        // another virtual desktop — unlike the picture, which stops. Only a
+        // window that is gone takes its process's audio with it.
+        Capture::WindowAudio { hwnd, .. } => {
+            // SAFETY: one handle query on a stale handle; answers `false`.
+            unsafe { IsWindow(Some(HWND(*hwnd as *mut core::ffi::c_void))).as_bool() }
+        }
+        Capture::Desktop { .. }
+        | Capture::Camera { .. }
+        | Capture::Mic { .. }
+        | Capture::SystemAudio {} => true,
     }
 }
 

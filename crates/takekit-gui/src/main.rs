@@ -194,6 +194,31 @@ async fn list_devices() -> Vec<String> {
     .expect("list_devices task panicked")
 }
 
+#[derive(Serialize)]
+struct MicItem {
+    name: String,
+    endpoint: String,
+}
+
+/// Microphones for the picker's sound groups. Named like the capture side
+/// matches them (`Mic { device }` hits name or endpoint), so a picked row can
+/// go straight into a source.
+#[tauri::command]
+async fn list_mics() -> Vec<MicItem> {
+    tauri::async_runtime::spawn_blocking(|| {
+        takekit_media::devices::microphones()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| MicItem {
+                name: m.name,
+                endpoint: m.endpoint,
+            })
+            .collect()
+    })
+    .await
+    .expect("list_mics task panicked")
+}
+
 /// Which of these captures are still worth recording. A window source whose
 /// window has closed, been hidden, or gone to another virtual desktop (or had
 /// its app suspended) gets dropped by the panel instead of being offered: a
@@ -985,6 +1010,7 @@ fn main() {
             ui_ping,
             list_windows,
             list_devices,
+            list_mics,
             check_sources,
             source_preview,
             enter_crop_mode,

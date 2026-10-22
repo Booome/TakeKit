@@ -70,10 +70,16 @@ const I18N = {
 
     "notice.close": "关闭",
 
-    "picker.search": "搜索窗口或摄像头…",
+    "picker.search": "搜索窗口、摄像头或声音…",
     "picker.desktop": "桌面",
     "picker.windows": "窗口",
     "picker.cameras": "摄像头",
+    "picker.mics": "麦克风",
+    "picker.sound": "声音",
+    "picker.systemAudio": "系统声音",
+    "picker.systemAudioMeta": "扬声器播放的一切",
+    "picker.micMeta": "麦克风",
+    "picker.windowSound": "这个窗口的声音",
     "picker.desktopAll": "整个桌面",
     "picker.allDisplays": "全部显示器",
     "picker.none": "没有匹配项",
@@ -83,6 +89,8 @@ const I18N = {
 
     "label.desktop": "整个桌面",
     "label.monitor": "显示器 {n}",
+    "label.systemAudio": "系统声音",
+    "label.windowSound": "窗口声音",
 
     "row.fpsLabel": "帧率",
     "row.qualityLabel": "画质",
@@ -100,6 +108,8 @@ const I18N = {
     "editor.loading": "正在抓取画面…",
     "editor.noStill": "这个源暂时抓不到静帧",
     "preview.minimized": "窗口已最小化，不抓静帧；裁剪按录制时恢复后的尺寸",
+    "preview.camera": "摄像头没有静帧画面",
+    "preview.audio": "声音源没有画面，只有声音",
 
     "crop.title": "裁剪",
     "crop.oneToOne": "1 px = 源 1 px",
@@ -248,10 +258,16 @@ const I18N = {
 
     "notice.close": "Dismiss",
 
-    "picker.search": "Search windows or cameras…",
+    "picker.search": "Search windows, cameras or sound…",
     "picker.desktop": "Desktop",
     "picker.windows": "Windows",
     "picker.cameras": "Cameras",
+    "picker.mics": "Microphones",
+    "picker.sound": "Sound",
+    "picker.systemAudio": "System audio",
+    "picker.systemAudioMeta": "everything the speakers play",
+    "picker.micMeta": "microphone",
+    "picker.windowSound": "this window's sound",
     "picker.desktopAll": "Entire desktop",
     "picker.allDisplays": "All displays",
     "picker.none": "No matches",
@@ -261,6 +277,8 @@ const I18N = {
 
     "label.desktop": "Entire desktop",
     "label.monitor": "Display {n}",
+    "label.systemAudio": "System audio",
+    "label.windowSound": "window sound",
 
     "row.fpsLabel": "Frame rate",
     "row.qualityLabel": "Quality",
@@ -278,6 +296,8 @@ const I18N = {
     "editor.loading": "Taking a still…",
     "editor.noStill": "No still available for this source",
     "preview.minimized": "Window is minimized, so there is no still; the crop uses the size the take records at",
+    "preview.camera": "A camera has no still preview",
+    "preview.audio": "A sound source has no picture",
 
     "crop.title": "Crop",
     "crop.oneToOne": "1 px = 1 source px",

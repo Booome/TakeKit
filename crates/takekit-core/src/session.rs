@@ -19,7 +19,10 @@ use crate::ffmpeg;
 use crate::marks::Marks;
 use crate::source::{Backend, Capture, Engine, Source, is_recordable};
 use crate::take::Take;
-use takekit_media::{CameraCapture, MediaFrame, ScreenCapture, ScreenTarget, TakeClock};
+use takekit_media::{
+    CameraCapture, LoopbackCapture, LoopbackTarget, MediaFrame, MicCapture, ScreenCapture,
+    ScreenTarget, TakeClock,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -169,9 +172,45 @@ impl Prepared {
 
         for src in &self.settings.sources {
             let out = recording.take.path_for(&src.id);
-            let (tx, rx) = std::sync::mpsc::channel::<MediaFrame>();
             let fps = src.fps.max(1);
             let bitrate = bitrate_for(effective_quality(src, self.settings.quality));
+
+            // Sound sources take a different road than the picture: the
+            // capture reports its format and the writer opens an AAC file
+            // behind it (see `start_audio_media`). Same failure rule — a
+            // source that cannot start ends the whole take and leaves no
+            // folder behind.
+            if src.capture.is_audio() {
+                let t_spawn = Instant::now();
+                let started = start_audio_media(
+                    src,
+                    out.clone(),
+                    clock,
+                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
+                );
+                let (handle_capture, sender, writer) = match started {
+                    Ok(triple) => triple,
+                    Err(e) => {
+                        drop(recording);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(e);
+                    }
+                };
+                recording
+                    .spawn_ms
+                    .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
+                recording.media.push(MediaRunning {
+                    id: src.id.clone(),
+                    capture: src.capture.clone(),
+                    handle: Some(handle_capture),
+                    sender: Some(sender),
+                    writer,
+                    out,
+                });
+                continue;
+            }
+
+            let (tx, rx) = std::sync::mpsc::channel::<MediaFrame>();
 
             // One writer thread per source, holding the Media Foundation
             // objects: they are not `Send`, and the capture must never block
@@ -218,6 +257,12 @@ impl Prepared {
                         .map(MediaCapture::Camera),
                     Err(e) => Err(e),
                 },
+                // Audio sources are started in-process above and `continue`
+                // past this point — ffmpeg has no WASAPI loopback, so there
+                // is nothing left for this video-only match to do.
+                Capture::Mic { .. } | Capture::SystemAudio { .. } | Capture::WindowAudio { .. } => {
+                    unreachable!("audio sources take the branch above")
+                }
             };
             let handle_capture = match started {
                 Ok(handle) => handle,
@@ -277,7 +322,43 @@ impl Prepared {
             started: Instant::now(),
         };
 
+        // Sound sources are recorded in-process even on this backend — ffmpeg
+        // has no WASAPI loopback to offer, so there is nothing to spawn. Their
+        // timestamps come from one clock shared by the take's audio.
+        let audio_clock = TakeClock::start();
+
         for src in &self.settings.sources {
+            let out = recording.take.path_for(&src.id);
+            if src.capture.is_audio() {
+                let t = std::time::Instant::now();
+                let started = start_audio_media(
+                    src,
+                    out.clone(),
+                    audio_clock,
+                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
+                );
+                let (handle_capture, sender, writer) = match started {
+                    Ok(triple) => triple,
+                    Err(e) => {
+                        drop(recording);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(e);
+                    }
+                };
+                recording
+                    .spawn_ms
+                    .push((src.id.clone(), t.elapsed().as_millis() as u64));
+                recording.media.push(MediaRunning {
+                    id: src.id.clone(),
+                    capture: src.capture.clone(),
+                    handle: Some(handle_capture),
+                    sender: Some(sender),
+                    writer,
+                    out,
+                });
+                continue;
+            }
+
             // A source can stop resolving between prepare and start (a window
             // closed during the countdown). Same cleanup as a failed spawn:
             // nothing was recorded, so the folder must not survive.
@@ -289,7 +370,6 @@ impl Prepared {
                     return Err(Error::Source(e));
                 }
             };
-            let out = recording.take.path_for(&src.id);
             let log = recording.take.dir.join(format!("{}.log", src.id));
 
             let mut args: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
@@ -421,11 +501,13 @@ impl MediaRunning {
     }
 }
 
-/// The two capture handles a Windows-API source can hold. They are different
+/// The capture handles a Windows-API source can hold. They are different
 /// types reaching the same `stop`, which is all a take ever does to them.
 enum MediaCapture {
     Screen(ScreenCapture),
     Camera(CameraCapture),
+    Mic(MicCapture),
+    Loopback(LoopbackCapture),
 }
 
 impl MediaCapture {
@@ -433,6 +515,8 @@ impl MediaCapture {
         match self {
             MediaCapture::Screen(c) => c.stop(),
             MediaCapture::Camera(c) => c.stop(),
+            MediaCapture::Mic(c) => c.stop(),
+            MediaCapture::Loopback(c) => c.stop(),
         }
     }
 }
@@ -497,9 +581,10 @@ struct WriteReport {
     height: u32,
 }
 
-/// A camera's Media Foundation symbolic link, matched from the name the source
-/// carries. The ffmpeg backend addresses cameras by DirectShow name; Media
-/// Foundation has its own naming, so the panel's pick has to be translated.
+/// The camera's Media Foundation symbolic link, matched from the name the
+/// source carries. The ffmpeg backend addresses cameras by DirectShow name;
+/// Media Foundation has its own naming, so the panel's pick has to be
+/// translated.
 fn camera_link(device: &str) -> std::result::Result<String, takekit_media::MediaError> {
     let cameras = takekit_media::devices::cameras()?;
     cameras
@@ -513,6 +598,117 @@ fn camera_link(device: &str) -> std::result::Result<String, takekit_media::Media
         })
 }
 
+/// A microphone's WASAPI endpoint id, matched the same way — by its listed
+/// name or by the endpoint id itself.
+fn mic_endpoint(device: &str) -> std::result::Result<String, takekit_media::MediaError> {
+    let mics = takekit_media::devices::microphones()?;
+    mics.iter()
+        .find(|m| m.name == device || m.endpoint == device)
+        .map(|m| m.endpoint.clone())
+        .ok_or_else(|| {
+            takekit_media::MediaError::message(format!(
+                "no microphone \"{device}\"; takekit media --list shows the names"
+            ))
+        })
+}
+
+/// One started audio source: its capture handle, the channel feeding its
+/// writer thread, and the writer thread itself.
+type StartedAudio = (
+    MediaCapture,
+    std::sync::mpsc::Sender<MediaFrame>,
+    std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
+);
+
+/// Start one audio source through the OS capture APIs and put a writer behind
+/// it. Both backends land here — ffmpeg has no WASAPI loopback at all, so a
+/// sound source is never a child process.
+///
+/// The writer thread comes first and waits for the capture's format (sample
+/// rate and channel count) over a channel, the same shape the CLI's `media`
+/// command uses: `AudioWriter` cannot open its file until it knows them.
+fn start_audio_media(
+    src: &Source,
+    out: PathBuf,
+    clock: TakeClock,
+    bitrate_kbps: u32,
+) -> Result<StartedAudio> {
+    let (tx, rx) = std::sync::mpsc::channel::<MediaFrame>();
+    let (format_tx, format_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || write_audio(rx, format_rx, out, bitrate_kbps));
+
+    let (capture, format) = match &src.capture {
+        Capture::Mic { device } => {
+            let endpoint = mic_endpoint(device).map_err(spawn_error)?;
+            let capture = MicCapture::start(&endpoint, tx.clone(), clock).map_err(spawn_error)?;
+            let f = capture.format();
+            (MediaCapture::Mic(capture), (f.sample_rate, f.channels))
+        }
+        Capture::SystemAudio {} => {
+            let capture = LoopbackCapture::start(LoopbackTarget::All, tx.clone(), clock)
+                .map_err(spawn_error)?;
+            let f = capture.format();
+            (MediaCapture::Loopback(capture), (f.sample_rate, f.channels))
+        }
+        Capture::WindowAudio { hwnd, .. } => {
+            // The filter is the process tree of the window's owner. A window
+            // that is gone has no tree left to listen to.
+            let pid = takekit_media::loopback::window_pid(*hwnd)
+                .ok_or_else(|| Error::Source(format!("no process owns window {hwnd:#x}")))?;
+            let capture =
+                LoopbackCapture::start(LoopbackTarget::ProcessTree(pid), tx.clone(), clock)
+                    .map_err(spawn_error)?;
+            let f = capture.format();
+            (MediaCapture::Loopback(capture), (f.sample_rate, f.channels))
+        }
+        _ => {
+            return Err(Error::Source(
+                "start_audio_media was given a video source".into(),
+            ));
+        }
+    };
+    format_tx
+        .send(format)
+        .map_err(|_| Error::Source("the audio writer is gone".into()))?;
+    Ok((capture, tx, handle))
+}
+
+/// Drain an audio capture into one MP4 of AAC, then finalise it. The file's
+/// length is the samples that arrived — chunks are written back to back, so
+/// there is no end hint to latch (unlike the video writer's held frame).
+fn write_audio(
+    rx: std::sync::mpsc::Receiver<MediaFrame>,
+    format_rx: std::sync::mpsc::Receiver<(u32, u32)>,
+    out: PathBuf,
+    bitrate_kbps: u32,
+) -> std::result::Result<WriteReport, String> {
+    use takekit_media::AudioWriter;
+
+    let (rate, channels) = format_rx
+        .recv()
+        .map_err(|_| "the audio capture never reported a format".to_string())?;
+    let mut writer =
+        AudioWriter::create(&out, rate, channels, bitrate_kbps).map_err(|e| e.to_string())?;
+    let mut chunks = 0u64;
+    let mut bytes = 0u64;
+    while let Ok(frame) = rx.recv() {
+        if let MediaFrame::Audio(chunk) = frame {
+            bytes += chunk.data.len() as u64;
+            chunks += 1;
+            writer.write(&chunk).map_err(|e| e.to_string())?;
+        }
+    }
+    writer.finish().map_err(|e| e.to_string())?;
+    // PCM 16-bit interleaved: two bytes per sample per channel.
+    let seconds = bytes as f64 / (rate as f64 * channels as f64 * 2.0);
+    Ok(WriteReport {
+        seconds,
+        frames: chunks,
+        width: 0,
+        height: 0,
+    })
+}
+
 /// CRF-flavoured quality as the fixed bitrate Media Foundation's H.264 encoder
 /// takes. Rough by design: hardware encoders do not do CRF, and the steps are
 /// wide enough that the difference between them is what the knob promises.
@@ -522,6 +718,18 @@ fn bitrate_for(quality: u8) -> u32 {
         15..=22 => 12_000,
         23..=30 => 8_000,
         _ => 5_000,
+    }
+}
+
+/// The same knob as AAC bitrate. Much smaller numbers than the picture's —
+/// 256 kbps is transparent for stereo speech and music, and the top of the
+/// range the CLI's `media` command caps at.
+fn audio_bitrate_for(quality: u8) -> u32 {
+    match quality {
+        0..=14 => 256,
+        15..=22 => 192,
+        23..=30 => 128,
+        _ => 96,
     }
 }
 
@@ -988,6 +1196,26 @@ impl Session {
                 }
                 Capture::Camera { device, .. } => {
                     camera_link(device).map_err(spawn_error)?;
+                }
+                Capture::Mic { device, .. } => {
+                    // Same check the capture itself will make, surfaced here
+                    // so an unplugged mic fails before the veil, not as a
+                    // half-recorded take.
+                    mic_endpoint(device).map_err(spawn_error)?;
+                }
+                Capture::SystemAudio { .. } => {
+                    // Always addressable: loopback on the default render
+                    // device, which Windows guarantees exists while any
+                    // audio endpoint is present.
+                }
+                Capture::WindowAudio { hwnd, title, .. } => {
+                    // Sound survives the window being covered or minimised
+                    // (that is the point of per-process loopback) — only the
+                    // window going away ends it, so `IsWindow` is the whole
+                    // check, same as `is_recordable`.
+                    if let Err(e) = crate::source::window_by_hwnd(*hwnd) {
+                        return Err(Error::Source(format!("{title}: {e}")));
+                    }
                 }
             }
         }

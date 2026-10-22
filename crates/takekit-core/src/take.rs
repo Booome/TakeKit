@@ -82,7 +82,11 @@ impl Take {
                 .iter()
                 .map(|s| SourceRecord {
                     id: s.id.clone(),
-                    file: format!("{}.{}", s.id, ext),
+                    // Audio lands in `.mp4` even in a `.mkv` take: the MF sink
+                    // writer that renders it names its container after the
+                    // extension and does not know Matroska (see
+                    // `Capture::output_ext`).
+                    file: format!("{}.{}", s.id, s.capture.output_ext(ext)),
                     duration: None,
                     frames: None,
                     source: s.clone(),
@@ -93,8 +97,16 @@ impl Take {
         Ok(Self { dir, ext, manifest })
     }
 
+    /// Where a source's file lives. Reads the manifest rather than recomputing
+    /// the name, so an audio source's `.mp4` inside a `.mkv` take (see
+    /// `Capture::output_ext`) is found exactly where `create` said it would.
     pub fn path_for(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.{}", self.ext))
+        self.manifest
+            .sources
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| self.dir.join(&s.file))
+            .unwrap_or_else(|| self.dir.join(format!("{id}.{}", self.ext)))
     }
 
     pub fn save_manifest(&self) -> std::io::Result<()> {

@@ -13,8 +13,8 @@ use takekit_core::ffmpeg;
 use takekit_core::session::{Session, Settings};
 use takekit_core::source::{Backend, Capture, Crop, Engine, Source, WindowItem};
 use takekit_media::{
-    AudioWriter, CameraCapture, DeviceList, MediaFrame, MicCapture, ScreenCapture, ScreenTarget,
-    TakeClock, writer,
+    AudioWriter, CameraCapture, DeviceList, LoopbackCapture, LoopbackTarget, MediaFrame,
+    MicCapture, ScreenCapture, ScreenTarget, TakeClock, writer,
 };
 
 mod client;
@@ -120,6 +120,14 @@ struct MediaArgs {
     /// Record a microphone: its name, or its endpoint id
     #[arg(long, value_name = "MIC")]
     mic: Option<String>,
+
+    /// Record what the speakers play (system sound)
+    #[arg(long)]
+    system_audio: bool,
+
+    /// Record only one window's sound: its handle, e.g. --window-audio 0x1234
+    #[arg(long, value_name = "HWND", value_parser = parse_hwnd)]
+    window_audio: Option<isize>,
 
     /// Stop after this many seconds
     #[arg(short, long, default_value_t = 5.0)]
@@ -369,6 +377,48 @@ fn record(args: RecordArgs) -> Result<(), String> {
 /// Record through the Windows capture APIs: Windows Graphics Capture for a
 /// screen, Media Foundation for a camera and a microphone, Media Foundation
 /// again to encode. No ffmpeg involved.
+/// One audio writer started on its own thread: the capture's end of the
+/// frame channel, the end its format arrives on, and the thread itself.
+type AudioWriterStart = (
+    std::sync::mpsc::Sender<MediaFrame>,
+    std::sync::mpsc::Sender<(u32, u32)>,
+    std::thread::JoinHandle<Result<(String, u64), String>>,
+);
+
+/// One audio writer on its own thread — Media Foundation objects are not
+/// `Send`, and a capture only learns its format once it runs, so the rate
+/// and channel count travel to the writer over a channel before the file
+/// can be opened. The same shape the core's `write_audio` uses: a device
+/// harness must not grow a second opinion about how an AAC file is written.
+///
+/// Returns the capture's end of the frame channel, the format's end, and
+/// the writer thread; the caller starts the capture and hands the format
+/// over the moment it reports one.
+fn open_audio(name: &str, path: PathBuf, bitrate: u32) -> AudioWriterStart {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (tx, rx) = mpsc::channel::<MediaFrame>();
+    let (format_tx, format_rx) = mpsc::channel();
+    let name = name.to_string();
+    let handle = thread::spawn(move || -> Result<(String, u64), String> {
+        let (rate, channels) = format_rx
+            .recv()
+            .map_err(|_| format!("the {name} capture never reported a format"))?;
+        let mut writer = AudioWriter::create(&path, rate, channels, bitrate).map_err(string_of)?;
+        let mut delivered = 0u64;
+        while let Ok(frame) = rx.recv() {
+            if let MediaFrame::Audio(chunk) = frame {
+                delivered += 1;
+                writer.write(&chunk).map_err(string_of)?;
+            }
+        }
+        writer.finish().map_err(string_of)?;
+        Ok((name, delivered))
+    });
+    (tx, format_tx, handle)
+}
+
 fn media(args: MediaArgs) -> Result<(), String> {
     use std::sync::mpsc;
     use std::thread;
@@ -379,9 +429,11 @@ fn media(args: MediaArgs) -> Result<(), String> {
     let wanted = args.screen.is_some()
         || args.window.is_some()
         || args.camera.is_some()
-        || args.mic.is_some();
+        || args.mic.is_some()
+        || args.system_audio
+        || args.window_audio.is_some();
     if !wanted {
-        return Err("nothing to record: pass --screen, --window, --camera or --mic".into());
+        return Err("nothing to record: pass --screen, --window, --camera, --mic, --system-audio or --window-audio".into());
     }
     if !args.duration.is_finite() || !(0.1..=86_400.0).contains(&args.duration) {
         return Err(format!(
@@ -494,29 +546,8 @@ fn media(args: MediaArgs) -> Result<(), String> {
     let mic = match &args.mic {
         Some(name) => {
             let endpoint = resolve_mic(&devices, name)?;
-            let (tx, rx) = mpsc::channel::<MediaFrame>();
-            // The writer has to live on its own thread — Media Foundation
-            // objects are not `Send` — so the rate and channel count the
-            // microphone reported travel over to it.
-            let (format_tx, format_rx) = mpsc::channel();
-            let path = dir.join("mic.mp4");
-            let bitrate = args.bitrate;
-            let handle = thread::spawn(move || -> Result<(String, u64), String> {
-                let (rate, channels) = format_rx
-                    .recv()
-                    .map_err(|_| "the microphone never reported a format".to_string())?;
-                let mut writer = AudioWriter::create(&path, rate, channels, bitrate.min(256))
-                    .map_err(string_of)?;
-                let mut delivered = 0u64;
-                while let Ok(frame) = rx.recv() {
-                    if let MediaFrame::Audio(chunk) = frame {
-                        delivered += 1;
-                        writer.write(&chunk).map_err(string_of)?;
-                    }
-                }
-                writer.finish().map_err(string_of)?;
-                Ok(("mic".to_string(), delivered))
-            });
+            let (tx, format_tx, handle) =
+                open_audio("mic", dir.join("mic.mp4"), args.bitrate.min(256));
             let capture = MicCapture::start(&endpoint, tx.clone(), clock).map_err(string_of)?;
             let format = capture.format();
             format_tx
@@ -528,6 +559,38 @@ fn media(args: MediaArgs) -> Result<(), String> {
         }
         None => None,
     };
+
+    // Loopback: what the speakers play, either all of it or just one window's
+    // process tree. Same shape as the microphone — the writer needs the
+    // format the capture settles on, so it travels over a channel.
+    let mut loopback = None;
+    if args.system_audio || args.window_audio.is_some() {
+        let target = match args.window_audio {
+            Some(hwnd) => {
+                let pid = takekit_media::loopback::window_pid(hwnd)
+                    .ok_or_else(|| format!("no process owns window {hwnd:#x}"))?;
+                LoopbackTarget::ProcessTree(pid)
+            }
+            None => LoopbackTarget::All,
+        };
+        let (tx, format_tx, handle) = open_audio(
+            "loopback",
+            dir.join(if target == LoopbackTarget::All {
+                "system-audio.mp4"
+            } else {
+                "window-audio.mp4"
+            }),
+            args.bitrate.min(256),
+        );
+        let capture = LoopbackCapture::start(target, tx.clone(), clock).map_err(string_of)?;
+        let format = capture.format();
+        format_tx
+            .send((format.sample_rate, format.channels))
+            .map_err(|_| "the loopback writer is gone".to_string())?;
+        senders.push(tx);
+        writers.push(handle);
+        loopback = Some(capture);
+    }
 
     println!("recording for {:.1}s into {}", args.duration, dir.display());
     thread::sleep(Duration::from_secs_f64(args.duration));
@@ -548,6 +611,9 @@ fn media(args: MediaArgs) -> Result<(), String> {
         c.stop().map_err(string_of)?;
     }
     if let Some(c) = mic {
+        c.stop().map_err(string_of)?;
+    }
+    if let Some(c) = loopback {
         c.stop().map_err(string_of)?;
     }
     drop(senders);

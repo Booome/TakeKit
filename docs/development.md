@@ -51,14 +51,16 @@ crates/
 │   ├─ session.rs         Session::prepare → Prepared → start → Recording
 │   │                     （Backend::Ffmpeg 与 Backend::Windows 两条运行时）
 │   ├─ take.rs            Take::create / 目录与 take.json（ext: mkv 或 mp4）
-│   ├─ source.rs          Capture{Desktop,Window,Camera}、Backend、list_windows、
-│   │                     is_recordable、bring_to_front、偶数尺寸 crop
+│   ├─ source.rs          Capture{Desktop,Window,Camera,Mic,SystemAudio,WindowAudio}、
+│   │                     Backend、list_windows、is_recordable、bring_to_front、
+│   │                     偶数尺寸 crop
 │   ├─ encoder.rs         NVENC → QSV → AMF → x264，每个都用一帧试编验证
 │   └─ ffmpeg.rs          locate / spawn / 探针 / list_devices
 ├─ takekit-media/         ← Windows API 采集（详见 docs/api-recording.md）
 │   ├─ clock.rs           TakeClock：全 take 统一时间原点（WGC=QPC 直减；MF=首样本桥接）
 │   ├─ screen.rs          WGC 抓屏/抓窗口（被遮挡窗口可录）
 │   ├─ camera.rs / mic.rs Media Foundation 设备读取（NV12 / PCM）
+│   ├─ loopback.rs        WASAPI 回环：系统声音 / 单窗口进程树声音
 │   └─ writer.rs          MF SinkWriter：H.264+AAC 写 MP4（含前导黑帧/静音对齐）
 ├─ takekit-cli/           ← 薄壳，bin 名 `takekit`
 └─ takekit-gui/

@@ -12,10 +12,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaSource, IMFMediaType, IMFSourceReader,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MFCreateAttributes,
-    MFCreateSourceReaderFromMediaSource,
+    IMFMediaSource, IMFSourceReader, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
@@ -24,7 +22,7 @@ use crate::devices::activate;
 use crate::error::{MediaError, Result};
 use crate::frame::{MediaFrame, PixelFormat, VideoFrame};
 use crate::mediatype::{camera_type, frame_size};
-use crate::reader::{VIDEO_STREAM, next_sample, open_reader, sample_bytes};
+use crate::reader::{VIDEO_STREAM, create_reader, native_type, next_sample, sample_bytes};
 
 /// How long a camera is given to open before the take is called off.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,27 +148,21 @@ fn open(link: &str, fps: u32) -> Result<(IMFSourceReader, u32, u32)> {
 
     // The resolution is the device's, not ours: a camera has a handful of modes
     // and asking for one it does not have means a black take.
-    let native = native_type(&source)?;
+    //
+    // One reader does both jobs: the native size is read off it, then the type
+    // we want is set on it. A throwaway reader for the peek would shut the
+    // source down when it was dropped (see `reader::create_reader`).
+    let reader = create_reader(&source)?;
+    let native = native_type(&reader, VIDEO_STREAM)?;
     let (width, height) = frame_size(&native)?;
     if width == 0 || height == 0 {
         return Err(MediaError::message("the camera reports no picture size"));
     }
-    let reader = open_reader(&source, VIDEO_STREAM, &camera_type(width, height, fps)?)?;
-    Ok((reader, width, height))
-}
-
-fn native_type(source: &IMFMediaSource) -> Result<IMFMediaType> {
-    // SAFETY: the attributes and the reader are owned here; only the media type
-    // leaves, and it is reference-counted.
+    // SAFETY: the reader is owned here and returned to the caller still live.
     unsafe {
-        let mut attributes: Option<IMFAttributes> = None;
-        MFCreateAttributes(&mut attributes, 0)?;
-        let attributes = attributes.ok_or_else(|| MediaError::message("no attribute store"))?;
-        let reader = MFCreateSourceReaderFromMediaSource(source, &attributes)?;
-        reader
-            .GetNativeMediaType(VIDEO_STREAM, 0)
-            .map_err(Into::into)
+        reader.SetCurrentMediaType(VIDEO_STREAM, None, &camera_type(width, height, fps)?)?;
     }
+    Ok((reader, width, height))
 }
 
 fn pump(

@@ -1,5 +1,6 @@
 /target
 takes/
+takes-media/
 *.mkv
 *.mp4
 *.mov

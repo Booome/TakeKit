@@ -12,10 +12,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaSource, IMFMediaType, IMFSourceReader,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID,
+    IMFMediaSource, IMFSourceReader, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MFCreateAttributes, MFCreateSourceReaderFromMediaSource,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
@@ -24,7 +23,7 @@ use crate::devices::activate;
 use crate::error::{MediaError, Result};
 use crate::frame::{AudioChunk, MediaFrame};
 use crate::mediatype::pcm_type;
-use crate::reader::{AUDIO_STREAM, next_sample, open_reader, sample_bytes};
+use crate::reader::{AUDIO_STREAM, create_reader, native_type, next_sample, sample_bytes};
 
 /// How long a microphone is given to open before the take is called off.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -145,7 +144,11 @@ fn open(endpoint: &str) -> Result<(IMFSourceReader, u32, u32)> {
         endpoint,
     )?;
 
-    let native = native_type(&source)?;
+    // One reader does both jobs: the native type is read off it, then the
+    // type we want is set on it. A throwaway reader for the peek would shut
+    // the source down when it was dropped (see `reader::create_reader`).
+    let reader = create_reader(&source)?;
+    let native = native_type(&reader, AUDIO_STREAM)?;
     // SAFETY: two scalar attribute reads on an owned object.
     let (sample_rate, channels) = unsafe {
         (
@@ -156,23 +159,11 @@ fn open(endpoint: &str) -> Result<(IMFSourceReader, u32, u32)> {
     if sample_rate == 0 || channels == 0 {
         return Err(MediaError::message("the microphone reports no format"));
     }
-    let reader = open_reader(&source, AUDIO_STREAM, &pcm_type(sample_rate, channels)?)?;
-    Ok((reader, sample_rate, channels))
-}
-
-/// The type the device offers before we ask for anything.
-fn native_type(source: &IMFMediaSource) -> Result<IMFMediaType> {
-    // SAFETY: the attributes and the reader are owned here; only the media type
-    // leaves, and it is reference-counted.
+    // SAFETY: the reader is owned here and returned to the caller still live.
     unsafe {
-        let mut attributes: Option<IMFAttributes> = None;
-        MFCreateAttributes(&mut attributes, 0)?;
-        let attributes = attributes.ok_or_else(|| MediaError::message("no attribute store"))?;
-        let reader = MFCreateSourceReaderFromMediaSource(source, &attributes)?;
-        reader
-            .GetNativeMediaType(AUDIO_STREAM, 0)
-            .map_err(Into::into)
+        reader.SetCurrentMediaType(AUDIO_STREAM, None, &pcm_type(sample_rate, channels)?)?;
     }
+    Ok((reader, sample_rate, channels))
 }
 
 fn pump(

@@ -35,7 +35,7 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
 - `takekit-core` 有 5 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
-- 基线（2026-10-22 实测）：core 43 / cli 9 / gui 82 / media 20。以 `cargo test` 实际输出为准。
+- 基线（2026-10-22 实测）：core 43 / cli 9 / gui 82 / media 21。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **隔离运行**（不碰用户真实配置）与 WebView2 双缓解：见 `docs/webview2-agent-sandbox.md` §4（唯一出处，配方与两条铁律都在那里）。
 

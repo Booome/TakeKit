@@ -184,6 +184,11 @@ const I18N = {
     "err.hotkey-conflict": "快捷键 {detail} 注册失败（可能已被其他程序占用）",
     "err.save": "没能保存设置：{detail}",
     "err.internal": "内部错误：{detail}",
+    "err.take-gone": "目录已不在：{detail}",
+    "err.reveal-failed": "打开目录失败：{detail}",
+    "err.not-a-take": "这不是录制目录：{detail}",
+    "err.delete-failed": "删除失败：{detail}",
+    "err.log-entry-gone": "该日志条目已不存在（可能已被删除）",
   },
 
   en: {
@@ -357,6 +362,11 @@ const I18N = {
     "err.hotkey-conflict": "Could not register {detail} — another app may already use it",
     "err.save": "Could not save the setting: {detail}",
     "err.internal": "Internal error: {detail}",
+    "err.take-gone": "That folder is gone: {detail}",
+    "err.reveal-failed": "Could not open the folder: {detail}",
+    "err.not-a-take": "That is not a take folder: {detail}",
+    "err.delete-failed": "Could not delete: {detail}",
+    "err.log-entry-gone": "That log entry is already gone",
   },
 };
 

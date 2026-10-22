@@ -442,8 +442,12 @@ pub fn even_frame(frame: VideoFrame) -> VideoFrame {
     let mut out = Vec::with_capacity(kept * height as usize);
     for row in 0..height as usize {
         let at = row * stride;
-        if at + kept <= frame.data.len() {
-            out.extend_from_slice(&frame.data[at..at + kept]);
+        // Same rule as `crop_frame`: a torn buffer gets the whole frame back,
+        // never a rebuild out of the rows that happened to fit — that one
+        // would carry a height its pixels no longer describe.
+        match frame.data.get(at..at + kept) {
+            Some(row_bytes) => out.extend_from_slice(row_bytes),
+            None => return frame,
         }
     }
     if matches!(frame.format, PixelFormat::Nv12) {
@@ -453,8 +457,9 @@ pub fn even_frame(frame: VideoFrame) -> VideoFrame {
         let chroma_at = stride * frame.height as usize;
         for row in 0..(height as usize / 2) {
             let at = chroma_at + row * stride;
-            if at + kept <= frame.data.len() {
-                out.extend_from_slice(&frame.data[at..at + kept]);
+            match frame.data.get(at..at + kept) {
+                Some(row_bytes) => out.extend_from_slice(row_bytes),
+                None => return frame,
             }
         }
     }
@@ -739,6 +744,38 @@ mod tests {
         assert_eq!(&trimmed.data[..8], &[1, 2, 3, 4, 6, 7, 8, 9]);
         assert_eq!(trimmed.data.len(), 12, "eight luma bytes plus four chroma");
         assert_eq!(&trimmed.data[8..], &[20, 21, 22, 23]);
+    }
+
+    /// A torn buffer gets the whole frame back from both halves of the
+    /// pipeline: rebuilding it out of the rows that happened to fit would
+    /// hand the encoder a height its pixels no longer describe (the policy
+    /// `crop_frame` states — the whole frame beats half of one).
+    #[test]
+    fn a_torn_buffer_is_never_rebuilt_row_by_row() {
+        // 5x3 BGRA where the data stops 10 bytes into the second row: the
+        // 4x2 rebuild needs row bytes at 20..36 and they are not there.
+        let torn = VideoFrame {
+            width: 5,
+            height: 3,
+            format: PixelFormat::Bgra,
+            data: vec![7; 30],
+            time: 0,
+        };
+        let again = even_frame(torn);
+        assert_eq!((again.width, again.height), (5, 3), "whole frame, not 4x2");
+        assert_eq!(again.data.len(), 30);
+
+        // Luma complete but the chroma plane short: same answer.
+        let torn_nv12 = VideoFrame {
+            width: 5,
+            height: 3,
+            format: PixelFormat::Nv12,
+            data: vec![7; 5 * 3 + 2],
+            time: 0,
+        };
+        let again = even_frame(torn_nv12);
+        assert_eq!((again.width, again.height), (5, 3));
+        assert_eq!(again.data.len(), 5 * 3 + 2);
     }
 
     /// A crop moves pixel boundaries and nothing else: the kept rectangle has

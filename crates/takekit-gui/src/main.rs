@@ -26,6 +26,7 @@ use serde::Serialize;
 use takekit_core::encoder;
 use takekit_core::ffmpeg;
 use takekit_core::source::{Capture, ScreenRect, is_recordable, virtual_screen_rect};
+use takekit_core::take::DeleteError;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::window::Color;
@@ -279,14 +280,14 @@ async fn journal_clear(pane: String) -> JournalView {
 /// a log entry is a note about a take, not the take itself. `at` is the stamp
 /// the entry carries (the row it was rendered from sends its own).
 #[tauri::command]
-async fn log_delete(at: u64) -> Result<JournalView, String> {
+async fn log_delete(at: u64) -> Result<JournalView, UiError> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut removed = false;
         let _ = journal::Journal::update(|j| removed = j.remove_log(at));
         if !removed {
             // Said out loud rather than a quiet no-op: the caller thinks a
             // row existed, and "it went away first" is the likely story.
-            return Err(format!("no log entry at {at}"));
+            return Err(UiError::new("err.log-entry-gone"));
         }
         Ok(journal_view())
     })
@@ -305,9 +306,18 @@ async fn log_delete(at: u64) -> Result<JournalView, String> {
 /// *entries* stay (they are history too); only their now-dead "open the
 /// folder" link is dropped.
 #[tauri::command]
-async fn take_delete(dir: String) -> Result<JournalView, String> {
+async fn take_delete(dir: String) -> Result<JournalView, UiError> {
     tauri::async_runtime::spawn_blocking(move || {
-        takekit_core::take::delete_dir(&dir)?;
+        takekit_core::take::delete_dir(&dir).map_err(|e| match e {
+            // One user-facing sentence for all three refusals — the panel
+            // shows "not a take folder" — while the precise reason (a file,
+            // a missing manifest, a path with no final component) stays in
+            // the `Display` the log and the control plane print.
+            DeleteError::NotADirectory(_)
+            | DeleteError::NotATake(_)
+            | DeleteError::MissingManifest(_) => UiError::with_detail("err.not-a-take", &dir),
+            DeleteError::Io(e) => UiError::with_detail("err.delete-failed", e),
+        })?;
         let _ = journal::Journal::update(|j| {
             j.takes.retain(|t| t.dir != dir);
             for e in &mut j.log {
@@ -367,7 +377,7 @@ fn exit_crop_mode(window: tauri::WebviewWindow) -> Result<(), UiError> {
 /// Open a take folder from the history pane. Synchronous: it only spawns
 /// Explorer, which returns at once.
 #[tauri::command]
-fn open_take(dir: String) -> Result<(), String> {
+fn open_take(dir: String) -> Result<(), UiError> {
     reveal::reveal(&reveal::take_dir(&dir)?)
 }
 

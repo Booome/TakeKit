@@ -120,6 +120,39 @@ impl Take {
     }
 }
 
+/// Why `delete_dir` refused to touch a folder.
+///
+/// The variants name the reason, not a message: `Display` composes the
+/// Chinese sentence logs and the control plane print, and the panel maps
+/// each variant onto a translated `UiError` code — a user-visible sentence
+/// composed in Rust would be stuck in whichever language it was written in
+/// (see `takekit_gui::proto::UiError`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteError {
+    /// Empty, or no final component (`C:\`): nothing that could name a take
+    /// folder. Refused before the path is touched at all.
+    NotADirectory(String),
+    /// The path exists but is a file.
+    NotATake(String),
+    /// A directory without our manifest — the `take.json` guard.
+    MissingManifest(String),
+    /// `remove_dir_all` itself failed; the folder may be half gone.
+    Io(String),
+}
+
+impl std::fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotADirectory(dir) => write!(f, "不是可删除的录制目录：{dir}"),
+            Self::NotATake(dir) => write!(f, "不是录制目录：{dir}"),
+            Self::MissingManifest(dir) => write!(f, "不是录制目录（缺少 take.json）：{dir}"),
+            Self::Io(e) => write!(f, "删除失败：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for DeleteError {}
+
 /// Delete one take folder — the disk half of removing a history row.
 ///
 /// The `take.json` check is what makes this safe to call with a string that
@@ -131,21 +164,21 @@ impl Take {
 /// protect, and the caller drops the record instead of keeping a tombstone
 /// row that can never be removed. `Err` always means "did not delete, and
 /// the caller should not drop the record either".
-pub fn delete_dir(dir: &str) -> Result<(), String> {
+pub fn delete_dir(dir: &str) -> Result<(), DeleteError> {
     let path = Path::new(dir);
     if dir.is_empty() || path.file_name().is_none() {
-        return Err(format!("不是可删除的录制目录：{dir}"));
+        return Err(DeleteError::NotADirectory(dir.to_string()));
     }
     if !path.exists() {
         return Ok(());
     }
     if !path.is_dir() {
-        return Err(format!("不是录制目录：{dir}"));
+        return Err(DeleteError::NotATake(dir.to_string()));
     }
     if !path.join("take.json").is_file() {
-        return Err(format!("不是录制目录（缺少 take.json）：{dir}"));
+        return Err(DeleteError::MissingManifest(dir.to_string()));
     }
-    fs::remove_dir_all(path).map_err(|e| format!("删除失败：{e}"))
+    fs::remove_dir_all(path).map_err(|e| DeleteError::Io(e.to_string()))
 }
 
 /// The take-folder stamp: **local** time as `YYYY-MM-DD-HH-MM-SS`.
@@ -245,8 +278,28 @@ mod tests {
         fs::write(plain.join("notes.txt"), b"x").unwrap();
 
         let err = delete_dir(&plain.to_string_lossy()).unwrap_err();
-        assert!(err.contains("take.json"), "{err}");
+        assert_eq!(
+            err,
+            DeleteError::MissingManifest(plain.to_string_lossy().into_owned())
+        );
+        assert!(err.to_string().contains("take.json"), "{err}");
         assert!(plain.exists(), "the folder must survive a refused delete");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_dir_refuses_a_file() {
+        let root = scratch("a-file");
+        let file = root.join("take.json");
+        fs::write(&file, b"x").unwrap();
+
+        let err = delete_dir(&file.to_string_lossy()).unwrap_err();
+        assert_eq!(
+            err,
+            DeleteError::NotATake(file.to_string_lossy().into_owned())
+        );
+        assert!(err.to_string().contains("不是录制目录"), "{err}");
+        assert!(file.exists(), "the file must survive a refused delete");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -258,7 +311,8 @@ mod tests {
     #[test]
     fn delete_dir_refuses_a_drive_root() {
         let err = delete_dir(r"C:\").unwrap_err();
-        assert!(err.contains("不是可删除的录制目录"), "{err}");
+        assert_eq!(err, DeleteError::NotADirectory(r"C:\".to_string()));
+        assert!(err.to_string().contains("不是可删除的录制目录"), "{err}");
     }
 
     #[test]

@@ -643,7 +643,11 @@ select {
     color var(--tk-dur) var(--tk-ease);
 }
 
-.take:hover .open {
+/* Hovering the row says "this opens"; hovering the trash says "this deletes",
+   so the arrow must not light up over the trash — the two affordances answer
+   different clicks (`:has` is Chromium 105+, the WebView2 runtime is far past
+   that). */
+.take:hover:not(:has(.row-del:hover)) .open {
   background: var(--tk-accent-soft);
   color: var(--tk-accent);
 }

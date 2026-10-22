@@ -972,12 +972,14 @@ impl Session {
         for src in &settings.sources {
             match &src.capture {
                 Capture::Desktop { .. } => {
-                    // Accepted as-is: `start_windows` points every desktop
-                    // source at the first monitor, so a `rect` picked for the
-                    // virtual screen the ffmpeg backend spans has nothing to
-                    // apply to here. The four crop edges *do* apply — they are
-                    // cut out of the captured frame by the writer — which is
-                    // what the panel's editor writes.
+                    // Accepted as-is: `start_windows` resolves a remembered
+                    // `rect` to the monitor holding its centre, and falls
+                    // back to the first monitor only when there is none
+                    // (2026-10-21 多屏) — so the rect picks a monitor, but
+                    // its extent does not apply: WGC captures one whole
+                    // output, not that region. The four crop edges *do*
+                    // apply — they are cut out of the captured frame by the
+                    // writer — which is what the panel's editor writes.
                 }
                 Capture::Window { hwnd, title, .. } => {
                     if let Err(e) = crate::source::window_by_hwnd(*hwnd) {

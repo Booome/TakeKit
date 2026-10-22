@@ -458,7 +458,7 @@ function shortPath(dir) {
 // message — putting it in the log too would let a deleted folder fill the pane
 // one click at a time.
 function openTake(dir) {
-  invoke("open_take", { dir }).catch((e) => showNotice("error", String(e)));
+  invoke("open_take", { dir }).catch((e) => showNotice("error", uiErrorText(e)));
 }
 
 function renderTabs() {
@@ -515,7 +515,7 @@ function rowTrash({ label, text, armedText, onConfirm }) {
       .catch((e) => {
         btn.classList.remove("armed");
         stamp();
-        showNotice("error", String(e));
+        showNotice("error", uiErrorText(e));
       });
   });
   return btn;
@@ -739,6 +739,10 @@ async function refreshSources() {
   state.sourcesLoaded = true;
   PROBE(`ipc-sources:${windows.length}w/${devices.length}d`);
   buildPicker();
+  // A row's size comes from these lists (a window's live w×h), and the first
+  // paint runs before they land — redraw so the size column fills in instead
+  // of staying at "—". Safe here: both callers run outside a recording.
+  render();
 }
 
 function pickButton(name, meta, onPick) {
@@ -2241,8 +2245,13 @@ async function init() {
         $("out-path").value = state.outRoot;
       }
     }
+    // Only the ffmpeg backend needs the binary: on the Windows backend a
+    // missing ffmpeg is not an error, and crying wolf at every launch is how
+    // an error notice stops being read.
     if (!e.ffmpeg) {
-      notify("error", t("notice.noFfmpeg"), t("notice.noFfmpegDetail"));
+      if (state.backend === "ffmpeg") {
+        notify("error", t("notice.noFfmpeg"), t("notice.noFfmpegDetail"));
+      }
     } else if (e.encoder) {
       state.encoderName = e.encoder;
       $("encoder").options[0].textContent = encoderAutoLabel();
@@ -2252,6 +2261,10 @@ async function init() {
     // order — probe first — leaves `sourcesLoaded` false, and the pending
     // buildPicker gets the monitors for free.)
     if (state.sourcesLoaded) buildPicker();
+    // Same reason as in `refreshSources`: a desktop row's size comes from
+    // `state.screen` and its name from `state.monitors`, both of which only
+    // exist now. Redraw the rows so they stop showing "—".
+    render();
   }
   await sources;
   // Both list panes are restored before the first paint of them: opening a

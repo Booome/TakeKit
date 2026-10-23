@@ -28,7 +28,7 @@ const I18N = {
     "sources.emptyHint": "添加一个窗口、桌面或摄像头开始录制。",
 
     "history.clear": "清空…",
-    "history.clearArmed": "再点一次清空",
+    "history.clearArmed": "再点一次删除文件",
     "log.clear": "清空…",
     "log.clearArmed": "再点一次清空",
     "history.emptyTitle": "还没有录制过",
@@ -45,6 +45,9 @@ const I18N = {
     "params.encoder": "视频编码",
     "params.encoderAuto": "自动",
     "params.encoderAutoWith": "自动（{name}）",
+    "params.ffmpegPath": "ffmpeg 路径",
+    "params.ffmpegPathHint": "留空则在 PATH 里找；手动指定后按指定的来",
+    "params.ffmpegPick": "选择 ffmpeg 程序",
     "params.marks": "鼠标效果",
     "params.marksHint": "点击涟漪与拖动轨迹叠加到录制画面上",
     "params.countdown": "倒计时",
@@ -79,11 +82,11 @@ const I18N = {
     "picker.systemAudio": "系统声音",
     "picker.systemAudioMeta": "扬声器播放的一切",
     "picker.micMeta": "麦克风",
-    "picker.windowSound": "这个窗口的声音",
     "picker.desktopAll": "整个桌面",
     "picker.allDisplays": "全部显示器",
     "picker.none": "没有匹配项",
     "picker.bgCapable": "被遮挡时仍可录",
+    "picker.noSignal": "无信号 · 先启动宿主程序",
     "picker.added": "已添加 · {meta}",
     "picker.addedTitle": "已在清单中",
 
@@ -97,17 +100,26 @@ const I18N = {
     "row.editLabel": "编辑源：{name}",
     "row.remove": "移除",
     "row.sizeUnknown": "尺寸未知",
+    "row.cropDropped": "裁剪超出画面，按整幅录制",
+    "row.soundOn": "声音已录进文件，点击静音",
+    "row.soundOff": "只有画面，点击录声音",
+    "row.soundDesktop": "桌面录的是整台电脑的声音",
 
     "editor.close": "关闭",
     "editor.crop": "裁剪",
+    "editor.sound": "静音",
+    "editor.soundHint": "打开后这个文件只有画面，没有声音",
     "editor.cropOpen": "调整裁剪…",
     "editor.cancel": "取消",
     "editor.save": "保存",
     "editor.size": "输出 {w} × {h}",
+    "editor.sizeWhole": "输出整幅（裁剪超出画面）",
     "editor.sizeUnknown": "尺寸未知",
     "editor.loading": "正在抓取画面…",
     "editor.noStill": "这个源暂时抓不到静帧",
-    "preview.minimized": "窗口已最小化，不抓静帧；裁剪按录制时恢复后的尺寸",
+    "editor.restoreWindow": "恢复窗口",
+    "preview.minimized": "窗口已最小化，系统不再绘制它，没有画面可对照。恢复窗口后才能裁剪。",
+    "preview.recycled": "这个句柄现在是别的进程的窗口了，请重新添加这个源",
     "preview.camera": "摄像头没有静帧画面",
     "preview.audio": "声音源没有画面，只有声音",
 
@@ -115,6 +127,8 @@ const I18N = {
     "crop.oneToOne": "1 px = 源 1 px",
     "crop.back": "返回",
     "crop.source": "源 {w} × {h}",
+    "crop.dropped": "整幅",
+    "crop.droppedHint": "裁剪超出画面，这个文件会按整幅录制",
     "crop.noSource": "没有可用的画面",
     "crop.zoomIn": "放大",
     "crop.zoomOut": "缩小",
@@ -199,6 +213,11 @@ const I18N = {
     "err.not-a-take": "这不是录制目录：{detail}",
     "err.delete-failed": "删除失败：{detail}",
     "err.log-entry-gone": "该日志条目已不存在（可能已被删除）",
+    "err.cam-no-signal": "{detail} 已注册但没有画面——虚拟摄像头需要先启动它的宿主程序（如 Mikey 客户端），再重新录制",
+    "err.cam-not-mf": "{detail} 是 DirectShow 虚拟摄像头，Windows 后端看不到它——请改用 ffmpeg 后端录制",
+    "err.device-gone": "找不到设备 {detail}——可能已被拔出或改名，请重新选择",
+    "err.cam-open": "{detail} 打不开——如果是虚拟摄像头，请先启动它的宿主程序（如 Mikey 客户端）；否则可能正被其他程序占用",
+    "err.ffmpeg-died": "录制进程没有写出任何画面",
   },
 
   en: {
@@ -215,7 +234,7 @@ const I18N = {
     "sources.emptyHint": "Add a window, the desktop or a camera to start recording.",
 
     "history.clear": "Clear…",
-    "history.clearArmed": "Click again to clear",
+    "history.clearArmed": "Click again to delete the files",
     "log.clear": "Clear…",
     "log.clearArmed": "Click again to clear",
     "history.emptyTitle": "Nothing recorded yet",
@@ -233,8 +252,11 @@ const I18N = {
     "params.encoder": "Video encoder",
     "params.encoderAuto": "Auto",
     "params.encoderAutoWith": "Auto ({name})",
+    "params.ffmpegPath": "ffmpeg path",
+    "params.ffmpegPathHint": "Empty = look in PATH; a path here wins",
+    "params.ffmpegPick": "Choose the ffmpeg executable",
     "params.marks": "Mouse effects",
-    "params.marksHint": "Draw clicks and drags onto the recording",
+    "params.marksHint": "Draw click ripples and drag trails into the recording",
     "params.countdown": "Countdown",
     "params.raise": "Raise windows",
     "params.raiseHint": "Minimized windows are always brought back at record time",
@@ -267,11 +289,11 @@ const I18N = {
     "picker.systemAudio": "System audio",
     "picker.systemAudioMeta": "everything the speakers play",
     "picker.micMeta": "microphone",
-    "picker.windowSound": "this window's sound",
     "picker.desktopAll": "Entire desktop",
     "picker.allDisplays": "All displays",
     "picker.none": "No matches",
     "picker.bgCapable": "keeps recording when covered",
+    "picker.noSignal": "no signal — start its host app",
     "picker.added": "Added · {meta}",
     "picker.addedTitle": "Already in the list",
 
@@ -285,17 +307,26 @@ const I18N = {
     "row.editLabel": "Edit source: {name}",
     "row.remove": "Remove",
     "row.sizeUnknown": "Size unknown",
+    "row.cropDropped": "The crop is larger than the picture; the whole frame is recorded",
+    "row.soundOn": "Sound is in the file — click to mute",
+    "row.soundOff": "Picture only — click to record sound",
+    "row.soundDesktop": "the desktop records all system sound",
 
     "editor.close": "Close",
     "editor.crop": "Crop",
+    "editor.sound": "Mute",
+    "editor.soundHint": "On means this file carries picture only, no sound",
     "editor.cropOpen": "Adjust crop…",
     "editor.cancel": "Cancel",
     "editor.save": "Save",
     "editor.size": "Output {w} × {h}",
+    "editor.sizeWhole": "Output whole frame (crop too large)",
     "editor.sizeUnknown": "Size unknown",
     "editor.loading": "Taking a still…",
     "editor.noStill": "No still available for this source",
-    "preview.minimized": "Window is minimized, so there is no still; the crop uses the size the take records at",
+    "editor.restoreWindow": "Restore window",
+    "preview.minimized": "This window is minimized, so Windows is not drawing it and there is nothing to crop against. Restore it first.",
+    "preview.recycled": "This handle belongs to another process's window now — add the source again",
     "preview.camera": "A camera has no still preview",
     "preview.audio": "A sound source has no picture",
 
@@ -303,6 +334,8 @@ const I18N = {
     "crop.oneToOne": "1 px = 1 source px",
     "crop.back": "Back",
     "crop.source": "Source {w} × {h}",
+    "crop.dropped": "whole frame",
+    "crop.droppedHint": "The crop is larger than the picture, so this file records the whole frame",
     "crop.noSource": "No picture available",
     "crop.zoomIn": "Zoom in",
     "crop.zoomOut": "Zoom out",
@@ -387,6 +420,11 @@ const I18N = {
     "err.not-a-take": "That is not a take folder: {detail}",
     "err.delete-failed": "Could not delete: {detail}",
     "err.log-entry-gone": "That log entry is already gone",
+    "err.cam-no-signal": "{detail} is registered but sends no video — start its host app (e.g. the Mikey client), then record again",
+    "err.cam-not-mf": "{detail} is a DirectShow virtual camera that the Windows backend cannot see — record it on the ffmpeg backend",
+    "err.device-gone": "No device named {detail} — it may be unplugged or renamed; pick it again",
+    "err.cam-open": "{detail} could not be opened — if it is a virtual camera, start its host app (e.g. the Mikey client); otherwise it may be in use by another app",
+    "err.ffmpeg-died": "the recording process wrote no frames",
   },
 };
 
@@ -441,6 +479,19 @@ function uiErrorText(err) {
     return t(err.code, { detail: err.detail == null ? "" : String(err.detail) });
   }
   return String(err);
+}
+
+/// A bare error string from the core (`Outcome.error` and friends) may be a
+/// `diagnose` code with its device name (`err.cam-no-signal|Mikey Cam`).
+/// Translate those too; anything else is already the sentence.
+function codeText(raw) {
+  const s = String(raw ?? "");
+  const at = s.indexOf("|");
+  if (at > 0) {
+    const code = s.slice(0, at);
+    if (/^err\.[a-z-]+$/.test(code)) return t(code, { detail: s.slice(at + 1) });
+  }
+  return s;
 }
 
 /// How a shortcut is shown to a person: `control+alt+KeyR` (what the plugin

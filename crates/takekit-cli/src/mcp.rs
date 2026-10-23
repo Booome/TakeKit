@@ -107,7 +107,9 @@ fn tools_call(params: &Value) -> Result<Value, String> {
             // optional trim and rates). Nulls left out so the server's own
             // defaults apply.
             let mut body = json!({});
-            for key in ["kind", "target", "monitor", "crop", "fps", "quality"] {
+            for key in [
+                "kind", "target", "monitor", "crop", "fps", "quality", "sound",
+            ] {
                 if let Some(value) = args.get(key) {
                     if !value.is_null() {
                         body[key] = value.clone();
@@ -137,6 +139,7 @@ fn tools_call(params: &Value) -> Result<Value, String> {
                 "countdown_secs",
                 "finalize_panel",
                 "out_root",
+                "ffmpeg_path",
                 "encoder",
                 "backend",
                 "marks",
@@ -262,6 +265,9 @@ fn tool_list() -> Vec<Value> {
             "description": "Add one source. Windows and cameras are matched by a name/title \
                             substring; a unique hit is added, several hits are listed back. \
                             mics match a device name; system-audio needs no target. \
+                            sound=true records this source's sound into the same file \
+                            (one source, one file, two streams): a window's own process \
+                            tree, or the whole machine's sound for the desktop. \
                             The panel shows the source the moment it is added.",
             "inputSchema": object(
                 json!({
@@ -271,6 +277,7 @@ fn tool_list() -> Vec<Value> {
                     "crop": prop("edges to trim: {top,bottom,left,right} in pixels (pictures only)", "object"),
                     "fps": prop("frames per second, default 30", "number"),
                     "quality": prop("per-source quality override", "number"),
+                    "sound": prop("kind=window or desktop: also record its sound into the same file (per-process loopback for a window, system sound for the desktop)", "boolean"),
                 }),
                 &["kind"],
             ),
@@ -299,9 +306,10 @@ fn tool_list() -> Vec<Value> {
                     "countdown_secs": prop("countdown before recording, 0 = off", "number"),
                     "finalize_panel": prop("full-screen stop checklist", "boolean"),
                     "out_root": prop("where takes are written", "string"),
+                    "ffmpeg_path": prop("where ffmpeg lives, null = PATH lookup", "string"),
                     "encoder": prop("nvenc | qsv | amf | x264 | null for auto", "string"),
                     "backend": prop("windows | ffmpeg", "string"),
-                    "marks": prop("draw click effects into the recording", "boolean"),
+                    "marks": prop("mouse effects: draw click ripples and drag trails into the recording", "boolean"),
                     "raise_sources": prop("bring windows to the front before recording", "boolean"),
                     "language": prop("zh | en", "string"),
                     "theme": prop("auto | light | dark", "string"),

@@ -6,7 +6,7 @@
 //! conversion.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -46,7 +46,12 @@ pub struct CameraCapture {
 
 impl CameraCapture {
     /// Start capturing `link` into `out`.
-    pub fn start(link: &str, fps: u32, out: Sender<MediaFrame>, clock: TakeClock) -> Result<Self> {
+    pub fn start(
+        link: &str,
+        fps: u32,
+        out: SyncSender<MediaFrame>,
+        clock: TakeClock,
+    ) -> Result<Self> {
         let (ready, opened) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
@@ -170,7 +175,7 @@ fn pump(
     width: u32,
     height: u32,
     stop: Arc<AtomicBool>,
-    out: Sender<MediaFrame>,
+    out: SyncSender<MediaFrame>,
     clock: TakeClock,
 ) -> Result<()> {
     // Bridged once, at the first sample: the camera's clock counts from its
@@ -185,16 +190,16 @@ fn pump(
         };
         let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(time));
         let data = sample_bytes(&sample)?;
-        if out
-            .send(MediaFrame::Video(VideoFrame {
+        if !crate::frame::offer(
+            &out,
+            MediaFrame::Video(VideoFrame {
                 width,
                 height,
                 format: PixelFormat::Nv12,
                 data,
                 time: time - anchor,
-            }))
-            .is_err()
-        {
+            }),
+        ) {
             // The writer is gone; there is nowhere to put the frames.
             return Ok(());
         }

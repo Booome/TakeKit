@@ -180,6 +180,21 @@ impl Journal {
         }
     }
 
+    /// The journal half of a destructive history clear: rows whose folders are
+    /// gone from disk go, and every log link pointing at one of those folders
+    /// goes with them (same rule as `take_delete`). Rows whose folders refused
+    /// to die stay — they are the panel's only record that something is still
+    /// on disk — and a take that landed mid-clear is never in `deleted`, so it
+    /// keeps its row too.
+    pub fn sweep_deleted_takes(&mut self, deleted: &std::collections::HashSet<String>) {
+        self.takes.retain(|t| !deleted.contains(&t.dir));
+        for e in &mut self.log {
+            if e.dir.as_deref().is_some_and(|d| deleted.contains(d)) {
+                e.dir = None;
+            }
+        }
+    }
+
     /// One log line out of the register, by the `at` stamp it carries — the
     /// only identity the record has, and what the row's delete button sends.
     /// First match wins: two lines written in the same millisecond are
@@ -397,6 +412,42 @@ mod tests {
         j.clear(Pane::Takes);
         assert!(j.takes.is_empty());
         assert_eq!(j.log.len(), 1);
+    }
+
+    #[test]
+    fn sweeping_deleted_takes_drops_their_rows_and_log_links() {
+        let mut j = Journal::default();
+        j.push_take(take(1));
+        j.push_take(take(2));
+        let mut linked = entry(10, "a");
+        linked.dir = Some(r"C:\takes\1".to_string());
+        j.push_log(linked);
+        let mut unlinked = entry(11, "b");
+        unlinked.dir = Some(r"C:\takes\2".to_string());
+        j.push_log(unlinked);
+
+        let deleted = std::collections::HashSet::from([r"C:\takes\1".to_string()]);
+        j.sweep_deleted_takes(&deleted);
+
+        // The row for the deleted folder goes; the other stays.
+        assert_eq!(j.takes.len(), 1);
+        assert_eq!(j.takes[0].at, 2);
+        // The log entry itself is history and stays; only its now-dead
+        // "open the folder" link is dropped.
+        assert_eq!(j.log.len(), 2);
+        assert_eq!(j.log[1].dir, None);
+        assert_eq!(j.log[0].dir.as_deref(), Some(r"C:\takes\2"));
+    }
+
+    #[test]
+    fn sweeping_never_touches_a_take_that_landed_mid_clear() {
+        let mut j = Journal::default();
+        j.push_take(take(1));
+        // A take finishing while the clear runs is not in `deleted` (the
+        // clear never saw its folder), so its row must survive the sweep.
+        let deleted = std::collections::HashSet::new();
+        j.sweep_deleted_takes(&deleted);
+        assert_eq!(j.takes.len(), 1);
     }
 
     #[test]

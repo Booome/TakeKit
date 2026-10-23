@@ -89,7 +89,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 |---|---|---|---|
 | `GET /state` | `status` + `config_get` + `journal_get` | — | 全量快照（§5.2） |
 | `GET /devices?kind=window\|desktop\|camera\|mic\|system-audio\|window-audio` | `list_windows` / `list_devices` / `list_mics` | — | 可加入的候选列表 |
-| `POST /sources` | `save_session` 的单源版 | 原生 `Source` JSON，或便捷 spec（`{kind, target?, monitor?, crop?, fps?, quality?}`，服务端解析 hwnd）；**带 `capture` 字段即按原生 Shape 解析**，否则按 spec | 新快照 |
+| `POST /sources` | `save_session` 的单源版 | 原生 `Source` JSON，或便捷 spec（`{kind, target?, monitor?, crop?, fps?, quality?, sound?}`，服务端解析 hwnd）；**带 `capture` 字段即按原生 Shape 解析**，否则按 spec。`kind: "window"` + `sound: true` = 该窗口的声音写进它自己的文件（一条源、一个文件、两条流）；`kind: "desktop"` + `sound: true` 同理，写的是**整台机器的系统声音**（Windows 没有分显示器的音频）；`kind: "window-audio"` / `"system-audio"` 仍保留，用于只录声音不要画面 | 新快照 |
 | `DELETE /sources/{index}` | 同上 | — | 新快照 |
 | `PUT /sources` | `save_session` | `Source[]` | 新快照 |
 | `PATCH /config` | `set_*` 系列合并 | Config 子集 | 新快照 |
@@ -141,7 +141,7 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
     {
       "index": 0,
       "id": "win",
-      "capture": { "Window": { "hwnd": 131542, "title": "微信",
+      "capture": { "Window": { "hwnd": 131542, "pid": 20488, "title": "微信",
                                "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
       "fps": 30,
       "quality": null
@@ -186,6 +186,12 @@ Agent 听到的是「微信窗口」，`Source` 要的是 `hwnd`。所以 `list_
 `takekit_add_source` 接受**标题子串**并在服务端解析：
 唯一命中 → 直接用；多个命中 → 返回候选列表让 Agent 消歧；零命中 → 报错附上当前可见窗口标题。
 （与 CLI `--window` 的标题匹配语义一致，不发明新规则。）
+
+**身份 = `hwnd` + `pid`，不是标题**（2026-10-23）：标题随时会变（VS Code 换文件、Chrome 换标签），
+所以 `capture.Window.title` 只是「最后一次看到的标题」这块**显示缓存**——解析和录制从不按它回落。
+句柄没了就报错让 Agent 重新加源；按旧标题去猜同名窗口比失败更糟，那会静默录到别人的窗口。
+`pid` 在 `list_devices` 的返回里本来就有，加源时服务端一并写入；`pid: 0` 是旧配置的「不知道」，
+退化成只校验句柄（不认新不认旧，也不用它拒绝任何东西）。
 
 ### 6.2 错误面：机器说一种话
 

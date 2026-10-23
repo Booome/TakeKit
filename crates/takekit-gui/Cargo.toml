@@ -18,6 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 rfd = "0.17.2"
 tauri-plugin-global-shortcut = "2"
+# A second launch must not open a second panel over the first: the plugin
+# keeps a Windows named mutex and forwards the launch to the running
+# instance's callback (which just raises the window), and the newcomer exits.
+tauri-plugin-single-instance = "2"
 # The agent's control surface (docs/agent-control.md): a loopback HTTP server.
 # tiny_http rather than an async stack because the routes call the same
 # blocking functions the panel's commands do, one request at a time — see the

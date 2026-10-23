@@ -11,7 +11,7 @@
 //! completion handler rendezvous with the caller.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -72,7 +72,7 @@ pub struct LoopbackCapture {
 impl LoopbackCapture {
     pub fn start(
         target: LoopbackTarget,
-        out: Sender<MediaFrame>,
+        out: SyncSender<MediaFrame>,
         clock: TakeClock,
     ) -> Result<Self> {
         let (ready, opened) = std::sync::mpsc::channel();
@@ -306,7 +306,7 @@ fn pump(
     client: &IAudioClient,
     capture: &IAudioCaptureClient,
     stop: Arc<AtomicBool>,
-    out: Sender<MediaFrame>,
+    out: SyncSender<MediaFrame>,
     clock: TakeClock,
 ) -> Result<()> {
     // SAFETY: starting and stopping the client only moves its state.
@@ -350,13 +350,13 @@ fn pump(
             // WASAPI's device time is in 100 ns units, the take's timeline too.
             let device_time = device_time as i64;
             let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(device_time));
-            if out
-                .send(MediaFrame::Audio(AudioChunk {
+            if !crate::frame::offer(
+                &out,
+                MediaFrame::Audio(AudioChunk {
                     data: chunk,
                     time: device_time - anchor,
-                }))
-                .is_err()
-            {
+                }),
+            ) {
                 break;
             }
         }

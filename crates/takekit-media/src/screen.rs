@@ -10,7 +10,7 @@
 //! the frame callback: the callback may simply not be running.
 
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 use windows_capture::capture::{CaptureControl, GraphicsCaptureApiHandler};
@@ -52,7 +52,7 @@ impl ScreenCapture {
     pub fn start(
         target: ScreenTarget,
         fps: u32,
-        out: Sender<MediaFrame>,
+        out: SyncSender<MediaFrame>,
         clock: TakeClock,
     ) -> Result<Self> {
         let interval =
@@ -196,11 +196,15 @@ pub fn monitor_index_for(x: i32, y: i32, w: u32, h: u32) -> Option<usize> {
         .map(|m| m.index)
 }
 
-type HandlerFlags = (std::sync::Arc<AtomicBool>, Sender<MediaFrame>, TakeClock);
+type HandlerFlags = (
+    std::sync::Arc<AtomicBool>,
+    SyncSender<MediaFrame>,
+    TakeClock,
+);
 
 struct Handler {
     stop: std::sync::Arc<AtomicBool>,
-    out: Sender<MediaFrame>,
+    out: SyncSender<MediaFrame>,
     clock: TakeClock,
 }
 
@@ -242,15 +246,19 @@ impl GraphicsCaptureApiHandler for Handler {
         let mut unpadded = Vec::new();
         let data = buffer.as_nopadding_buffer(&mut unpadded).to_vec();
 
-        // A full queue means the writer is behind; dropping the frame keeps the
-        // take going at the cost of one frame rather than blocking the capture.
-        let _ = self.out.send(MediaFrame::Video(VideoFrame {
-            width,
-            height,
-            format: PixelFormat::Bgra,
-            data,
-            time,
-        }));
+        // A full queue means the writer is behind; `offer` drops the frame —
+        // keeping the take going at the cost of one frame rather than blocking
+        // the capture — and says no only when the writer is gone.
+        crate::frame::offer(
+            &self.out,
+            MediaFrame::Video(VideoFrame {
+                width,
+                height,
+                format: PixelFormat::Bgra,
+                data,
+                time,
+            }),
+        );
         Ok(())
     }
 }

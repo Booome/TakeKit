@@ -73,6 +73,15 @@ pub enum Capture {
     /// whole window, frame included — the picture it makes on screen.
     Window {
         hwnd: isize,
+        /// The process that owned the handle when the source was added.
+        ///
+        /// Windows recycles handle numbers, so a bare `hwnd` can outlive its
+        /// window and point at a stranger's — the one failure that would be
+        /// recorded silently. `0` means "not known", which is what every
+        /// config written before this field says; such a source keeps the old
+        /// handle-only check rather than being refused.
+        #[serde(default)]
+        pid: u32,
         title: String,
         crop: Crop,
     },
@@ -85,7 +94,14 @@ pub enum Capture {
     SystemAudio {},
     /// The sound of one window's process tree, e.g. a game with its own music
     /// while a tutorial plays in the browser. Same loopback route, filtered.
-    WindowAudio { hwnd: isize, title: String },
+    WindowAudio {
+        hwnd: isize,
+        /// Same reason as `Window`: the process is what makes the handle mean
+        /// something, and getting it wrong listens to the wrong app.
+        #[serde(default)]
+        pid: u32,
+        title: String,
+    },
 }
 
 impl Capture {
@@ -123,8 +139,11 @@ impl Capture {
                 rect: *rect,
                 crop: edges,
             },
-            Capture::Window { hwnd, title, .. } => Capture::Window {
+            Capture::Window {
+                hwnd, pid, title, ..
+            } => Capture::Window {
                 hwnd: *hwnd,
+                pid: *pid,
                 title: title.clone(),
                 crop: edges,
             },
@@ -144,6 +163,17 @@ impl Capture {
             self,
             Capture::Mic { .. } | Capture::SystemAudio {} | Capture::WindowAudio { .. }
         )
+    }
+
+    /// The name of the thing being recorded, for error messages: a device or
+    /// a window title. `None` for the desktop — "the desktop" needs no name
+    /// to be recognised in a failure.
+    pub fn device_name(&self) -> Option<&str> {
+        match self {
+            Capture::Camera { device, .. } | Capture::Mic { device } => Some(device),
+            Capture::Window { title, .. } | Capture::WindowAudio { title, .. } => Some(title),
+            Capture::Desktop { .. } | Capture::SystemAudio {} => None,
+        }
     }
 
     /// The extension this source's file is written with. Video follows the
@@ -185,6 +215,13 @@ pub struct Source {
     /// Per-source quality override; `None` uses the session-wide quality.
     #[serde(default)]
     pub quality: Option<u8>,
+    /// Write this source's own sound into its file, alongside the picture.
+    ///
+    /// Only a window knows what "its own sound" means — its process tree,
+    /// through WASAPI's per-process loopback — so this is honoured there and
+    /// refused elsewhere rather than silently ignored.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 impl Source {
@@ -194,6 +231,7 @@ impl Source {
             capture,
             fps,
             quality: None,
+            audio: false,
         }
     }
 
@@ -205,7 +243,9 @@ impl Source {
             Capture::Desktop { rect, crop } => {
                 Some(crop.cropped(rect.unwrap_or_else(virtual_screen_rect)))
             }
-            Capture::Window { hwnd, title, crop } => resolve_window(*hwnd, title)
+            Capture::Window {
+                hwnd, pid, crop, ..
+            } => resolve_window(*hwnd, *pid)
                 .ok()
                 .map(|w| crop.cropped(w.rect)),
             Capture::Camera { .. }
@@ -229,8 +269,10 @@ impl Source {
                 args.extend(["-vf".into(), filter_chain(filters)]);
                 Ok((args, None))
             }
-            Capture::Window { hwnd, title, crop } => {
-                let win = resolve_window(*hwnd, title)?;
+            Capture::Window {
+                hwnd, pid, crop, ..
+            } => {
+                let win = resolve_window(*hwnd, *pid)?;
                 // Captured at the cropped rectangle, not at the window plus a
                 // crop filter: `cropped` already moved the origin, so filtering
                 // again would offset a second time and ask for a rectangle
@@ -423,7 +465,19 @@ pub fn preview(capture: &Capture) -> Preview {
                 }
             }
         }
-        Capture::Window { hwnd, title, .. } => {
+        Capture::Window {
+            hwnd, pid, title, ..
+        } => {
+            // A recycled handle is a different window wearing the number: a
+            // still of it would look perfectly fine and be the wrong source.
+            if !owns_window(*hwnd, *pid) {
+                return Preview {
+                    width: 0,
+                    height: 0,
+                    frame: None,
+                    reason: Some("preview.recycled".into()),
+                };
+            }
             let size = window_capture_size(*hwnd);
             let (width, height) = size.as_ref().map(|(w, h)| (*w, *h)).unwrap_or((0, 0));
             if width == 0 || height == 0 {
@@ -809,28 +863,81 @@ pub fn z_rank_of(hwnd: isize) -> Option<usize> {
 
 /// Resolve a title substring to exactly one window.
 ///
-/// Our own process is excluded for the same reason the picker excludes it: a
-/// remembered source that falls back to a title (its handle died) must never
-/// resolve to the panel that is running the recording.
+/// Only for *adding* a source — the CLI's `--title` and the picker. A
+/// remembered source is never re-resolved this way (see `resolve_window`):
+/// titles move, so a match on one says nothing about which window was chosen.
+///
+/// Our own process is excluded for the same reason the picker excludes it: the
+/// panel is a window too, and a take of it can only ever be blank.
 pub fn find_window(needle: &str) -> Result<WindowItem, String> {
     pick_only(list_windows(needle, Some(std::process::id())), needle)
 }
 
-/// The window a source points at.
+/// The window a source points at, by handle — and by the process that handle
+/// belonged to when the source was added.
 ///
-/// The handle is the identity, because two windows can share a title. A live
-/// handle wins even when the title has changed — browser tabs, editors adding
-/// an unsaved marker and every app that rewrites its caption would otherwise
-/// stop resolving, and the take would report a window it can see as missing.
+/// The handle is the identity, because two windows can share a title: a live
+/// handle wins even when the title has changed (browser tabs, editors adding an
+/// unsaved marker and every app that rewrites its caption would otherwise stop
+/// resolving, and the take would report a window it can see as missing).
 ///
-/// The title is only a fallback for the one case the handle cannot cover: the
-/// window is gone (or not capturable), which is also what a remembered source
-/// looks like after its app restarted.
-pub fn resolve_window(hwnd: isize, title: &str) -> Result<WindowItem, String> {
-    if let Ok(w) = window_by_hwnd(hwnd) {
-        return Ok(w);
+/// The process is the second half of that identity. Windows recycles handle
+/// numbers, so `IsWindow` alone answers "yes" for a stranger that inherited the
+/// number; the title used to be the fallback for a dead handle, which is worse
+/// than useless — it *launders* a recycled handle into a confident-looking
+/// match on whatever window happens to share the caption now, and it fails
+/// outright for the very apps whose titles move. A source whose window is gone
+/// is a source the user has to re-add, not one to guess about.
+pub fn resolve_window(hwnd: isize, pid: u32) -> Result<WindowItem, String> {
+    let window = window_by_hwnd(hwnd)?;
+    if pid != 0 && window.pid != pid {
+        // The number is alive but the window is not the one we remembered.
+        return Err(format!(
+            "window {hwnd} is now another process's (was pid {pid}, is pid {})",
+            window.pid
+        ));
     }
-    find_window(title).map_err(|e| format!("window {hwnd} \"{title}\": {e}"))
+    Ok(window)
+}
+
+/// Whether the handle still belongs to the process a source remembers.
+///
+/// Split out from `resolve_window` because status polling must not resolve: it
+/// would restore the user's minimized windows just to ask a question.
+pub fn owns_window(hwnd: isize, pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    takekit_media::loopback::window_pid(hwnd) == Some(pid)
+}
+
+/// The handle exists and is still that process's — no client area, no restore.
+///
+/// This is the whole check for a *sound* source: per-process loopback keeps
+/// working while the window is minimized, covered or on another desktop, so
+/// demanding a visible client area would refuse sources that record fine, and
+/// restoring one would move the user's screen just to answer a yes/no question.
+pub fn window_is_alive(hwnd: isize, pid: u32) -> bool {
+    // SAFETY: one handle query on a stale handle; answers `false`.
+    let exists = unsafe { IsWindow(Some(HWND(hwnd as *mut core::ffi::c_void))).as_bool() };
+    exists && owns_window(hwnd, pid)
+}
+
+/// A window's current caption, read without touching it.
+///
+/// This is what a row shows, and it changes under the row all the time: switch
+/// a file in an editor or a tab in a browser and the caption follows. It is
+/// deliberately *not* `window_by_hwnd`, which restores a minimized window as
+/// part of resolving — refreshing a label must never pull a window back onto
+/// the user's screen. `None` means the handle is gone, so the caller keeps
+/// showing the last title it knew.
+pub fn live_title(hwnd: isize) -> Option<String> {
+    let handle = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: one handle query and one text read; a stale handle answers false.
+    if !unsafe { IsWindow(Some(handle)).as_bool() } {
+        return None;
+    }
+    Some(window_title(handle))
 }
 
 /// Whether this capture can still be recorded for real.
@@ -847,14 +954,13 @@ pub fn resolve_window(hwnd: isize, title: &str) -> Result<WindowItem, String> {
 /// itself reports a device that is gone.
 pub fn is_recordable(capture: &Capture) -> bool {
     match capture {
-        Capture::Window { hwnd, .. } => live_window(HWND(*hwnd as *mut core::ffi::c_void)),
+        Capture::Window { hwnd, pid, .. } => {
+            owns_window(*hwnd, *pid) && live_window(HWND(*hwnd as *mut core::ffi::c_void))
+        }
         // Sound keeps playing from a window that is covered, minimized or on
         // another virtual desktop — unlike the picture, which stops. Only a
         // window that is gone takes its process's audio with it.
-        Capture::WindowAudio { hwnd, .. } => {
-            // SAFETY: one handle query on a stale handle; answers `false`.
-            unsafe { IsWindow(Some(HWND(*hwnd as *mut core::ffi::c_void))).as_bool() }
-        }
+        Capture::WindowAudio { hwnd, pid, .. } => window_is_alive(*hwnd, *pid),
         Capture::Desktop { .. }
         | Capture::Camera { .. }
         | Capture::Mic { .. }
@@ -1277,6 +1383,7 @@ mod tests {
     fn a_window_that_is_gone_is_not_recordable() {
         let gone = Capture::Window {
             hwnd: 0,
+            pid: 0,
             title: "TakeKit no such window".to_string(),
             crop: Crop::default(),
         };
@@ -1416,6 +1523,8 @@ mod tests {
         let window = TestWindow::open();
         let capture = Capture::Window {
             hwnd: window.hwnd(),
+            // The test window is this process's own.
+            pid: std::process::id(),
             title: "TakeKit test window".to_string(),
             crop: Crop::default(),
         };
@@ -1450,6 +1559,8 @@ mod tests {
         let window = TestWindow::open();
         let capture = Capture::Window {
             hwnd: window.hwnd(),
+            // The test window is this process's own.
+            pid: std::process::id(),
             title: "TakeKit test window".to_string(),
             crop: Crop::default(),
         };
@@ -1636,12 +1747,78 @@ mod tests {
     fn a_window_capture_keeps_its_handle() {
         let capture = Capture::Window {
             hwnd: 4660,
+            pid: 4242,
             title: "Editor".to_string(),
             crop: Crop::default(),
         };
         let json = serde_json::to_string(&capture).unwrap();
         assert!(json.contains("\"hwnd\":4660"), "{json}");
+        assert!(json.contains("\"pid\":4242"), "{json}");
         assert_eq!(serde_json::from_str::<Capture>(&json).unwrap(), capture);
+    }
+
+    /// Configs written before `pid` existed have no such field, and they must
+    /// keep loading: a source that suddenly cannot be read would take the whole
+    /// saved list down with it.
+    #[test]
+    fn a_window_capture_without_a_pid_still_loads() {
+        let json = r#"{"Window":{"hwnd":4660,"title":"Editor","crop":{"top":0,"bottom":0,"left":0,"right":0}}}"#;
+        let capture: Capture = serde_json::from_str(json).unwrap();
+        match capture {
+            Capture::Window { hwnd, pid, .. } => {
+                assert_eq!(hwnd, 4660);
+                assert_eq!(pid, 0, "an unknown owner is 0, not a refusal");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The handle is checked against the process it belonged to: Windows
+    /// recycles handle numbers, and a stranger wearing one is exactly the
+    /// wrong window to record.
+    #[test]
+    #[ignore = "shows a real window; run by hand on an interactive desktop"]
+    fn a_window_handle_owned_by_another_process_is_refused() {
+        let _turn = INTERACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let window = TestWindow::open();
+        let mine = std::process::id();
+        let resolved = resolve_window(window.hwnd(), mine).expect("our own window resolves");
+        assert_eq!(resolved.hwnd, window.hwnd());
+        let refused = resolve_window(window.hwnd(), mine + 1);
+        assert!(
+            refused.is_err(),
+            "a recycled handle must not resolve: {refused:?}"
+        );
+        // 0 is the "unknown owner" of every older config: handle-only, as before.
+        assert!(resolve_window(window.hwnd(), 0).is_ok());
+    }
+
+    /// Reading a caption for the row must never touch the window: `resolve`
+    /// restores a minimized window, and a label refresh that did so would pull
+    /// windows back onto the user's screen every couple of seconds.
+    #[test]
+    #[ignore = "shows a real window; run by hand on an interactive desktop"]
+    fn reading_a_title_does_not_unminimize() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_MINIMIZE, ShowWindow};
+
+        let _turn = INTERACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let window = TestWindow::open();
+        let before = live_title(window.hwnd());
+        assert!(before.is_some(), "a plain window has a caption");
+        unsafe {
+            let _ = ShowWindow(window.handle, SW_MINIMIZE);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let during = live_title(window.hwnd());
+        assert!(
+            unsafe { IsIconic(window.handle).as_bool() },
+            "reading a title restored the window"
+        );
+        assert_eq!(
+            before, during,
+            "the caption is still readable while minimized"
+        );
+        assert!(live_title(0).is_none(), "a dead handle has no title");
     }
 
     /// `hwdownload` is how a Desktop Duplication frame leaves the GPU, and only

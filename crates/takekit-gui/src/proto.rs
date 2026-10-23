@@ -117,6 +117,18 @@ impl UiError {
             detail: Some(detail.to_string()),
         }
     }
+
+    /// A `diagnose` code string (`err.cam-no-signal|Mikey Cam`) unpacked into
+    /// the same shape a hand-written error gets — so the panel translates the
+    /// code and the machine face explains it, no matter which layer raised it.
+    /// `None` when the string carries no code.
+    pub fn from_code_string(text: &str) -> Option<Self> {
+        let (code, detail) = takekit_core::diagnose::split(text);
+        (!code.is_empty()).then(|| Self {
+            code: code.to_string(),
+            detail: Some(detail.to_string()),
+        })
+    }
 }
 
 impl std::fmt::Display for UiError {

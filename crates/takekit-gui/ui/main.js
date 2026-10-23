@@ -115,6 +115,18 @@ function isAudio(capture) {
   return Boolean(capture.Mic || capture.SystemAudio || capture.WindowAudio);
 }
 
+// Whether this source can carry sound at all. Only a window can: its process
+// tree is what "its own sound" means, which is why the speaker shows up on a
+// window row and nowhere else. Note this asks what the source *could* do —
+// whether it currently does is `source.audio`, and the row has to keep
+// offering the switch after it is turned off, or it could never go back on.
+function canCarrySound(source) {
+  // A window brings its own process tree; the desktop brings everyone's.
+  // Windows has no per-monitor sound, so a desktop source's sound is the whole
+  // machine's — which is why the option belongs here and not on a monitor.
+  return Boolean(source.capture.Window || source.capture.Desktop);
+}
+
 // A remembered source carries no display text — only what the core needs — so
 // the row labels are derived back from the capture spec.
 // The size of the picture a take of this source records — the same pixels the
@@ -143,7 +155,37 @@ function geometryOf(capture) {
   const crop = cropOf(capture);
   const cropped = crop.top || crop.bottom || crop.left || crop.right;
   if (!cropped) return `${size.w}×${size.h}`;
+  // Edges that no longer fit (the window shrank, or the crop came from the CLI
+  // and never fitted) are dropped by the writer — `CropBox::rect_in` records
+  // the whole frame rather than a two-pixel sliver. So the row must print the
+  // whole frame too: `→ -2280×1392` described a file that never exists.
+  if (!cropFits(capture)) return `${size.w}×${size.h}`;
   return `${size.w}×${size.h} → ${size.w - crop.left - crop.right}×${size.h - crop.top - crop.bottom}`;
+}
+
+/** Whether the picked edges leave a frame the writer will actually keep. */
+function cropFits(capture) {
+  const size = frameSize(capture);
+  if (!size) return true;
+  return fitsIn(cropOf(capture), size.w, size.h);
+}
+
+/**
+ * The same test against a bare draft and a bare size — the card works on a
+ * draft, the row works on a capture, and both have to answer alike.
+ * `CropBox::rect_in` keeps a crop of two pixels or more and drops anything
+ * smaller, so "fits" is 2, not 1.
+ */
+function fitsIn(crop, width, height) {
+  if (!width || !height) return true;
+  const out = outputSize(crop, width, height);
+  return out.w >= 2 && out.h >= 2;
+}
+
+/** Whether anything is trimmed at all — the test the row and the card share. */
+function isCropped(capture) {
+  const c = cropOf(capture);
+  return Boolean(c.top || c.bottom || c.left || c.right);
 }
 
 // What the row says (2026-10-21 方案 A): identity on the left, comparable
@@ -213,7 +255,13 @@ function captureKey(capture) {
 // names stay snake_case: Tauri does not rename them.
 function sessionParams() {
   return {
-    sources: state.sources.map(({ id, capture, fps, quality }) => ({ id, capture, fps, quality })),
+    sources: state.sources.map(({ id, capture, fps, quality, audio }) => ({
+      id,
+      capture,
+      fps,
+      quality,
+      audio: Boolean(audio),
+    })),
     out_root: state.outRoot,
     encoder: state.encoder,
     backend: state.backend,
@@ -237,7 +285,7 @@ function persist() {
 // No display text is stored: the row derives its label from the capture spec
 // on every render (see `labelFor`), so a language switch relabels as it goes.
 function addSource(id, capture) {
-  state.sources.push({ id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY });
+  state.sources.push({ id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY, audio: false });
   preheatFor(capture);
   persist();
   render();
@@ -297,6 +345,67 @@ async function pruneSources() {
   PROBE(`sources-pruned:${gone}`);
   return gone;
 }
+
+// A window's caption moves under the row all the time: VS Code puts the open
+// file in it, Chrome the active tab. The handle is the identity, so nothing
+// about *which* window gets recorded can drift — but the label was captured
+// when the source was added, and it would go on naming a file the user left an
+// hour ago (2026-10-23).
+//
+// Only the label, and only in memory: config.json is the truth for everything
+// a take reads, and a value that changes when the user clicks a tab has no
+// business rewriting that file every couple of seconds. The next launch
+// re-derives it, which is why dropping it costs nothing.
+let titlesInflight = false;
+async function refreshTitles() {
+  if (titlesInflight || state.recording || state.sources.length === 0) return;
+  if (document.visibilityState !== "visible") return;
+  const watched = state.sources.filter((s) => s.capture.Window || s.capture.WindowAudio);
+  if (watched.length === 0) return;
+  titlesInflight = true;
+  let titles;
+  try {
+    titles = await invoke("source_titles", { captures: watched.map((s) => s.capture) });
+  } catch (e) {
+    console.error("source_titles", e);
+    return;
+  } finally {
+    titlesInflight = false;
+  }
+  let changed = false;
+  watched.forEach((s, i) => {
+    // `null` means the handle is gone; the last title it had beats a blank row
+    // for the moment before it is pruned.
+    const live = titles[i];
+    if (!live) return;
+    const slot = s.capture.Window || s.capture.WindowAudio;
+    if (slot.title === live) return;
+    slot.title = live;
+    changed = true;
+  });
+  if (!changed) return;
+  // The open editor carries its own copy of the name, or it would be the one
+  // stale place left on screen.
+  if (editor) {
+    const source = state.sources.find((s) => s.id === editor.id);
+    if (source) {
+      editor.name = labelFor(source.capture).name;
+      renderEditor();
+    }
+  }
+  render();
+}
+
+// Every 1.2 s: slow enough to be free, fast enough that a caption change looks
+// live. A setTimeout chain for the same reason `tickLoop` uses one.
+async function titleLoop() {
+  try {
+    await refreshTitles();
+  } finally {
+    setTimeout(titleLoop, 1200);
+  }
+}
+
 
 // One source's window can close or leave this desktop mid-take, and ffmpeg
 // would go on recording whatever is behind it. Stop that one where it stands —
@@ -368,6 +477,58 @@ function sourceTile(capture) {
   return tile;
 }
 
+// The row's speaker, same family as the tiles above (16px, 1.4 stroke). The
+// icon is the whole control: crossed out means this file has no sound, the
+// waves mean it does. No text — at 26px there is no room for a label, and the
+// tooltip does that job on hover.
+const SOUND_ICONS = {
+  on:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 6h2.2L7.5 3.2v9.6L4.2 10H2z" stroke-linejoin="round"/><path d="M10 6.2a2.4 2.4 0 0 1 0 3.6M12 4.5a5 5 0 0 1 0 7" stroke-linecap="round"/></svg>',
+  off:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 6h2.2L7.5 3.2v9.6L4.2 10H2z" stroke-linejoin="round"/><path d="M10.2 6.2l3.6 3.6M13.8 6.2l-3.6 3.6" stroke-linecap="round"/></svg>',
+};
+
+// One click flips the sound and nothing else: no editor round-trip. `audio`
+// is the field the core reads, so the write goes there directly; the editor's
+// "静音" switch is the same field seen from the other side (see `openEditor`).
+function soundToggle(source) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  const on = Boolean(source.audio);
+  btn.className = on ? "row-sound on" : "row-sound";
+  btn.innerHTML = SOUND_ICONS[on ? "on" : "off"];
+  // The desktop's sound is not "its own" the way a window's is: it is whatever
+  // the machine plays. Said in the tooltip, because that is the one place the
+  // difference can be explained without a second control.
+  const key = on ? "row.soundOn" : "row.soundOff";
+  btn.title = source.capture.Desktop
+    ? `${t(key)} · ${t("row.soundDesktop")}`
+    : t(key);
+  btn.setAttribute("aria-label", btn.title);
+  btn.setAttribute("aria-pressed", String(on));
+  btn.disabled = state.recording;
+  btn.addEventListener("click", (e) => {
+    // The row itself opens the editor; flipping the speaker is not that.
+    e.stopPropagation();
+    source.audio = !source.audio;
+    persist();
+    render();
+  });
+  return btn;
+}
+
+// The speaker's place on a row that has nothing to mute. It is an empty box of
+// exactly the same width, not a missing cell: the row is laid out from the
+// right, so anything of variable width left of the size column would move the
+// numbers every time a list mixed windows with microphones. A window, a
+// desktop, a microphone and a camera then all end at the same three columns.
+function soundSlot() {
+  const slot = document.createElement("span");
+  slot.className = "row-sound-slot";
+  slot.setAttribute("aria-hidden", "true");
+  return slot;
+}
+
 function render() {
   // While a take is running the transport bar stays on every tab: a timer and
   // a stop button you cannot see are how a recording gets forgotten.
@@ -380,6 +541,9 @@ function render() {
   for (const s of state.sources) {
     const row = document.createElement("div");
     row.className = "row";
+    // What the row is, for anything that needs to tell kinds apart without
+    // reading the icon's markup (the UI matrix does; nothing styles on it).
+    row.dataset.kind = kindOf(s.capture);
     // The whole row opens the source's editor. Before this, the row carried
     // two bare dropdowns whose values ("30", "Q20") said nothing about what
     // they were, and there was no room left for a third thing to set.
@@ -409,9 +573,14 @@ function render() {
     geo.className = label.geo ? "row-geo" : "row-geo dim";
     geo.textContent = label.geo || "—";
     // The prose that used to sit under the name now lives here: same column,
-    // same tooltip, never in the scanning lane.
-    if (label.note || !label.geo) {
-      geo.title = [label.geo || t("row.sizeUnknown"), label.note].filter(Boolean).join(" · ");
+    // same tooltip, never in the scanning lane. A crop that no longer fits
+    // says so here, because the number beside it is the whole frame and
+    // nothing about it looks trimmed.
+    const dropped = isCropped(s.capture) && !cropFits(s.capture);
+    if (label.note || !label.geo || dropped) {
+      geo.title = [label.geo || t("row.sizeUnknown"), label.note, dropped ? t("row.cropDropped") : ""]
+        .filter(Boolean)
+        .join(" · ");
     }
 
     const summary = document.createElement("div");
@@ -439,12 +608,25 @@ function render() {
     });
     row.addEventListener("keydown", (e) => {
       if (e.key !== "Enter" && e.key !== " ") return;
+      // The row's own buttons answer their own keys. Without this, Enter on
+      // the × or the speaker would also open the editor underneath it.
+      if (e.target.closest(".row-remove, .row-sound")) return;
       e.preventDefault();
       open();
     });
     row.setAttribute("aria-label", t("row.editLabel", { name: label.name }));
 
-    row.append(tile, main, geo, summary, remove);
+    // What the row says about a source, left to right: name, then the numbers,
+    // then whether the file has sound — the last thing before the ×. The
+    // speaker used to sit between the name and the size, which cut the scan
+    // lane in two ("… 1720×1392 🔊 30fps"); as the final cell it closes the
+    // line of facts instead of interrupting it. A switch that disappears when
+    // off would have no way back on, so rows that cannot carry sound keep an
+    // empty slot of the same width (see `soundSlot`).
+    const cells = [tile, main, geo, summary];
+    cells.push(canCarrySound(s) ? soundToggle(s) : soundSlot());
+    cells.push(remove);
+    row.append(...cells);
     listEl.append(row);
   }
 
@@ -500,7 +682,16 @@ function shortPath(dir) {
 // A failed open answers a click the user just made, so the notice is the whole
 // message — putting it in the log too would let a deleted folder fill the pane
 // one click at a time.
+//
+// A double-click fires two clicks, and two opens land two Explorer windows on
+// the same folder. One open per row is enough: the same dir within the window
+// is the same intention. Different dirs are never throttled against each
+// other, so browsing two takes quickly still opens both.
+let lastOpen = { dir: null, at: 0 };
 function openTake(dir) {
+  const now = Date.now();
+  if (dir === lastOpen.dir && now - lastOpen.at < 1500) return;
+  lastOpen = { dir, at: now };
   invoke("open_take", { dir }).catch((e) => showNotice("error", uiErrorText(e)));
 }
 
@@ -833,6 +1024,7 @@ function buildPicker() {
     }
     items.push({ el: btn, match });
     g.items.push(btn);
+    return btn;
   };
 
   const gDesktop = group(t("picker.desktop"));
@@ -887,22 +1079,32 @@ function buildPicker() {
       meta,
       (q) => w.title.toLowerCase().includes(q),
       () =>
-        addSource(uniqueId("win"), { Window: { hwnd: w.hwnd, title: w.title, crop: CROP() } }),
+        addSource(uniqueId("win"), {
+          Window: { hwnd: w.hwnd, pid: w.pid, title: w.title, crop: CROP() },
+        }),
       { Window: { hwnd: w.hwnd } },
     );
   }
 
   const gCameras = group(t("picker.cameras"));
   for (const d of state.devices) {
-    const name = truncate(d, 48);
-    item(
+    const name = truncate(d.name, 48);
+    // `live === false` = a registered filter with no output pin: a virtual
+    // camera whose host app (e.g. the Mikey client) is not running. Say so
+    // up front instead of failing at record time. Otherwise the meta names
+    // the backends that can open it — dshow = ffmpeg, mf = windows.
+    const dead = d.live === false;
+    const backends =
+      d.dshow && d.mf ? "DirectShow + MF" : d.mf ? "Media Foundation" : "DirectShow";
+    const btn = item(
       gCameras,
       name,
-      "DirectShow",
-      (q) => d.toLowerCase().includes(q),
-      () => addSource(uniqueId("cam"), { Camera: { device: d, crop: CROP() } }),
-      { Camera: { device: d } },
+      dead ? t("picker.noSignal") : backends,
+      (q) => d.name.toLowerCase().includes(q),
+      () => addSource(uniqueId("cam"), { Camera: { device: d.name, crop: CROP() } }),
+      { Camera: { device: d.name } },
     );
+    if (dead) btn.classList.add("no-signal");
   }
 
   // Sound sources. A mic is picked by name; the system is one row; a window's
@@ -940,20 +1142,11 @@ function buildPicker() {
     () => addSource(uniqueId("sys-audio"), { SystemAudio: {} }),
     { SystemAudio: {} },
   );
-  for (const w of state.windows) {
-    const name = truncate(w.title, 48);
-    item(
-      gSound,
-      name,
-      t("picker.windowSound"),
-      (q) => w.title.toLowerCase().includes(q) || "window audio".includes(q) || "窗口声音".includes(q),
-      () =>
-        addSource(uniqueId("win-audio"), {
-          WindowAudio: { hwnd: w.hwnd, title: w.title },
-        }),
-      { WindowAudio: { hwnd: w.hwnd } },
-    );
-  }
+  // Both are listed here on purpose, because "sound only, no picture" is a
+  // different thing to ask for. What is *not* listed twice is a window's or the
+  // desktop's own sound: that is an option on the picture source itself (see
+  // `editor-sound`), so each thing is named once instead of asking the user to
+  // pick the same window twice and hoping the two picks match.
 
   const none = document.createElement("div");
   none.className = "pick empty-row hidden";
@@ -1057,7 +1250,7 @@ function showSaved(result) {
   if (result.failed > 0) {
     const detail = result.sources
       .filter((s) => s.error)
-      .map((s) => `${s.id}: ${s.error}`)
+      .map((s) => `${s.id}: ${codeText(s.error)}`)
       .join("\n");
     notify(
       "warn",
@@ -1411,7 +1604,7 @@ function setParamsDisabled(off) {
   // while one runs. Recording controls are selected by name: the
   // language/theme rows share .set-row but are UI settings and stay usable.
   for (const el of document.querySelectorAll(
-    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn",
+    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn, #ffmpeg-path, #ffmpeg-browse",
   )) {
     el.disabled = off;
   }
@@ -1440,6 +1633,24 @@ function bindParams() {
   $("encoder").addEventListener("change", (e) => {
     state.encoder = e.target.value || null;
     persist();
+  });
+  // Not debounced through `persist`: the setting is applied to the running
+  // process the moment it lands (the next prepare reads it), so a change is
+  // its own command — like the language and theme rows.
+  $("ffmpeg-path").addEventListener("change", (e) => {
+    const path = e.target.value.trim();
+    e.target.value = path;
+    invoke("set_ffmpeg_path", { path }).catch((e) => console.error("set_ffmpeg_path", e));
+  });
+  $("ffmpeg-browse").addEventListener("click", () => {
+    invoke("pick_file", { title: t("params.ffmpegPick") })
+      .then((path) => {
+        if (path) {
+          $("ffmpeg-path").value = path;
+          invoke("set_ffmpeg_path", { path }).catch((e) => console.error("set_ffmpeg_path", e));
+        }
+      })
+      .catch((e) => console.error("pick_file", e));
   });
   $("marks-value").addEventListener("change", (e) => {
     state.marks = e.target.checked;
@@ -1502,6 +1713,9 @@ function applySaved(cfg) {
     state.encoder = cfg.encoder;
     $("encoder").value = cfg.encoder;
   }
+  // Empty stays empty: the placeholder (PATH) is the lookup story, not text
+  // the field owns.
+  $("ffmpeg-path").value = cfg.ffmpeg_path || "";
   // Anything that is not "ffmpeg" reads as the Windows backend: an old config
   // has no field at all, and the in-process backend is the default going
   // forward.
@@ -1527,6 +1741,9 @@ function applySaved(cfg) {
       capture: s.capture,
       fps: s.fps,
       quality: s.quality,
+      // A window that was set to record its own sound has to come back that
+      // way; the field is picked out by name, so it is named here or lost.
+      audio: Boolean(s.audio),
     });
     // Warm the engine probe for restored sources too. The picker preheats on
     // add, but a source that came back from config would otherwise leave the
@@ -1582,6 +1799,14 @@ function applyLanguageUi() {
   render();
   buildPicker();
   renderJournal();
+  // The card and the crop workspace write their labels in JS rather than
+  // through `data-i18n`, so a switch made while either is open would leave
+  // them in the language they were born in — including the output size line,
+  // which reads "输出 …" and then never changes.
+  if (editor) {
+    renderEditor();
+    if (!$("crop").classList.contains("hidden")) renderCrop();
+  }
 }
 
 function renderSettingsState() {
@@ -1846,15 +2071,35 @@ async function openEditor(id) {
   const audio = isAudio(source.capture);
   $("editor-fps").closest(".edit-field").classList.toggle("hidden", audio);
   $("editor-thumb").closest(".edit-section").classList.toggle("hidden", audio);
+  // Only a picture that can carry sound shows the switch — a window's own
+  // process tree, or the desktop's system sound — so it is hidden elsewhere
+  // rather than offered and then ignored.
+  const windowSound = canCarrySound(source);
+  $("editor-sound-row").classList.toggle("hidden", !windowSound);
+  // The switch reads "静音", so it is on when the sound is off: the row's
+  // speaker and this checkbox are two views of one field, and they must
+  // never disagree about which way round it is.
+  $("editor-sound").checked = windowSound && !source.audio;
   $("editor").classList.remove("hidden");
   renderEditor();
-  const shot = invoke("source_preview", { capture: source.capture }).catch((e) => ({
+  await loadPreview(source);
+}
+
+// Grab the still — or the reason there is none — for the open editor.
+//
+// Split out from `openEditor` because restoring a minimized window is a second
+// way in: the same grab has to run again afterwards, against the same guard
+// that stops a stale answer from landing in a different source's editor.
+async function loadPreview(source) {
+  const id = editor.id;
+  editor.loading = true;
+  renderEditor();
+  const still = await invoke("source_preview", { capture: source.capture }).catch((e) => ({
     image: null,
     width: 0,
     height: 0,
     note: uiErrorText(e),
   }));
-  const still = await shot;
   // Closed, or opened on another source, while the grab was in flight.
   if (!editor || editor.id !== id) return;
   editor.loading = false;
@@ -1863,7 +2108,28 @@ async function openEditor(id) {
   editor.image = still.image || null;
   editor.note = still.note || null;
   renderEditor();
-  PROBE(`editor-open ${id} still=${editor.width}x${editor.height} ok=${Boolean(editor.image)}`);
+  PROBE(`editor-still ${id} still=${editor.width}x${editor.height} ok=${Boolean(editor.image)}`);
+}
+
+// The window behind this source is minimized: bring it back so the crop can be
+// drawn against a picture.
+//
+// A button, not something the editor does on open. Resolving a window restores
+// it, so an editor that resolved eagerly would pull windows onto the screen
+// every time one was clicked — and restoring one *does* hand it the keyboard
+// focus (Windows semantics). The user asking is what makes that acceptable.
+async function restoreSourceWindow() {
+  if (!editor || editor.loading) return;
+  const source = state.sources.find((s) => s.id === editor.id);
+  if (!source) return;
+  $("editor-restore").disabled = true;
+  await invoke("restore_window", { capture: source.capture }).catch((e) => {
+    console.error("restore_window", e);
+    return false;
+  });
+  if (!editor || editor.id !== source.id) return;
+  $("editor-restore").disabled = false;
+  await loadPreview(source);
 }
 
 function renderEditor() {
@@ -1878,13 +2144,19 @@ function renderEditor() {
   $("editor-title").textContent = editor.name;
   $("editor-tile").innerHTML = source ? SOURCE_ICONS[kindOf(source.capture)] : "";
   const out = outputSize(editor.draft, editor.width || 0, editor.height || 0);
+  // A draft whose edges leave nothing is one the writer drops: the card then
+  // says "whole frame", which is what the file will hold. Printing `0 × 1392`
+  // would describe a picture nothing can write.
+  const draftFits = fitsIn(editor.draft, editor.width, editor.height);
   const size = editor.width
-    ? t("editor.size", { w: out.w, h: out.h })
+    ? draftFits
+      ? t("editor.size", { w: out.w, h: out.h })
+      : t("editor.sizeWhole")
     : t("editor.sizeUnknown");
   $("editor-sub").textContent = editor.width
     ? `${editor.width} × ${editor.height}`
     : t("editor.sizeUnknown");
-  $("editor-size").textContent = editor.width ? `${out.w} × ${out.h}` : "—";
+  $("editor-size").textContent = editor.width ? (draftFits ? `${out.w} × ${out.h}` : t("crop.dropped")) : "—";
   const img = $("editor-img");
   img.classList.toggle("hidden", !editor.image);
   if (editor.image) img.src = editor.image;
@@ -1892,17 +2164,31 @@ function renderEditor() {
   $("editor-thumb-empty").textContent = editor.loading
     ? t("editor.loading")
     : noteText(editor.note);
-  // Croppable when the *size* is known, picture or not: a crop is four numbers
-  // against the frame the take will record, and a grab that failed (a
-  // minimized window, a window that refuses PrintWindow) does not make those
-  // numbers unknowable. Only a source with no size at all has nothing to edit.
-  const cropable = editor.width > 0 && editor.height > 0;
+  // Croppable only with a picture in hand (2026-10-23). A crop is four numbers
+  // against the frame the take will record, and the numbers themselves are
+  // always computable — but a user who cannot see what they are trimming is
+  // guessing, and the one state that has no still (a minimized window) is the
+  // one where the guess is least checkable. Measured, the earlier rule
+  // ("size known ⇒ croppable") was admitting exactly that case.
+  const cropable = Boolean(editor.image);
   $("editor-thumb").disabled = !cropable;
+  // The one reason for a missing picture the user can fix from here. Shown as a
+  // button in the footer, where the other reasons already live as text.
+  const canRestore = !editor.image && editor.note === "preview.minimized";
+  $("editor-restore").classList.toggle("hidden", !canRestore);
+  $("editor-restore").disabled = !canRestore || editor.loading;
   // The reason lives on the picture area (it wraps there); the footer keeps
   // one short line. A sentence here is what squeezed 取消/保存 into two
   // one-character lines on a long source name (2026-10-21).
   $("editor-note").textContent = cropable ? size : "";
-  $("editor-thumb").title = editor.note || "";
+  // The tooltip carries the sentence, not the reason code: `editor.note` holds
+  // "preview.minimized" and friends, and a code is not a tooltip. When the
+  // sentence is already printed on the picture area, an empty tooltip is the
+  // honest answer.
+  // Cleared rather than set to the reason: `editor.note` holds a code
+  // ("preview.minimized") and the sentence for it is already printed on the
+  // picture area. A tooltip that repeats it, or worse shows the code, is noise.
+  $("editor-thumb").title = "";
 }
 
 function closeEditor() {
@@ -1924,6 +2210,10 @@ function saveEditor() {
   }
   source.fps = Number($("editor-fps").value) || source.fps;
   source.quality = Number($("editor-quality").value) || source.quality;
+  // The switch only exists for a window; reading it on anything else would
+  // write a flag the core refuses out loud. Checked means muted, so the field
+  // is its negation.
+  if (canCarrySound(source)) source.audio = !$("editor-sound").checked;
   // Without a picture there is nothing to have cropped: leave the edges as
   // they were rather than writing a draft against a size of zero.
   if (editor.width && editor.height) {
@@ -1937,7 +2227,9 @@ function saveEditor() {
   persist();
   render();
   closeEditor();
-  PROBE(`editor-saved ${id} fps=${source.fps} q=${source.quality}`);
+  PROBE(
+    `editor-saved ${id} fps=${source.fps} q=${source.quality} sound=${Boolean(source.audio)}`,
+  );
 }
 
 // ── The crop workspace ─────────────────────────────────────────────────────
@@ -1991,10 +2283,19 @@ function renderCrop() {
   plane.style.transform = `translate(${view.panX}px, ${view.panY}px)`;
   const c = editor.draft;
   const out = outputSize(c, editor.width, editor.height);
-  box.style.left = `${c.left * view.zoom}px`;
-  box.style.top = `${c.top * view.zoom}px`;
-  box.style.width = `${out.w * view.zoom}px`;
-  box.style.height = `${out.h * view.zoom}px`;
+  // A draft with no picture left in it is one the writer will drop, so the
+  // toolbar says what the file will get rather than a size it cannot write.
+  // The reason rides on the tooltip: the toolbar has no room for a sentence.
+  const fits = fitsIn(c, editor.width, editor.height);
+  // The box is the frame the take will record, and the dimming shadow is what
+  // is thrown away. Edges that do not fit throw nothing away, so the box
+  // covers the whole picture — a zero-width box would dim the entire stage and
+  // read as a broken viewer rather than as "nothing is cropped".
+  box.classList.toggle("dropped", !fits);
+  box.style.left = `${(fits ? c.left : 0) * view.zoom}px`;
+  box.style.top = `${(fits ? c.top : 0) * view.zoom}px`;
+  box.style.width = `${(fits ? out.w : editor.width) * view.zoom}px`;
+  box.style.height = `${(fits ? out.h : editor.height) * view.zoom}px`;
   for (const edge of EDGES) {
     const field = $(`edge-${edge}`);
     // The field being typed into keeps every keystroke; the others follow.
@@ -2006,7 +2307,9 @@ function renderCrop() {
     const id = handle.dataset.edge;
     handle.setAttribute("aria-label", t(`crop.handle.${id}`));
   }
-  $("crop-output").textContent = `${out.w} × ${out.h}`;
+  const outLabel = $("crop-output");
+  outLabel.textContent = fits ? `${out.w} × ${out.h}` : t("crop.dropped");
+  outLabel.title = fits ? "" : t("crop.droppedHint");
 }
 
 function zoomAt(next, cx, cy) {
@@ -2075,6 +2378,16 @@ async function openWorkspace() {
 }
 
 async function closeWorkspace() {
+  // Nothing to go back to. A save, a cancel or a take starting can close the
+  // card while the workspace is still animating out, and `editor !== mine`
+  // below cannot tell that apart from its own editor (both are null) — the
+  // card would come back empty, with the default title and no source.
+  if (!editor) {
+    $("crop").classList.add("hidden");
+    delete document.body.dataset.view;
+    await invoke("exit_crop_mode").catch((e) => console.error("exit_crop_mode", e));
+    return;
+  }
   const mine = editor;
   $("crop").classList.add("hidden");
   delete document.body.dataset.view;
@@ -2234,6 +2547,7 @@ function initEditor() {
     closeEditor();
   });
   $("editor-save").addEventListener("click", saveEditor);
+  $("editor-restore").addEventListener("click", restoreSourceWindow);
   $("editor-thumb").addEventListener("click", openWorkspace);
   $("crop-back").addEventListener("click", closeWorkspace);
 
@@ -2391,4 +2705,5 @@ async function tickLoop() {
 }
 
 tickLoop();
+titleLoop();
 init();

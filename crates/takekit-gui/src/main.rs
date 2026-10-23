@@ -149,6 +149,11 @@ fn ui_ping(stage: String) {
 #[derive(Serialize)]
 struct WindowItem {
     hwnd: isize,
+    /// The process behind the handle, so the picker can write it into the
+    /// source. Without it the panel could only ever store `pid: 0` — the
+    /// "unknown owner" that skips the recycled-handle check — and the check
+    /// would exist everywhere except the one door real users come through.
+    pid: u32,
     title: String,
     x: i32,
     y: i32,
@@ -168,6 +173,7 @@ async fn list_windows(filter: String) -> Vec<WindowItem> {
             .into_iter()
             .map(|w| WindowItem {
                 hwnd: w.hwnd,
+                pid: w.pid,
                 title: w.title,
                 x: w.rect.x,
                 y: w.rect.y,
@@ -184,11 +190,34 @@ async fn list_windows(filter: String) -> Vec<WindowItem> {
 // recording lock runs off the main thread: synchronous commands execute on it,
 // and one 2-second probe would freeze rendering, input and window dragging.
 
+#[derive(Serialize)]
+struct CameraItem {
+    name: String,
+    /// `Some(false)` = the DirectShow listing tags it `(none)`: registered,
+    /// but no output pin — a virtual camera whose host app is off. `None`
+    /// when the listing cannot tell (older ffmpeg builds print no tag).
+    live: Option<bool>,
+    /// The ffmpeg backend (DirectShow) can open it.
+    dshow: bool,
+    /// The windows backend (Media Foundation) can open it.
+    mf: bool,
+}
+
 #[tauri::command]
-async fn list_devices() -> Vec<String> {
-    tauri::async_runtime::spawn_blocking(|| match ffmpeg::locate() {
-        Some(ff) => ffmpeg::list_capture_devices(&ff),
-        None => Vec::new(),
+async fn list_devices() -> Vec<CameraItem> {
+    tauri::async_runtime::spawn_blocking(|| {
+        // The merged enumeration (dshow ∪ MF): one list for the picker and
+        // the agent's control surface, each entry tagged with the backends
+        // that can open it.
+        takekit_core::devices::cameras(ffmpeg::locate().as_deref())
+            .into_iter()
+            .map(|c| CameraItem {
+                name: c.name,
+                live: c.live,
+                dshow: c.dshow,
+                mf: c.mf,
+            })
+            .collect()
     })
     .await
     .expect("list_devices task panicked")
@@ -240,6 +269,52 @@ async fn source_preview(capture: Capture) -> preview::Still {
         .expect("source_preview task panicked")
 }
 
+/// The current caption of each window source, in the order asked.
+///
+/// A row shows a title, and titles move all the time — switch a file in an
+/// editor, a tab in a browser, and the caption follows. The stored title is
+/// only what it said when the source was added, so the row would keep naming a
+/// file the user left an hour ago.
+///
+/// Read-only by construction: this must never go through `window_by_hwnd`,
+/// which restores a minimized window as part of resolving. A label refresh
+/// that pulled windows back onto the screen every couple of seconds would be
+/// worse than the stale text. `None` means the handle is gone; the caller keeps
+/// showing the last title it knew.
+#[tauri::command]
+async fn source_titles(captures: Vec<Capture>) -> Vec<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        captures
+            .iter()
+            .map(|capture| match capture {
+                Capture::Window { hwnd, .. } | Capture::WindowAudio { hwnd, .. } => {
+                    takekit_core::source::live_title(*hwnd)
+                }
+                _ => None,
+            })
+            .collect()
+    })
+    .await
+    .expect("source_titles task panicked")
+}
+
+/// Bring a minimized window back, so its crop can be edited against a picture.
+///
+/// The panel never does this on its own: opening an editor must not reshuffle
+/// the user's desktop, and restoring a window *does* activate it (Windows
+/// semantics). So it is a button the user presses, and it answers whether the
+/// window was minimized when asked.
+#[tauri::command]
+async fn restore_window(capture: Capture) -> Result<bool, UiError> {
+    let hwnd = match capture {
+        Capture::Window { hwnd, .. } | Capture::WindowAudio { hwnd, .. } => hwnd,
+        _ => return Err(UiError::new("err.restore-not-a-window")),
+    };
+    tauri::async_runtime::spawn_blocking(move || takekit_core::source::unminimize(hwnd))
+        .await
+        .map_err(|e| UiError::with_detail("err.restore-failed", e))
+}
+
 /// Everything the two list panes need, plus the unread counts behind the tab
 /// markers. Read as a whole because the panes are redrawn together.
 #[derive(Serialize)]
@@ -289,11 +364,41 @@ async fn journal_seen(pane: String) -> JournalView {
     .expect("journal_seen task panicked")
 }
 
+/// Clear a pane — destructive on the history pane (the panel's clear is the
+/// bulk form of the row's trash button): the folder behind every row goes to
+/// disk-delete behind the same `take.json` guard a single delete uses, then
+/// the rows and the dead log links follow. A folder that refuses to die keeps
+/// its row — that row is the panel's only record that files are still there —
+/// and a take that landed mid-clear is never touched at all.
+///
+/// The log clear stays row-only and loses no files by it: a log entry is a
+/// note about a take, not the take itself (same rule as `log_delete`), and
+/// its own storage is just the `journal.json` row this already rewrites.
 #[tauri::command]
 async fn journal_clear(pane: String) -> JournalView {
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(pane) = journal::Pane::parse(&pane) {
-            let _ = journal::Journal::update(|j| j.clear(pane));
+        match journal::Pane::parse(&pane) {
+            Some(journal::Pane::Takes) => {
+                let dirs: Vec<String> = journal::Journal::load()
+                    .takes
+                    .iter()
+                    .map(|t| t.dir.clone())
+                    .collect();
+                let mut deleted = std::collections::HashSet::new();
+                for dir in dirs {
+                    match takekit_core::take::delete_dir(&dir) {
+                        Ok(()) => {
+                            deleted.insert(dir);
+                        }
+                        Err(e) => crate::probe(&format!("clear:kept {e}")),
+                    }
+                }
+                let _ = journal::Journal::update(|j| j.sweep_deleted_takes(&deleted));
+            }
+            Some(journal::Pane::Log) => {
+                let _ = journal::Journal::update(|j| j.clear(journal::Pane::Log));
+            }
+            None => {}
         }
         journal_view()
     })
@@ -498,6 +603,18 @@ fn pick_folder(title: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Pick an executable file — the ffmpeg setting's browse button. The filter is
+/// advisory (Windows lets the user type `*.*`), which is fine: `ffmpeg::locate`
+/// only trusts a path that names a file.
+#[tauri::command]
+fn pick_file(title: &str) -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("executable", &["exe"])
+        .pick_file()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Start a take. The prepare step probes the machine (up to two seconds), so it
 /// runs off the main thread: a synchronous command executes on it, which would
 /// freeze rendering, input and window dragging. The take itself only starts
@@ -578,6 +695,25 @@ async fn set_countdown(secs: u8) -> Result<(), String> {
 async fn set_finalize_panel(on: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         config::Config::update(|cfg| cfg.finalize_panel = on)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Point the process at a specific ffmpeg, or back to the PATH lookup with an
+/// empty string. Applied to the core immediately — the next prepare picks it
+/// up — and remembered like every other setting.
+#[tauri::command]
+async fn set_ffmpeg_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = path.trim();
+        let value = if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        };
+        ffmpeg::set_path(value.as_deref().map(std::path::PathBuf::from));
+        config::Config::update(|cfg| cfg.ffmpeg_path = value)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -809,6 +945,33 @@ fn main() {
     webview_browser_args();
     probe("rust:setup");
     let app = tauri::Builder::default()
+        // First plugin: a second launch must reach the running instance's
+        // callback and exit, never build a second panel over the first (two
+        // panels fight over one recording lock and one hotkey). The callback
+        // runs on this instance's main thread, so the same lock rules as the
+        // close handler apply: try_lock only, never wait.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            let state = app.state::<take::AppState>();
+            // `pending` counts too: during the countdown the recording slot is
+            // still empty but the take is committed and the panel is away.
+            let busy = state.starting.load(Ordering::SeqCst)
+                || state.finalizing.load(Ordering::SeqCst)
+                || match state.recording.try_lock() {
+                    Ok(guard) => guard.is_some(),
+                    Err(_) => true,
+                }
+                || match state.pending.try_lock() {
+                    Ok(guard) => guard.is_some(),
+                    Err(_) => true,
+                };
+            if busy {
+                // Mid-take the panel hides itself (it would be in the frame);
+                // the popover is the designed way back to a running take.
+                crate::tray_panel::raise(app);
+            } else {
+                show_main_window(app);
+            }
+        }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(take::AppState::default())
         // The window is built hidden (see `.visible(false)` below) and shown
@@ -829,6 +992,9 @@ fn main() {
                 cfg.effective_language(),
                 cfg.effective_theme()
             ));
+            // The configured ffmpeg location (empty = PATH lookup). Fed to the
+            // core once here and again whenever `set_ffmpeg_path` changes it.
+            ffmpeg::set_path(cfg.ffmpeg_path.as_deref().map(std::path::PathBuf::from));
             // A hotkey that cannot be registered is not fatal — the panel still
             // works by button. The reason goes to the probe log for now; the
             // settings UI surfaces it later.
@@ -854,8 +1020,14 @@ fn main() {
             // The prompt layer: built hidden so its page is ready the moment a
             // take starts (see overlay.rs). TAKEKIT_OVERLAY_DEMO shows it at
             // startup instead, which is how the cover gets measured.
-            overlay::create(app.handle())?;
-            probe("overlay:ready");
+            //
+            // A create failure degrades to "no prompt layer": the take path
+            // falls back to the no-veil start (take.rs), and taking the whole
+            // app down over a cosmetic window would cost the recording too.
+            match overlay::create(app.handle()) {
+                Ok(_) => probe("overlay:ready"),
+                Err(e) => probe(&format!("overlay:create-failed {e}")),
+            }
             if std::env::var("TAKEKIT_OVERLAY_DEMO").is_ok() {
                 probe("overlay:demo");
                 overlay::show(app.handle());
@@ -1013,11 +1185,14 @@ fn main() {
             list_mics,
             check_sources,
             source_preview,
+            source_titles,
+            restore_window,
             enter_crop_mode,
             exit_crop_mode,
             env_info,
             preheat_engine,
             pick_folder,
+            pick_file,
             start_recording,
             overlay_finish,
             overlay_cancel,
@@ -1029,6 +1204,7 @@ fn main() {
             set_hotkey,
             set_countdown,
             set_finalize_panel,
+            set_ffmpeg_path,
             set_control,
             config_get,
             ui_settings,

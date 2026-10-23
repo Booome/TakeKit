@@ -157,9 +157,15 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         //
         // The code decides the sentence, the detail is whatever the core said:
         // the one failure users actually hit gets its own actionable wording.
+        // A core error that already carries a `diagnose` code *is* the code —
+        // wrapping it in err.prepare-failed would bury the actionable half.
         let err = match e {
             takekit_core::session::Error::NoFfmpeg => UiError::new("err.no-ffmpeg"),
-            other => UiError::with_detail("err.prepare-failed", other),
+            other => {
+                let text = other.to_string();
+                UiError::from_code_string(&text)
+                    .unwrap_or_else(|| UiError::with_detail("err.prepare-failed", text))
+            }
         };
         *state.last_error.lock().unwrap() = Some(err.to_string());
         crate::probe(&format!("begin:failed {err}"));
@@ -173,22 +179,41 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         prepared.engine_probed()
     ));
 
-    if secs == 0 {
+    // A prompt layer that cannot come up is not a reason to lose the take: it
+    // degrades to the countdown-off start (no veil, straight to spawn) and the
+    // probe log says so. Refusing the take here was the old behaviour, and a
+    // create failure at startup used to take the whole app down with it.
+    //
+    // The veil must be up before the take is committed only on the countdown
+    // path: committing first with no clock, no GO and no veil would leave a
+    // pending take whose only exit is guessing Esc. The degraded path below
+    // never parks a pending take — it spawns at once — so it needs no veil.
+    let veil_ok = secs > 0 && crate::overlay::show(app);
+    if secs > 0 && !veil_ok {
+        crate::probe("countdown:overlay-missing degraded=no-prompt");
+    }
+
+    if !veil_ok {
         *state.pending.lock().unwrap() = Some(prepared);
         // From here the take is committed: the panel steps aside, and only the
         // spawn can follow.
         crate::tray::set_recording(app, true);
         crate::hide_tray_window(app);
-        // Countdown off (DESIGN §4.6): no veil, a 50ms settle for the window
-        // hide, then straight to spawn. The short beep is asked for while the
-        // panel is still on screen — the tray dot is the other half of the
-        // "it started" signal, and the cost (the first 0.3–0.5s of the take
-        // is empty) is the documented price of turning the countdown off.
+        // Countdown off (DESIGN §4.6) or a degraded no-veil start: no veil, a
+        // 50ms settle for the window hide, then straight to spawn. The short
+        // beep is asked for while the panel is still on screen — the tray dot
+        // is the other half of the "it started" signal, and the cost (the first
+        // 0.3–0.5s of the take is empty) is the documented price of turning
+        // the countdown off.
         if let Some(window) = app.get_webview_window("main") {
             let _ = app.emit_to("main", "take:beep", &BeepInfo { hz: 440, ms: 120 });
             let _ = window.hide();
         }
-        crate::probe("countdown:off");
+        crate::probe(if secs == 0 {
+            "countdown:off"
+        } else {
+            "countdown:degraded"
+        });
         std::thread::sleep(Duration::from_millis(50));
         // The panel is still awaiting this command: a failure is reported by
         // the rejected invoke, not by a `take:failed` event it would show a
@@ -205,16 +230,6 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
                 Err(err)
             }
         };
-    }
-
-    // The veil has to be up before the take is committed. Committing first and
-    // discovering the veil cannot show would leave a pending take with no
-    // clock, no GO and no exit except guessing Esc.
-    if !crate::overlay::show(app) {
-        let err = UiError::new("err.overlay");
-        *state.last_error.lock().unwrap() = Some(err.to_string());
-        crate::probe("countdown:overlay-missing");
-        return Err(err);
     }
 
     *state.pending.lock().unwrap() = Some(prepared);
@@ -367,7 +382,11 @@ fn spawn_started(
         Err(e) => {
             // The source count is the panel's business (it knows what it asked
             // for); the code plus the engine's own words are what it needs.
-            let err = UiError::with_detail("err.spawn-failed", e);
+            // Same unwrapping as prepare: a `diagnose` code rides through as
+            // the code itself.
+            let text = e.to_string();
+            let err = UiError::from_code_string(&text)
+                .unwrap_or_else(|| UiError::with_detail("err.spawn-failed", text));
             *state.last_error.lock().unwrap() = Some(err.to_string());
             crate::probe(&format!("spawn:failed {err}"));
             // Tray, veil and panel are the caller's job — doing that here would

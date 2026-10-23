@@ -37,7 +37,7 @@ use windows::core::PCWSTR;
 
 use crate::devices::ensure_media_foundation;
 use crate::error::{MediaError, Result};
-use crate::frame::{AudioChunk, PixelFormat, VideoFrame};
+use crate::frame::{AudioChunk, MediaFrame, PixelFormat, VideoFrame};
 use crate::mediatype::{pcm_type, video_type};
 /// A frame held until the next one says how long it was on screen.
 struct Pending {
@@ -97,23 +97,28 @@ impl VideoWriter {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self> {
-        // SAFETY: every call below takes objects owned here; the stream index
-        // is the only thing that outlives the call and it is a plain integer.
-        unsafe {
-            let writer = sink(path)?;
-            let output = h264_type(width, height, fps, bitrate_kbps)?;
-            let stream = writer.AddStream(&output)?;
-            let input = input_type(format, width, height, fps)?;
-            writer.SetInputMediaType(stream, &input, None)?;
-            writer.BeginWriting()?;
-            Ok(Self {
-                writer,
-                stream,
-                flip: matches!(format, PixelFormat::Bgra),
-                pending: None,
-                spare: Vec::new(),
-                last_duration: 0,
-            })
+        let writer = sink(path)?;
+        let stream = add_video_stream(&writer, format, width, height, fps, bitrate_kbps)?;
+        // SAFETY: the sink is owned here and every stream it will carry has
+        // been set up; after this it accepts samples.
+        unsafe { writer.BeginWriting() }.map_err(MediaError::from)?;
+        Ok(Self::attach(&writer, stream, format))
+    }
+
+    /// Wrap a picture stream that already exists on a sink someone else owns.
+    ///
+    /// That is the window-with-its-own-sound case: one file carries a picture
+    /// and a sound, and Media Foundation has to be told about both streams
+    /// before it starts writing — so `MuxSink` adds them and the writers here
+    /// only stamp samples into them.
+    pub fn attach(writer: &IMFSinkWriter, stream: u32, format: PixelFormat) -> Self {
+        Self {
+            writer: writer.clone(),
+            stream,
+            flip: matches!(format, PixelFormat::Bgra),
+            pending: None,
+            spare: Vec::new(),
+            last_duration: 0,
         }
     }
 
@@ -190,6 +195,17 @@ impl VideoWriter {
     /// did not change produced one frame, and only the stop time says how long
     /// that frame was on screen.
     pub fn finish_at(mut self, end: Option<i64>) -> Result<()> {
+        self.flush(end)?;
+        // SAFETY: Finalize flushes and closes; the writer is consumed so it
+        // cannot be written to afterwards.
+        unsafe { self.writer.Finalize() }.map_err(Into::into)
+    }
+
+    /// Write the frame still held back, ending it at `end`.
+    ///
+    /// Leaves the file open: a sink shared with a sound stream is finalised by
+    /// whoever owns it, not by either stream's writer.
+    pub fn flush(&mut self, end: Option<i64>) -> Result<()> {
         if let Some(last) = self.pending.take() {
             let duration = match end {
                 Some(end) => (end - last.time).max(self.last_duration),
@@ -206,9 +222,7 @@ impl VideoWriter {
                 )?;
             }
         }
-        // SAFETY: Finalize flushes and closes; the writer is consumed so it
-        // cannot be written to afterwards.
-        unsafe { self.writer.Finalize() }.map_err(Into::into)
+        Ok(())
     }
 }
 
@@ -226,30 +240,30 @@ pub struct AudioWriter {
 
 impl AudioWriter {
     pub fn create(path: &Path, sample_rate: u32, channels: u32, bitrate_kbps: u32) -> Result<Self> {
-        // SAFETY: owned objects, integer stream index, as above.
-        unsafe {
-            let writer = sink(path).map_err(|e| e.context("AudioWriter::sink"))?;
-            let output = aac_type(sample_rate, channels, bitrate_kbps)
-                .map_err(|e| e.context("AudioWriter::aac_type"))?;
-            let stream = writer
-                .AddStream(&output)
-                .map_err(|e| MediaError::from(e).context("AudioWriter::AddStream"))?;
-            let input =
-                pcm_type(sample_rate, channels).map_err(|e| e.context("AudioWriter::pcm_type"))?;
-            writer
-                .SetInputMediaType(stream, &input, None)
-                .map_err(|e| MediaError::from(e).context("AudioWriter::SetInputMediaType"))?;
-            writer
-                .BeginWriting()
-                .map_err(|e| MediaError::from(e).context("AudioWriter::BeginWriting"))?;
-            Ok(Self {
-                writer,
-                stream,
-                bytes_per_second: sample_rate * channels * 2,
-                next: None,
-                started: false,
-            })
+        let writer = sink(path).map_err(|e| e.context("AudioWriter::sink"))?;
+        let stream = add_audio_stream(&writer, sample_rate, channels, bitrate_kbps)?;
+        // SAFETY: the sink is owned here and its one stream is set up.
+        unsafe { writer.BeginWriting() }
+            .map_err(|e| MediaError::from(e).context("AudioWriter::BeginWriting"))?;
+        Ok(Self::attach(&writer, stream, sample_rate, channels))
+    }
+
+    /// Wrap a sound stream that already exists on a sink someone else owns —
+    /// the window-with-its-own-sound case, exactly as `VideoWriter::attach`.
+    pub fn attach(writer: &IMFSinkWriter, stream: u32, sample_rate: u32, channels: u32) -> Self {
+        Self {
+            writer: writer.clone(),
+            stream,
+            bytes_per_second: sample_rate * channels * 2,
+            next: None,
+            started: false,
         }
+    }
+
+    /// How far the file's timeline reaches, in 100 ns units from the take's
+    /// origin — readable before finalising, which is what a shared sink needs.
+    pub fn end(&self) -> i64 {
+        self.next.unwrap_or(0)
     }
 
     /// Write one chunk.
@@ -286,10 +300,125 @@ impl AudioWriter {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<()> {
+    /// Close the file and report how far its timeline reached, in 100 ns units
+    /// from the take's origin.
+    ///
+    /// That is the position after the last sample written, lead-in silence
+    /// included — which the sink cannot say for itself, because it knows the
+    /// samples and not the take. Counting the bytes that arrived instead
+    /// leaves the silence out, and a microphone that woke up half a second
+    /// late then looks half a second short: exactly the error a drift check
+    /// must not have.
+    pub fn finish(self) -> Result<i64> {
+        let end = self.end();
         // SAFETY: as `VideoWriter::finish`.
         unsafe { self.writer.Finalize() }
-            .map_err(|e| MediaError::from(e).context("AudioWriter::finish"))
+            .map_err(|e| MediaError::from(e).context("AudioWriter::finish"))?;
+        Ok(end)
+    }
+}
+
+/// One sink writer carrying a picture and its sound.
+///
+/// A window can be recorded together with the sound its own process tree
+/// makes, and the two belong in one file. Media Foundation takes a stream only
+/// before the sink starts writing, so both streams are added here and `begin`
+/// comes after — which is why the picture's size has to be known first, and
+/// why the sound that arrives before the first frame waits in its channel
+/// instead of being written.
+pub struct MuxSink {
+    writer: IMFSinkWriter,
+}
+
+impl MuxSink {
+    pub fn create(path: &Path) -> Result<Self> {
+        Ok(Self {
+            writer: sink(path)?,
+        })
+    }
+
+    /// Add the picture stream. The first frame is what says how big the file
+    /// is, so this is called once one has arrived.
+    pub fn add_video(
+        &self,
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<VideoWriter> {
+        let stream = add_video_stream(&self.writer, format, width, height, fps, bitrate_kbps)?;
+        Ok(VideoWriter::attach(&self.writer, stream, format))
+    }
+
+    /// Add the sound stream.
+    pub fn add_audio(
+        &self,
+        sample_rate: u32,
+        channels: u32,
+        bitrate_kbps: u32,
+    ) -> Result<AudioWriter> {
+        let stream = add_audio_stream(&self.writer, sample_rate, channels, bitrate_kbps)?;
+        Ok(AudioWriter::attach(
+            &self.writer,
+            stream,
+            sample_rate,
+            channels,
+        ))
+    }
+
+    pub fn begin(&self) -> Result<()> {
+        // SAFETY: every stream this file will carry was added through the two
+        // calls above, which is what the sink insists on.
+        unsafe { self.writer.BeginWriting() }.map_err(MediaError::from)
+    }
+
+    /// Close the file. Both writers must have flushed their last sample first.
+    pub fn finalize(&self) -> Result<()> {
+        // SAFETY: flushes and closes; the sink is still owned here, so nothing
+        // can be written through it afterwards.
+        unsafe { self.writer.Finalize() }.map_err(MediaError::from)
+    }
+}
+
+/// Tell a sink about one picture stream, and what will be handed to it.
+fn add_video_stream(
+    writer: &IMFSinkWriter,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Result<u32> {
+    let output = h264_type(width, height, fps, bitrate_kbps)?;
+    let input = input_type(format, width, height, fps)?;
+    // SAFETY: both types are owned here, and the stream index that outlives
+    // the call is a plain integer.
+    unsafe {
+        let stream = writer.AddStream(&output)?;
+        writer.SetInputMediaType(stream, &input, None)?;
+        Ok(stream)
+    }
+}
+
+/// The same for one sound stream: AAC out, the PCM every capture produces in.
+fn add_audio_stream(
+    writer: &IMFSinkWriter,
+    sample_rate: u32,
+    channels: u32,
+    bitrate_kbps: u32,
+) -> Result<u32> {
+    let output = aac_type(sample_rate, channels, bitrate_kbps)?;
+    let input = pcm_type(sample_rate, channels)?;
+    // SAFETY: as `add_video_stream`.
+    unsafe {
+        let stream = writer
+            .AddStream(&output)
+            .map_err(|e| MediaError::from(e).context("AudioWriter::AddStream"))?;
+        writer
+            .SetInputMediaType(stream, &input, None)
+            .map_err(|e| MediaError::from(e).context("AudioWriter::SetInputMediaType"))?;
+        Ok(stream)
     }
 }
 
@@ -607,7 +736,6 @@ pub fn write_stream(
     clock: crate::clock::TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<StreamReport> {
-    use crate::frame::MediaFrame;
     use std::sync::atomic::Ordering;
 
     let Encode {
@@ -643,7 +771,13 @@ pub fn write_stream(
             Sampling::KeepLatest => {
                 match rx.recv_timeout(interval) {
                     Ok(MediaFrame::Video(frame)) => {
-                        frames += 1;
+                        // Keep latest means the newest picture, not the newest
+                        // that happened to be at the queue's head: after a
+                        // stall the queue holds a burst, and stamping the
+                        // burst's *oldest* frame into the gap the stall left
+                        // behind is exactly backwards.
+                        let (frame, seen) = newest_of_burst(&rx, frame);
+                        frames += seen;
                         latest = Some(even_frame(crop_frame(frame, crop)));
                     }
                     Ok(_) => {}
@@ -694,6 +828,27 @@ pub fn write_stream(
         width: size.0,
         height: size.1,
     })
+}
+
+/// Everything the queue is holding, collapsed to its newest frame.
+///
+/// `first` is the one the caller just received; whatever piled up behind it is
+/// older by definition (the queue is FIFO), so only the last one is kept. The
+/// count comes back as "frames the capture delivered" for the report — the
+/// intermediate ones were delivered too, just never written.
+fn newest_of_burst(
+    rx: &std::sync::mpsc::Receiver<MediaFrame>,
+    first: VideoFrame,
+) -> (VideoFrame, u64) {
+    let mut frame = first;
+    let mut seen = 1;
+    while let Ok(next) = rx.try_recv() {
+        if let MediaFrame::Video(next) = next {
+            frame = next;
+            seen += 1;
+        }
+    }
+    (frame, seen)
 }
 
 fn open_for(
@@ -821,6 +976,52 @@ mod tests {
         assert_eq!(&cropped.data[8..12], &[9, 9, 9, 9]);
         assert_eq!(&cropped.data[12..16], &[10, 10, 10, 10]);
         assert_eq!(cropped.time, 7, "the timestamp travels with the pixels");
+    }
+
+    /// A burst behind the queue's head is one picture to write: the newest.
+    /// Stamping the burst's oldest frame into the gap a stall leaves behind
+    /// would rewind the picture right where the viewer sees the hiccup.
+    #[test]
+    fn a_burst_collapses_to_its_newest_frame() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(8);
+        for time in [0i64, 1, 2, 3] {
+            tx.send(MediaFrame::Video(VideoFrame {
+                width: 2,
+                height: 2,
+                format: PixelFormat::Bgra,
+                data: vec![time as u8; 16],
+                time,
+            }))
+            .unwrap();
+        }
+        let MediaFrame::Video(first) = rx.recv().unwrap() else {
+            panic!("a video frame went in");
+        };
+        let (winner, seen) = newest_of_burst(&rx, first);
+        assert_eq!(winner.time, 3, "the last frame in wins");
+        assert_eq!(&winner.data[..], &[3u8; 16]);
+        assert_eq!(seen, 4, "every delivered frame is still counted");
+    }
+
+    /// An empty queue behind the head is the common case: one frame in, the
+    /// same frame out, one frame counted.
+    #[test]
+    fn a_lone_frame_survives_the_burst_check() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(8);
+        tx.send(MediaFrame::Video(VideoFrame {
+            width: 1,
+            height: 1,
+            format: PixelFormat::Bgra,
+            data: vec![7; 4],
+            time: 5,
+        }))
+        .unwrap();
+        let MediaFrame::Video(first) = rx.recv().unwrap() else {
+            panic!("a video frame went in");
+        };
+        let (winner, seen) = newest_of_burst(&rx, first);
+        assert_eq!(winner.time, 5);
+        assert_eq!(seen, 1);
     }
 
     /// Nothing to cut must cost nothing: the very same buffer comes back.

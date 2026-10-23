@@ -6,7 +6,7 @@
 //! for nothing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -44,7 +44,7 @@ pub struct MicCapture {
 }
 
 impl MicCapture {
-    pub fn start(endpoint: &str, out: Sender<MediaFrame>, clock: TakeClock) -> Result<Self> {
+    pub fn start(endpoint: &str, out: SyncSender<MediaFrame>, clock: TakeClock) -> Result<Self> {
         let (ready, opened) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
@@ -169,7 +169,7 @@ fn open(endpoint: &str) -> Result<(IMFSourceReader, u32, u32)> {
 fn pump(
     reader: &IMFSourceReader,
     stop: Arc<AtomicBool>,
-    out: Sender<MediaFrame>,
+    out: SyncSender<MediaFrame>,
     clock: TakeClock,
 ) -> Result<()> {
     // Same bridge as the camera: one offset at the first sample, then the
@@ -184,13 +184,13 @@ fn pump(
         };
         let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(time));
         let data = sample_bytes(&sample)?;
-        if out
-            .send(MediaFrame::Audio(AudioChunk {
+        if !crate::frame::offer(
+            &out,
+            MediaFrame::Audio(AudioChunk {
                 data,
                 time: time - anchor,
-            }))
-            .is_err()
-        {
+            }),
+        ) {
             return Ok(());
         }
     }

@@ -1,6 +1,6 @@
-//! Marks (click ripples, drag trails) come from MouseShow, linked as a library
-//! rather than launched as a process: no handshake, no orphaned overlay if this
-//! process dies.
+//! Mouse effects (`marks` — click ripples, drag trails) come from MouseShow,
+//! linked as a library rather than launched as a process: no handshake, no
+//! orphaned overlay if this process dies.
 
 pub use mouseshow::{Marks, MarksError};
 

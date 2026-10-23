@@ -15,8 +15,25 @@ use std::time::{Duration, Instant};
 /// finalising a normal file.
 const FINALISE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Find ffmpeg on PATH. Returns `None` if it is not there.
+/// Where ffmpeg was configured to live (panel setting, `--ffmpeg` flag).
+/// `None` means "no preference" and `locate` falls back to PATH.
+static OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Point the process at a specific ffmpeg (or back to PATH lookup with
+/// `None`). A configured path that is not a file is remembered but does not
+/// shadow PATH — see `locate`.
+pub fn set_path(path: Option<PathBuf>) {
+    *OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+/// Find ffmpeg: the configured path when it names a file, else PATH.
+/// Returns `None` if neither lands on one.
 pub fn locate() -> Option<PathBuf> {
+    if let Some(p) = OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if p.is_file() {
+            return Some(p.clone());
+        }
+    }
     // Windows-only crate (the source module calls Win32 unconditionally), so
     // the binary name is not selected at runtime.
     let exe = "ffmpeg.exe";
@@ -213,14 +230,27 @@ fn cached_dda(
     ok
 }
 
+/// One camera the DirectShow list reports.
+pub struct DshowCamera {
+    pub name: String,
+    /// Can it deliver frames right now, as far as the listing says? `Some(true)`
+    /// for an entry tagged `(video)`, `Some(false)` for `(none)` — the
+    /// signature of a registered filter with no live output pin, i.e. a
+    /// virtual camera whose host app is not running. `None` on builds that
+    /// print no tag at all (then the listing cannot tell).
+    pub live: Option<bool>,
+}
+
 /// Devices that ffmpeg can capture from (DirectShow on Windows).
 ///
 /// Parsing this is less obvious than it looks: ffmpeg builds differ. Some print
 /// `DirectShow video devices` headers and tag entries as `(video)`; others (the
 /// full builds on Windows) print only the name followed by an `Alternative name`
 /// line whose class GUID says whether it is a video or an audio device. Both
-/// shapes are handled.
-pub fn list_capture_devices(ffmpeg: &Path) -> Vec<String> {
+/// shapes are handled. The inline tag doubles as a liveness read: the same
+/// virtual camera lists as `(video)` with its host app running and `(none)`
+/// without it.
+pub fn list_capture_devices(ffmpeg: &Path) -> Vec<DshowCamera> {
     /// DirectShow class GUIDs.
     const VIDEO: &str = "860BB310-5D01-11D0-BD3B-00A0C911CE86";
     const AUDIO: &str = "33D9A762-90C8-11D0-BD43-00A0C911CE86";
@@ -241,8 +271,10 @@ pub fn list_capture_devices(ffmpeg: &Path) -> Vec<String> {
     let Ok(out) = out else { return Vec::new() };
     let text = String::from_utf8_lossy(&out.stderr);
 
-    let mut devices: Vec<String> = Vec::new();
-    let mut pending: Option<String> = None;
+    let mut devices: Vec<DshowCamera> = Vec::new();
+    // The name line's tag rides along to the Alternative name line, which is
+    // what decides video vs audio.
+    let mut pending: Option<(String, Option<bool>)> = None;
     let mut in_audio_section = false;
 
     for line in text.lines() {
@@ -258,9 +290,9 @@ pub fn list_capture_devices(ffmpeg: &Path) -> Vec<String> {
         let quoted = first_quoted(line);
 
         if line.contains("Alternative name") {
-            if let (Some(name), Some(guid)) = (pending.take(), last_guid(line)) {
+            if let (Some((name, live)), Some(guid)) = (pending.take(), last_guid(line)) {
                 if guid.eq_ignore_ascii_case(VIDEO) {
-                    devices.push(name);
+                    devices.push(DshowCamera { name, live });
                 } else if guid.eq_ignore_ascii_case(AUDIO) {
                     // audio device: ignored for now
                 }
@@ -269,14 +301,27 @@ pub fn list_capture_devices(ffmpeg: &Path) -> Vec<String> {
         }
 
         if let Some(name) = quoted {
+            // What the listing learned by probing the filter: a device with no
+            // output pins (a virtual camera whose host app is off) is tagged
+            // `(none)`, one delivering frames `(video)`.
+            let live = if line.contains("(video)") {
+                Some(true)
+            } else if line.contains("(none)") {
+                Some(false)
+            } else {
+                None
+            };
             // Builds that tag the entry inline are unambiguous.
             if line.contains("(video)") {
-                devices.push(name);
+                devices.push(DshowCamera {
+                    name,
+                    live: Some(true),
+                });
                 pending = None;
             } else if in_audio_section {
                 pending = None;
             } else {
-                pending = Some(name);
+                pending = Some((name, live));
             }
         }
     }
@@ -361,5 +406,26 @@ mod tests {
             .as_deref(),
             Some("860BB310-5D01-11D0-BD3B-00A0C911CE86")
         );
+    }
+
+    #[test]
+    fn the_configured_path_wins_and_a_stale_one_falls_back_to_path() {
+        // A stand-in ffmpeg: `locate` only checks that the path is a file.
+        let fake = std::env::temp_dir().join("takekit-ffmpeg-override-test.exe");
+        std::fs::write(&fake, b"").unwrap();
+
+        super::set_path(Some(fake.clone()));
+        assert_eq!(super::locate().as_deref(), Some(fake.as_path()));
+
+        // A configured path that is gone must not shadow PATH: the setting
+        // survives (the file may come back), the lookup just degrades.
+        super::set_path(Some(std::env::temp_dir().join("no-such-ffmpeg.exe")));
+        assert_ne!(
+            super::locate().as_deref(),
+            Some(std::env::temp_dir().join("no-such-ffmpeg.exe").as_path())
+        );
+
+        super::set_path(None);
+        let _ = std::fs::remove_file(&fake);
     }
 }

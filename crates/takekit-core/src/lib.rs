@@ -4,6 +4,8 @@
 //! source starts and stops with the take, so the outputs line up without any
 //! post-production alignment.
 
+pub mod devices;
+pub mod diagnose;
 pub mod encoder;
 pub mod ffmpeg;
 pub mod fsx;

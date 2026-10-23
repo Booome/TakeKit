@@ -178,6 +178,34 @@
               </select>
             </div>
           </div>
+          <div class="set-row">
+            <div class="txt">
+              <label class="title" for="ffmpeg-path" data-i18n="params.ffmpegPath">ffmpeg 路径</label>
+              <span class="hint" data-i18n="params.ffmpegPathHint"></span>
+            </div>
+            <div class="ctl">
+              <div class="path-row">
+                <input
+                  class="value mono"
+                  id="ffmpeg-path"
+                  type="text"
+                  placeholder="PATH"
+                  spellcheck="false"
+                />
+                <button
+                  class="browse"
+                  id="ffmpeg-browse"
+                  type="button"
+                  aria-label="选择 ffmpeg 程序"
+                  title="选择 ffmpeg 程序"
+                  data-i18n-aria="params.ffmpegPick"
+                  data-i18n-title="params.ffmpegPick"
+                >
+                  …
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="set-group">
           <p class="set-label" data-i18n="settings.recording">录制行为</p>
@@ -344,6 +372,16 @@
             </label>
           </div>
 
+          <div class="set-row hidden" id="editor-sound-row">
+            <div class="txt">
+              <label class="title" for="editor-sound" data-i18n="editor.sound">窗口的声音</label>
+              <span class="hint" data-i18n="editor.soundHint"></span>
+            </div>
+            <div class="ctl">
+              <input class="switch" id="editor-sound" type="checkbox" role="switch" />
+            </div>
+          </div>
+
           <div class="edit-section">
             <p class="edit-label" data-i18n="editor.crop">裁剪</p>
             <button class="thumb" id="editor-thumb" type="button">
@@ -357,6 +395,9 @@
 
         <footer class="modal-foot">
           <span class="modal-note" id="editor-note"></span>
+          <button class="ghost flat hidden" id="editor-restore" type="button" data-i18n="editor.restoreWindow">
+            恢复窗口
+          </button>
           <button class="ghost flat" id="editor-cancel" type="button" data-i18n="editor.cancel">
             取消
           </button>

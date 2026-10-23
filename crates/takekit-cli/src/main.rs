@@ -28,6 +28,10 @@ mod mcp;
     about = "Record several sources at once into one take"
 )]
 struct Cli {
+    /// Point at a specific ffmpeg instead of the PATH lookup
+    #[arg(long, global = true, value_name = "PATH")]
+    ffmpeg: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -75,6 +79,26 @@ struct RecordArgs {
     #[arg(long, value_name = "DEVICE")]
     cam: Option<String>,
 
+    /// Also record a microphone, by name or endpoint id (see
+    /// `takekit media --list` for the names)
+    #[arg(long, value_name = "DEVICE")]
+    mic: Option<String>,
+
+    /// Also record what the speakers play (system sound, WASAPI loopback)
+    #[arg(long)]
+    system_audio: bool,
+
+    /// Write the window's own sound into the same file as its picture
+    /// (needs --window; per-process WASAPI loopback)
+    #[arg(long)]
+    window_sound: bool,
+
+    /// Write the desktop's sound into the same file as its picture (system
+    /// sound, WASAPI loopback — the whole machine, since Windows has no
+    /// per-monitor audio; not with --window)
+    #[arg(long)]
+    desktop_sound: bool,
+
     /// Stop after this many seconds (otherwise press Enter)
     #[arg(short, long, default_value_t = 0.0)]
     duration: f64,
@@ -93,7 +117,8 @@ struct RecordArgs {
     #[arg(long, default_value_t = 20)]
     quality: u8,
 
-    /// Draw click ripples and drag trails into the recording (MouseShow)
+    /// Mouse effects (the panel's "鼠标效果"): draw click ripples and drag
+    /// trails into the recording (MouseShow)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     marks: bool,
 }
@@ -185,6 +210,11 @@ impl std::str::FromStr for CropArg {
 
 fn main() {
     let cli = Cli::parse();
+    // Global override, honoured by every `ffmpeg::locate` below (the panel has
+    // its own setting for this; the CLI takes the flag).
+    if let Some(path) = cli.ffmpeg {
+        ffmpeg::set_path(Some(path));
+    }
     let result = match cli.command {
         Command::List { filter } => list(&filter),
         Command::Record(args) => record(args),
@@ -193,7 +223,9 @@ fn main() {
         Command::Mcp => mcp::run(),
     };
     if let Err(e) = result {
-        eprintln!("takekit: {e}");
+        // A `diagnose` code becomes its English sentence here; anything else
+        // is already the sentence.
+        eprintln!("takekit: {}", takekit_core::diagnose::explain(&e));
         std::process::exit(1);
     }
 }
@@ -210,12 +242,27 @@ fn list(filter: &str) -> Result<(), String> {
     }
 
     println!("\ncapture devices:");
-    let devs = ffmpeg::list_capture_devices(&ff);
+    // The merged enumeration (dshow ∪ MF), the same list the panel's picker
+    // and the agent's control surface show. Tags: which backends can open it,
+    // and `(no signal)` when DirectShow reports a registered filter with no
+    // output pin — a virtual camera whose host app is off.
+    let devs = takekit_core::devices::cameras(Some(&ff));
     if devs.is_empty() {
         println!("  (none)");
     }
     for d in devs {
-        println!("  {d}");
+        let status = if d.live == Some(false) {
+            "  (no signal)"
+        } else {
+            ""
+        };
+        let backends = match (d.dshow, d.mf) {
+            (true, true) => "dshow+mf",
+            (true, false) => "dshow",
+            (false, true) => "mf",
+            (false, false) => "?",
+        };
+        println!("  {}{}  [{}]", d.name, status, backends);
     }
     Ok(())
 }
@@ -270,23 +317,40 @@ fn record(args: RecordArgs) -> Result<(), String> {
         ));
     }
     let mut sources = Vec::new();
+    if args.window_sound && args.window.is_none() {
+        return Err("--window-sound records a window's sound, so it needs --window".into());
+    }
+    if args.desktop_sound && args.window.is_some() {
+        return Err(
+            "--desktop-sound records the desktop's sound; drop --window, or use --window-sound"
+                .into(),
+        );
+    }
     if let Some(target) = &args.window {
         let win = window_target(target)?;
-        sources.push(Source::new(
+        let mut source = Source::new(
             "win",
             Capture::Window {
                 hwnd: win.hwnd,
+                // The handle alone can be recycled onto another app's window;
+                // the process makes "this window" mean something.
+                pid: win.pid,
                 title: win.title,
                 crop: args.crop.0,
             },
             args.fps,
-        ));
+        );
+        // The sound of this window goes into this source's own file, not into
+        // one of its own: what a user picked is a window, sound included.
+        source.audio = args.window_sound;
+        sources.push(source);
     } else {
-        sources.push(Source::new(
-            "screen",
-            desktop_capture(args.crop.0),
-            args.fps,
-        ));
+        let mut source = Source::new("screen", desktop_capture(args.crop.0), args.fps);
+        // Windows has no per-monitor sound: what the desktop source carries is
+        // everything the speakers play, the same loopback the `--system-audio`
+        // source records — but in this source's own file, behind its picture.
+        source.audio = args.desktop_sound;
+        sources.push(source);
     }
     if let Some(device) = &args.cam {
         sources.push(Source::new(
@@ -297,6 +361,22 @@ fn record(args: RecordArgs) -> Result<(), String> {
             },
             args.fps,
         ));
+    }
+    // Sound sources are in-process on either backend (ffmpeg has no WASAPI
+    // loopback), so the same flags mean the same thing with and without
+    // `--windows`. Added here rather than in the media harness so a long
+    // multi-source take lands a take.json like any other record run.
+    if let Some(device) = &args.mic {
+        sources.push(Source::new(
+            "mic",
+            Capture::Mic {
+                device: device.clone(),
+            },
+            args.fps,
+        ));
+    }
+    if args.system_audio {
+        sources.push(Source::new("sys", Capture::SystemAudio {}, args.fps));
     }
 
     let settings = Settings {
@@ -359,7 +439,11 @@ fn record(args: RecordArgs) -> Result<(), String> {
     let finished = rec.stop().map_err(|e| e.to_string())?;
     for outcome in &finished.sources {
         match (&outcome.error, outcome.seconds) {
-            (Some(err), _) => println!("  {}: FAILED — {}", outcome.id, err),
+            (Some(err), _) => println!(
+                "  {}: FAILED — {}",
+                outcome.id,
+                takekit_core::diagnose::explain(err)
+            ),
             (None, Some(d)) => {
                 println!("  {}: {d:.3}s  ({:.1} MB)", outcome.id, outcome.megabytes())
             }
@@ -380,7 +464,7 @@ fn record(args: RecordArgs) -> Result<(), String> {
 /// One audio writer started on its own thread: the capture's end of the
 /// frame channel, the end its format arrives on, and the thread itself.
 type AudioWriterStart = (
-    std::sync::mpsc::Sender<MediaFrame>,
+    std::sync::mpsc::SyncSender<MediaFrame>,
     std::sync::mpsc::Sender<(u32, u32)>,
     std::thread::JoinHandle<Result<(String, u64), String>>,
 );
@@ -398,7 +482,9 @@ fn open_audio(name: &str, path: PathBuf, bitrate: u32) -> AudioWriterStart {
     use std::sync::mpsc;
     use std::thread;
 
-    let (tx, rx) = mpsc::channel::<MediaFrame>();
+    // Same bounded queue the core's `start_audio_media` uses; a full one drops
+    // the chunk (see `takekit_media::offer`).
+    let (tx, rx) = mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = mpsc::channel();
     let name = name.to_string();
     let handle = thread::spawn(move || -> Result<(String, u64), String> {
@@ -461,7 +547,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
     // writer's drain took.
     let end_hint = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let mut writers: Vec<thread::JoinHandle<Result<(String, u64), String>>> = Vec::new();
-    let mut senders: Vec<mpsc::Sender<MediaFrame>> = Vec::new();
+    let mut senders: Vec<mpsc::SyncSender<MediaFrame>> = Vec::new();
 
     // Each source gets its own channel and its own writer thread: a capture
     // must never block on an encoder, and the files are separate anyway.
@@ -471,8 +557,8 @@ fn media(args: MediaArgs) -> Result<(), String> {
     // when it arrives with the gap it really had; with `--cfr` the picture is
     // sampled at --fps. Same frames out, different sampling in.
     type SourceWriter = thread::JoinHandle<Result<(String, u64), String>>;
-    let open = |name: &str| -> (mpsc::Sender<MediaFrame>, SourceWriter) {
-        let (tx, rx) = mpsc::channel::<MediaFrame>();
+    let open = |name: &str| -> (mpsc::SyncSender<MediaFrame>, SourceWriter) {
+        let (tx, rx) = mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
         let path = dir.join(format!("{name}.mp4"));
         let name = name.to_string();
         let fps = args.fps.max(1);
@@ -670,11 +756,27 @@ fn media_list() -> Result<(), String> {
         println!("  [{:#x}] {} {}x{}", w.hwnd, title, w.rect.w, w.rect.h);
     }
     println!("cameras:");
-    if devices.cameras.is_empty() {
+    // The merged enumeration (dshow ∪ MF), tagged by which backend can open
+    // each one — same list as `takekit list`, the panel's picker and the
+    // agent's control surface. `media` itself records on the windows backend
+    // and needs an `mf` camera.
+    let cams = takekit_core::devices::cameras(takekit_core::ffmpeg::locate().as_deref());
+    if cams.is_empty() {
         println!("  (none)");
     }
-    for c in &devices.cameras {
-        println!("  {}", c.name);
+    for c in &cams {
+        let status = if c.live == Some(false) {
+            "  (no signal)"
+        } else {
+            ""
+        };
+        let backends = match (c.dshow, c.mf) {
+            (true, true) => "dshow+mf",
+            (true, false) => "dshow",
+            (false, true) => "mf",
+            (false, false) => "?",
+        };
+        println!("  {}{}  [{}]", c.name, status, backends);
     }
     println!("microphones:");
     if devices.mics.is_empty() {
@@ -687,12 +789,26 @@ fn media_list() -> Result<(), String> {
 }
 
 fn resolve_camera(devices: &DeviceList, name: &str) -> Result<String, String> {
-    devices
+    if let Some(c) = devices
         .cameras
         .iter()
         .find(|c| c.name == name || c.link == name)
-        .map(|c| c.link.clone())
-        .ok_or_else(|| format!("no camera \"{name}\"; see `takekit media --list`"))
+    {
+        return Ok(c.link.clone());
+    }
+    // Not MF-visible. If the merged list knows it as a DirectShow-only
+    // camera, say that instead of "no such device" — same guidance the
+    // other doors give (the `err.cam-not-mf` sentence).
+    let known = takekit_core::devices::cameras(takekit_core::ffmpeg::locate().as_deref())
+        .into_iter()
+        .find(|c| c.name == name);
+    match known {
+        Some(c) if !c.mf => Err(takekit_core::diagnose::explain(&format!(
+            "{}|{name}",
+            takekit_core::diagnose::CAM_NOT_MF
+        ))),
+        _ => Err(format!("no camera \"{name}\"; see `takekit media --list`")),
+    }
 }
 
 fn resolve_mic(devices: &DeviceList, name: &str) -> Result<String, String> {

@@ -96,6 +96,29 @@ pub fn toggle(app: &AppHandle) {
     let _ = window.set_focus();
 }
 
+/// Bring the popover up for keeps — the second launch's "show me what is
+/// already running" while a take owns the screen. Unlike `toggle` this never
+/// hides an already-visible popover (a focus request is not a close request)
+/// and skips the reopen guard (that guard is for the tray click's own focus
+/// juggling, not for an explicit raise).
+pub fn raise(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(LABEL) else {
+        crate::probe("tray:no-panel");
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.set_focus();
+        return;
+    }
+    match position_near_tray(app, &window) {
+        Ok(()) => crate::probe("tray:placed"),
+        Err(e) => crate::probe(&format!("tray:place-failed {e}")),
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+    crate::probe("tray:raised");
+}
+
 pub fn hide(window: &WebviewWindow) {
     if window.hide().is_ok() {
         crate::probe("tray:hidden");

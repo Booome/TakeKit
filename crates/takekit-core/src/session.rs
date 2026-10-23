@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Instant;
 
+use crate::diagnose;
 use crate::encoder::{self, Encoder};
 use crate::ffmpeg;
 use crate::marks::Marks;
 use crate::source::{Backend, Capture, Engine, Source, is_recordable};
 use crate::take::Take;
 use takekit_media::{
-    CameraCapture, LoopbackCapture, LoopbackTarget, MediaFrame, MicCapture, ScreenCapture,
+    CameraCapture, LoopbackCapture, LoopbackTarget, MediaFrame, MicCapture, MuxSink, ScreenCapture,
     ScreenTarget, TakeClock,
 };
 
@@ -65,7 +66,7 @@ pub struct Settings {
     pub quality: u8,
     /// `None` picks the best available encoder.
     pub encoder: Option<Encoder>,
-    /// Draw click ripples and drag trails (MouseShow).
+    /// Mouse effects: draw click ripples and drag trails (MouseShow).
     pub marks: bool,
     /// ffmpeg children, or the OS capture APIs in-process.
     pub backend: Backend,
@@ -204,13 +205,57 @@ impl Prepared {
                     capture: src.capture.clone(),
                     handle: Some(handle_capture),
                     sender: Some(sender),
+                    sound: None,
                     writer,
                     out,
                 });
                 continue;
             }
 
-            let (tx, rx) = std::sync::mpsc::channel::<MediaFrame>();
+            // A source that records sound with its picture writes one file
+            // with both tracks: the picture through WGC, the sound through
+            // WASAPI's loopback, one sink writer behind the pair. What the
+            // sound *is* depends on the picture — a window's own process tree,
+            // or everything the speakers play for the desktop (see `start_av`).
+            if src.audio {
+                let t_spawn = Instant::now();
+                let started = start_av(
+                    src,
+                    out.clone(),
+                    clock,
+                    end_hint.clone(),
+                    bitrate,
+                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
+                );
+                let (handle_capture, sender, sound, writer) = match started {
+                    Ok(quad) => quad,
+                    Err(e) => {
+                        drop(recording);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(e);
+                    }
+                };
+                recording
+                    .spawn_ms
+                    .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
+                recording.media.push(MediaRunning {
+                    id: src.id.clone(),
+                    capture: src.capture.clone(),
+                    handle: Some(handle_capture),
+                    sender: Some(sender),
+                    sound: Some(sound),
+                    writer,
+                    out,
+                });
+                continue;
+            }
+
+            // Bounded, and fed through `offer` by the captures: the writer
+            // must never make the capture wait, and an unbounded queue would
+            // turn "the writer is behind" into unbounded memory growth (a 4K
+            // BGRA frame is about 33 MB). A full queue drops the frame — the
+            // encoder holds the previous picture across the gap.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
 
             // One writer thread per source, holding the Media Foundation
             // objects: they are not `Send`, and the capture must never block
@@ -231,20 +276,13 @@ impl Prepared {
             // the captures so the writers drain and finalise), then remove the
             // folder — nothing usable was recorded.
             let started = match &src.capture {
-                Capture::Desktop { rect, .. } => {
-                    // WGC captures one output at a time — a "whole virtual
-                    // desktop" does not exist for it. A remembered rect picks
-                    // the monitor holding its centre (that is what the picker
-                    // stored); no rect falls back to the first monitor, which
-                    // is what this used to do unconditionally (2026-10-21 多屏).
-                    let index = match rect {
-                        Some(r) => takekit_media::monitor_index_for(r.x, r.y, r.w, r.h),
-                        None => None,
-                    }
-                    .unwrap_or(1);
-                    ScreenCapture::start(ScreenTarget::Monitor(index), src.fps, tx.clone(), clock)
-                        .map(MediaCapture::Screen)
-                }
+                Capture::Desktop { rect, .. } => ScreenCapture::start(
+                    ScreenTarget::Monitor(monitor_index(*rect)),
+                    src.fps,
+                    tx.clone(),
+                    clock,
+                )
+                .map(MediaCapture::Screen),
                 Capture::Window { hwnd, .. } => {
                     // No raise, and none needed: WGC keeps recording a window
                     // that sits behind others. That is the whole point of this
@@ -281,6 +319,7 @@ impl Prepared {
                 capture: src.capture.clone(),
                 handle: Some(handle_capture),
                 sender: Some(tx),
+                sound: None,
                 writer: handle,
                 out,
             });
@@ -353,6 +392,7 @@ impl Prepared {
                     capture: src.capture.clone(),
                     handle: Some(handle_capture),
                     sender: Some(sender),
+                    sound: None,
                     writer,
                     out,
                 });
@@ -428,9 +468,31 @@ struct MediaRunning {
     /// — the same role `Running.capture` plays for the ffmpeg ones.
     capture: Capture,
     handle: Option<MediaCapture>,
-    sender: Option<std::sync::mpsc::Sender<MediaFrame>>,
+    sender: Option<std::sync::mpsc::SyncSender<MediaFrame>>,
+    /// The sound that goes into this source's own file, when it asked for one
+    /// (a window recording its own process tree). It has its own capture and
+    /// its own channel, but shares the one writer thread — a sink writer is
+    /// not something to hand to two threads.
+    sound: Option<SoundLane>,
     writer: std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
     out: PathBuf,
+}
+
+/// One extra capture feeding an existing source's writer.
+struct SoundLane {
+    capture: Option<MediaCapture>,
+    sender: Option<std::sync::mpsc::SyncSender<MediaFrame>>,
+}
+
+impl SoundLane {
+    /// Stop the capture, then drop the channel so the writer drains and the
+    /// file closes. Same order the picture path uses, for the same reason.
+    fn stop(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            let _ = capture.stop();
+        }
+        self.sender.take();
+    }
 }
 
 impl MediaRunning {
@@ -446,6 +508,11 @@ impl MediaRunning {
         // in the channel, finalises the file and exits. Not joined here — the
         // UI asked for one source to stop, not for the take to pause on it.
         self.sender.take();
+        // The sound goes with its picture; a writer waiting on two channels
+        // only ends when both of them are closed.
+        if let Some(mut lane) = self.sound.take() {
+            lane.stop();
+        }
         true
     }
 
@@ -455,6 +522,9 @@ impl MediaRunning {
             let _ = handle.stop();
         }
         self.sender.take();
+        if let Some(mut lane) = self.sound.take() {
+            lane.stop();
+        }
         // `JoinHandle::join` takes ownership, so the handle leaves `self`.
         let writer = std::mem::replace(
             &mut self.writer,
@@ -482,12 +552,7 @@ impl MediaRunning {
                 Some((report.width, report.height)),
                 None,
             ),
-            Ok(_) => (
-                None,
-                Some(0),
-                None,
-                Some("no frames were written".to_string()),
-            ),
+            Ok(_) => (None, Some(0), None, Some(diagnose::FFMPEG_DIED.to_string())),
             Err(e) => (None, None, None, Some(e)),
         };
         Collected {
@@ -548,12 +613,7 @@ fn write_frames(
             // WGC hands over the whole window or monitor; the edges the editor
             // picked are cut here, so a cropped source records the same picture
             // on this backend as it does through ffmpeg's region grab.
-            crop: takekit_media::writer::CropBox {
-                top: crop.top,
-                bottom: crop.bottom,
-                left: crop.left,
-                right: crop.right,
-            },
+            crop: crop_box(crop),
             sampling: takekit_media::writer::Sampling::EveryFrame,
         },
         clock,
@@ -565,6 +625,231 @@ fn write_frames(
         frames: report.frames,
         width: report.width,
         height: report.height,
+    })
+}
+
+/// The edges the editor picked, in the writer's own vocabulary.
+fn crop_box(crop: crate::source::Crop) -> takekit_media::writer::CropBox {
+    takekit_media::writer::CropBox {
+        top: crop.top,
+        bottom: crop.bottom,
+        left: crop.left,
+        right: crop.right,
+    }
+}
+
+/// One started picture-with-sound source: the picture's capture, the channel
+/// into its writer, the sound capture with its own channel, and the thread
+/// that drains both into one file.
+type StartedAv = (
+    MediaCapture,
+    std::sync::mpsc::SyncSender<MediaFrame>,
+    SoundLane,
+    std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
+);
+
+/// Which monitor a desktop source records.
+///
+/// WGC captures one output at a time — a "whole virtual desktop" does not exist
+/// for it. A remembered rect picks the monitor holding its centre (that is what
+/// the picker stored); no rect falls back to the first monitor, which is what
+/// this used to do unconditionally (2026-10-21 多屏).
+fn monitor_index(rect: Option<crate::source::ScreenRect>) -> usize {
+    match rect {
+        Some(r) => takekit_media::monitor_index_for(r.x, r.y, r.w, r.h),
+        None => None,
+    }
+    .unwrap_or(1)
+}
+
+/// Start a picture and the sound that belongs with it, as one source.
+///
+/// Two captures, one writer: a sink writer is not something to hand to two
+/// threads, so both channels are drained by the thread that owns it (see
+/// `write_av`).
+///
+/// * A **window** brings its own sound: the process tree, which is what a
+///   window really is to a user — the process and its children, so a browser
+///   playing music in another process still counts as this window.
+/// * The **desktop** brings everyone's: everything the speakers play, which is
+///   the same WASAPI loopback the `SystemAudio` source records. There is no
+///   per-monitor sound on Windows, so "this screen's sound" and "this
+///   computer's sound" are the same thing — the option lives on the desktop
+///   source instead of on a monitor.
+fn start_av(
+    src: &Source,
+    out: PathBuf,
+    clock: TakeClock,
+    end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    bitrate: u32,
+    audio_bitrate_kbps: u32,
+) -> Result<StartedAv> {
+    // What to capture, and what to listen to while capturing it. Both are
+    // settled before anything opens: an unreachable target must fail before a
+    // second capture is left running.
+    let (video_target, audio_target) = match &src.capture {
+        Capture::Window {
+            hwnd, pid: owner, ..
+        } => {
+            // A window that is gone has no process tree left to listen to, and
+            // no picture either — say so before anything opens. The handle must
+            // still be the same process's: another app's window inheriting the
+            // number would put *its* music in this file.
+            let pid = takekit_media::loopback::window_pid(*hwnd)
+                .ok_or_else(|| Error::Source(format!("no process owns window {hwnd:#x}")))?;
+            if *owner != 0 && pid != *owner {
+                return Err(Error::Source(format!(
+                    "window {hwnd:#x} is now pid {pid}'s, not pid {owner}'s"
+                )));
+            }
+            (
+                ScreenTarget::Window(*hwnd),
+                LoopbackTarget::ProcessTree(pid),
+            )
+        }
+        Capture::Desktop { rect, .. } => (
+            ScreenTarget::Monitor(monitor_index(*rect)),
+            LoopbackTarget::All,
+        ),
+        other => {
+            return Err(Error::Source(format!(
+                "{} has no sound of its own to carry; only a window or the desktop does",
+                other.device_name().unwrap_or("this source")
+            )));
+        }
+    };
+
+    let fps = src.fps.max(1);
+    let crop = crop_box(src.capture.crop());
+    let (vtx, vrx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
+    let (atx, arx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
+    let (format_tx, format_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        write_av(
+            vrx,
+            arx,
+            format_rx,
+            out,
+            fps,
+            bitrate,
+            audio_bitrate_kbps,
+            clock,
+            end_hint,
+            crop,
+        )
+    });
+
+    // The picture first: if it cannot be captured there is nothing to put the
+    // sound into, and the loopback is the more expensive open.
+    let screen =
+        ScreenCapture::start(video_target, fps, vtx.clone(), clock).map_err(spawn_error)?;
+    let loopback = LoopbackCapture::start(audio_target, atx.clone(), clock).map_err(spawn_error)?;
+    let f = loopback.format();
+    format_tx
+        .send((f.sample_rate, f.channels))
+        .map_err(|_| Error::Source("the sound writer is gone".into()))?;
+
+    Ok((
+        MediaCapture::Screen(screen),
+        vtx,
+        SoundLane {
+            capture: Some(MediaCapture::Loopback(loopback)),
+            sender: Some(atx),
+        },
+        handle,
+    ))
+}
+
+/// Drain a picture and the sound that belongs with it into one MP4.
+///
+/// The sound usually starts talking before the first frame has arrived, and
+/// Media Foundation will not take a stream for a sink that has already begun
+/// writing. So the sound waits in its channel — a second or two of it fits —
+/// and goes in right behind the first frame, which is what says how big the
+/// file is.
+///
+/// The returned length is whichever stream ended later: the container's own
+/// duration is the longer of the two, and a take's manifest should say the
+/// same thing the file does.
+#[allow(clippy::too_many_arguments)]
+fn write_av(
+    vrx: std::sync::mpsc::Receiver<MediaFrame>,
+    arx: std::sync::mpsc::Receiver<MediaFrame>,
+    format_rx: std::sync::mpsc::Receiver<(u32, u32)>,
+    out: PathBuf,
+    fps: u32,
+    bitrate: u32,
+    audio_bitrate_kbps: u32,
+    clock: TakeClock,
+    end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    crop: takekit_media::writer::CropBox,
+) -> std::result::Result<WriteReport, String> {
+    use std::sync::atomic::Ordering;
+    use takekit_media::writer::{crop_frame, even_frame};
+
+    let (rate, channels) = format_rx
+        .recv()
+        .map_err(|_| "the sound capture never reported a format".to_string())?;
+
+    let first = loop {
+        match vrx.recv() {
+            Ok(MediaFrame::Video(frame)) => break frame,
+            Ok(_) => {}
+            Err(_) => return Err("the window never delivered a frame".into()),
+        }
+    };
+    let first = even_frame(crop_frame(first, crop));
+    let size = (first.width, first.height);
+
+    let sink = MuxSink::create(&out).map_err(|e| e.to_string())?;
+    let mut video = sink
+        .add_video(first.format, first.width, first.height, fps, bitrate)
+        .map_err(|e| e.to_string())?;
+    let mut audio = sink
+        .add_audio(rate, channels, audio_bitrate_kbps)
+        .map_err(|e| e.to_string())?;
+    sink.begin().map_err(|e| e.to_string())?;
+    video.write(&first).map_err(|e| e.to_string())?;
+
+    let mut frames = 1u64;
+    loop {
+        // Sound first in every turn: a chunk is a couple of kilobytes and must
+        // not queue behind a picture the encoder is busy with.
+        while let Ok(frame) = arx.try_recv() {
+            if let MediaFrame::Audio(chunk) = frame {
+                audio.write(&chunk).map_err(|e| e.to_string())?;
+            }
+        }
+        match vrx.recv_timeout(std::time::Duration::from_millis(2)) {
+            Ok(MediaFrame::Video(frame)) => {
+                let frame = even_frame(crop_frame(frame, crop));
+                video.write(&frame).map_err(|e| e.to_string())?;
+                frames += 1;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // What the sound still held, then the picture's last frame held until the
+    // stop time — the same end every other file in the take gets.
+    while let Ok(frame) = arx.try_recv() {
+        if let MediaFrame::Audio(chunk) = frame {
+            audio.write(&chunk).map_err(|e| e.to_string())?;
+        }
+    }
+    let end = match end_hint.load(Ordering::SeqCst) {
+        0 => clock.now_100ns(),
+        t => t,
+    };
+    video.flush(Some(end)).map_err(|e| e.to_string())?;
+    let audio_end = audio.end();
+    sink.finalize().map_err(|e| e.to_string())?;
+    Ok(WriteReport {
+        seconds: end.max(audio_end) as f64 / 10_000_000.0,
+        frames,
+        width: size.0,
+        height: size.1,
     })
 }
 
@@ -592,9 +877,7 @@ fn camera_link(device: &str) -> std::result::Result<String, takekit_media::Media
         .find(|c| c.name == device || c.link == device)
         .map(|c| c.link.clone())
         .ok_or_else(|| {
-            takekit_media::MediaError::message(format!(
-                "no camera \"{device}\" visible to Media Foundation (the ffmpeg backend sees more)"
-            ))
+            takekit_media::MediaError::message(format!("{}|{device}", diagnose::CAM_NOT_MF))
         })
 }
 
@@ -606,9 +889,7 @@ fn mic_endpoint(device: &str) -> std::result::Result<String, takekit_media::Medi
         .find(|m| m.name == device || m.endpoint == device)
         .map(|m| m.endpoint.clone())
         .ok_or_else(|| {
-            takekit_media::MediaError::message(format!(
-                "no microphone \"{device}\"; takekit media --list shows the names"
-            ))
+            takekit_media::MediaError::message(format!("{}|{device}", diagnose::DEVICE_GONE))
         })
 }
 
@@ -616,7 +897,7 @@ fn mic_endpoint(device: &str) -> std::result::Result<String, takekit_media::Medi
 /// writer thread, and the writer thread itself.
 type StartedAudio = (
     MediaCapture,
-    std::sync::mpsc::Sender<MediaFrame>,
+    std::sync::mpsc::SyncSender<MediaFrame>,
     std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
 );
 
@@ -633,7 +914,10 @@ fn start_audio_media(
     clock: TakeClock,
     bitrate_kbps: u32,
 ) -> Result<StartedAudio> {
-    let (tx, rx) = std::sync::mpsc::channel::<MediaFrame>();
+    // Bounded like the video one, but much deeper: chunks are tiny, and a
+    // dropped chunk pulls the rest of the file earlier (audio is written back
+    // to back) — only a writer stuck for whole seconds should ever fill it.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || write_audio(rx, format_rx, out, bitrate_kbps));
 
@@ -650,11 +934,19 @@ fn start_audio_media(
             let f = capture.format();
             (MediaCapture::Loopback(capture), (f.sample_rate, f.channels))
         }
-        Capture::WindowAudio { hwnd, .. } => {
+        Capture::WindowAudio {
+            hwnd, pid: owner, ..
+        } => {
             // The filter is the process tree of the window's owner. A window
-            // that is gone has no tree left to listen to.
+            // that is gone has no tree left to listen to, and a recycled
+            // handle would filter on a stranger's tree.
             let pid = takekit_media::loopback::window_pid(*hwnd)
                 .ok_or_else(|| Error::Source(format!("no process owns window {hwnd:#x}")))?;
+            if *owner != 0 && pid != *owner {
+                return Err(Error::Source(format!(
+                    "window {hwnd:#x} is now pid {pid}'s, not pid {owner}'s"
+                )));
+            }
             let capture =
                 LoopbackCapture::start(LoopbackTarget::ProcessTree(pid), tx.clone(), clock)
                     .map_err(spawn_error)?;
@@ -673,9 +965,12 @@ fn start_audio_media(
     Ok((capture, tx, handle))
 }
 
-/// Drain an audio capture into one MP4 of AAC, then finalise it. The file's
-/// length is the samples that arrived — chunks are written back to back, so
-/// there is no end hint to latch (unlike the video writer's held frame).
+/// Drain an audio capture into one MP4 of AAC, then finalise it.
+///
+/// The file's length is where its timeline stopped rather than how many bytes
+/// arrived: chunks are written back to back, so there is no end hint to latch
+/// (unlike the video writer's held frame), but the lead-in silence that pads a
+/// late-waking device does belong to the take and does count.
 fn write_audio(
     rx: std::sync::mpsc::Receiver<MediaFrame>,
     format_rx: std::sync::mpsc::Receiver<(u32, u32)>,
@@ -690,19 +985,15 @@ fn write_audio(
     let mut writer =
         AudioWriter::create(&out, rate, channels, bitrate_kbps).map_err(|e| e.to_string())?;
     let mut chunks = 0u64;
-    let mut bytes = 0u64;
     while let Ok(frame) = rx.recv() {
         if let MediaFrame::Audio(chunk) = frame {
-            bytes += chunk.data.len() as u64;
             chunks += 1;
             writer.write(&chunk).map_err(|e| e.to_string())?;
         }
     }
-    writer.finish().map_err(|e| e.to_string())?;
-    // PCM 16-bit interleaved: two bytes per sample per channel.
-    let seconds = bytes as f64 / (rate as f64 * channels as f64 * 2.0);
+    let end = writer.finish().map_err(|e| e.to_string())?;
     Ok(WriteReport {
-        seconds,
+        seconds: end as f64 / 10_000_000.0,
         frames: chunks,
         width: 0,
         height: 0,
@@ -734,9 +1025,11 @@ fn audio_bitrate_for(quality: u8) -> u32 {
 }
 
 /// Every spawn failure is a `Source` error: the caller knows what it asked to
-/// record, and the capture's own words name the device that refused.
+/// record, and the capture's own words name the device that refused. Known
+/// failures come back as `err.*|device` codes (see `diagnose`) so every face
+/// can say the same thing in its own words.
 fn spawn_error(e: takekit_media::MediaError) -> Error {
-    Error::Source(e.to_string())
+    Error::Source(diagnose::diagnose(&e.to_string(), None))
 }
 
 struct Running {
@@ -896,17 +1189,29 @@ impl Recording {
 
                         let bytes = std::fs::metadata(&r.out).map(|m| m.len()).unwrap_or(0);
                         let outcome = if bytes == 0 {
-                            let tail = ffmpeg::tail(&r.log, 3);
+                            // The signature that names the failure (e.g.
+                            // "Could not find output pin") need not be in the
+                            // last lines, so classification reads a wide
+                            // window; only the verbatim fallback quotes the
+                            // tail.
+                            let wide = ffmpeg::tail(&r.log, 20);
+                            let device = r.capture.device_name();
                             Collected {
                                 id: r.id.clone(),
                                 bytes: 0,
                                 seconds: None,
                                 frames: None,
                                 size: None,
-                                error: Some(if tail.is_empty() {
-                                    "ffmpeg exited without writing a frame or a log line".into()
-                                } else {
-                                    tail
+                                error: Some(match diagnose::classify(&wide, device) {
+                                    Some(code) => code,
+                                    None => {
+                                        let tail = ffmpeg::tail(&r.log, 3);
+                                        if tail.is_empty() {
+                                            diagnose::FFMPEG_DIED.to_string()
+                                        } else {
+                                            tail
+                                        }
+                                    }
                                 }),
                             }
                         } else {
@@ -1086,6 +1391,21 @@ impl Session {
     pub fn prepare(settings: Settings) -> Result<Prepared> {
         let t0 = std::time::Instant::now();
         validate_sources(&settings.sources)?;
+        // Sound inside a picture's file is a Media Foundation mux: ffmpeg has
+        // no WASAPI loopback and no way to put one stream's bytes into another
+        // stream's container here. Refused by name rather than silently
+        // recording a silent file — "the speaker was on and the file is mute"
+        // is indistinguishable from a broken microphone.
+        if settings.backend != Backend::Windows {
+            if let Some(bad) = settings.sources.iter().find(|s| s.audio) {
+                return Err(Error::Source(format!(
+                    "{}: recording its sound into its own file needs the Windows backend \
+                     (WGC + MF); ffmpeg has no WASAPI loopback — add --windows, or record \
+                     the sound as a source of its own (--system-audio)",
+                    bad.capture.device_name().unwrap_or("the desktop")
+                )));
+            }
+        }
         if settings.backend == Backend::Windows {
             return Self::prepare_windows(settings, t0);
         }
@@ -1189,8 +1509,10 @@ impl Session {
                     // apply — they are cut out of the captured frame by the
                     // writer — which is what the panel's editor writes.
                 }
-                Capture::Window { hwnd, title, .. } => {
-                    if let Err(e) = crate::source::window_by_hwnd(*hwnd) {
+                Capture::Window {
+                    hwnd, pid, title, ..
+                } => {
+                    if let Err(e) = crate::source::resolve_window(*hwnd, *pid) {
                         return Err(Error::Source(format!("{title}: {e}")));
                     }
                 }
@@ -1208,13 +1530,19 @@ impl Session {
                     // device, which Windows guarantees exists while any
                     // audio endpoint is present.
                 }
-                Capture::WindowAudio { hwnd, title, .. } => {
+                Capture::WindowAudio {
+                    hwnd, pid, title, ..
+                } => {
                     // Sound survives the window being covered or minimised
                     // (that is the point of per-process loopback) — only the
-                    // window going away ends it, so `IsWindow` is the whole
-                    // check, same as `is_recordable`.
-                    if let Err(e) = crate::source::window_by_hwnd(*hwnd) {
-                        return Err(Error::Source(format!("{title}: {e}")));
+                    // window going away, or its handle being recycled by
+                    // another process, ends it. No client area is required and
+                    // nothing is restored: a sound source must not move the
+                    // user's screen just to be checked.
+                    if !crate::source::window_is_alive(*hwnd, *pid) {
+                        return Err(Error::Source(format!(
+                            "{title}: window {hwnd:#x} is gone or belongs to another process"
+                        )));
                     }
                 }
             }
@@ -1351,6 +1679,49 @@ mod tests {
     fn two_sources_cannot_share_an_id() {
         let err = validate_sources(&[source("screen"), source("screen")]).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    /// Sound and picture in one file is a Media Foundation mux. The ffmpeg
+    /// backend has no WASAPI loopback to feed it, so a source asking for both
+    /// has to be refused by name — silently recording a mute file looks
+    /// exactly like a broken microphone.
+    #[test]
+    fn sound_inside_the_picture_needs_the_windows_backend() {
+        let mut desk = source("screen");
+        desk.audio = true;
+        let settings = Settings {
+            sources: vec![desk],
+            out_root: std::env::temp_dir(),
+            quality: 20,
+            encoder: None,
+            marks: false,
+            backend: Backend::Ffmpeg,
+        };
+        let err = match Session::prepare(settings) {
+            Ok(_) => panic!("the ffmpeg backend accepted a source with sound in its file"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("Windows backend"), "{err}");
+
+        // The same source on the Windows backend is not refused here — it is
+        // what the panel records every day.
+        let mut desk = source("screen");
+        desk.audio = true;
+        let settings = Settings {
+            sources: vec![desk],
+            out_root: std::env::temp_dir(),
+            quality: 20,
+            encoder: None,
+            marks: false,
+            backend: Backend::Windows,
+        };
+        match Session::prepare(settings) {
+            Ok(_) => {}
+            // A desktop source resolves without touching any hardware, so a
+            // failure here would be a real regression and must not pass as
+            // "expected in CI".
+            Err(e) => panic!("the Windows backend refused a desktop take: {e}"),
+        }
     }
 
     #[test]

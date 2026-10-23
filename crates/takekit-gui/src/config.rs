@@ -37,6 +37,11 @@ pub struct Config {
     /// needs no re-picking.
     pub sources: Vec<Source>,
     pub out_root: Option<String>,
+    /// Where ffmpeg lives, when it is not on PATH. `None` keeps the PATH
+    /// lookup. A path that stops naming a file degrades to the PATH lookup
+    /// too (see `ffmpeg::locate`) — the setting survives, the lookup just
+    /// stops trusting it until the file is back.
+    pub ffmpeg_path: Option<String>,
     /// `None` keeps the automatic pick.
     pub encoder: Option<Encoder>,
     /// ffmpeg children, or the OS capture APIs in-process (the only one that
@@ -71,6 +76,7 @@ impl Default for Config {
             finalize_panel: true,
             sources: Vec::new(),
             out_root: None,
+            ffmpeg_path: None,
             encoder: None,
             backend: Backend::Windows,
             marks: true,
@@ -234,6 +240,8 @@ mod tests {
                     "win",
                     Capture::Window {
                         hwnd: 133890,
+                        // A config from before the field existed: unknown owner.
+                        pid: 0,
                         title: "TakeKit - TRAE CN".to_string(),
                         crop: Crop::default(),
                     },

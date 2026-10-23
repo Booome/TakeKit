@@ -13,7 +13,10 @@
   /* 4.5:1 on white: the old #8a8a8a was ~3.5:1, which reads as grey fuzz at
      13px (row meta, empty-state hints, log detail lines). */
   --tk-text-2: #54565e;
-  --tk-text-3: #71737c;
+  /* 4.77:1 on the canvas (#f5f6f8) and 5.16:1 on a surface — the previous
+     #71737c cleared 4.5 only against pure white and fell to 4.37 on the
+     canvas, which is where every hint and section label actually sits. */
+  --tk-text-3: #6b6d76;
   --tk-accent: #2563eb;
   --tk-accent-fg: #ffffff;
   --tk-accent-soft: rgba(37, 99, 235, 0.1);
@@ -490,14 +493,69 @@ select {
   color: var(--tk-rec);
 }
 
+/* The row's speaker switch, the last cell before the ×. The icon is the state,
+   so the control stays quiet when the file has no sound; "on" is the only thing
+   on the row allowed to be accent-coloured, because it means the file is not
+   just a picture. */
+.row-sound {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: var(--tk-text-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+/* The same cell where there is nothing to mute (a microphone *is* its sound, a
+   camera has no route to one). It keeps the column: the row packs from the
+   right, so a variable-width hole anywhere left of the size column would slide
+   the numbers a row at a time. Empty and unclickable, but not missing. */
+.row-sound-slot {
+  flex: none;
+  width: 26px;
+  height: 26px;
+}
+
+.row-sound svg {
+  width: 16px;
+  height: 16px;
+}
+
+.row-sound:hover {
+  background: var(--tk-sunken);
+  color: var(--tk-text-2);
+}
+
+.row-sound.on {
+  color: var(--tk-accent);
+  background: var(--tk-accent-soft);
+}
+
+.row-sound:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* What the row says about a source without opening it: frame rate and quality.
    Read-only — the numbers are set in the editor, and two dropdowns with no
-   labels ("30", "Q20") had to be guessed at. Fixed width, right-aligned like
-   the size column: two numeric columns that stack down the list. */
+   labels ("30", "Q20") had to be guessed at.
+
+   It hugs its own text. It used to be a fixed 88px holding a 58px string,
+   which parked 30px of dead air in the middle of the row: it read as
+   "1720×1392 ... gap ... 30fps" instead of one tight line. A fixed column buys
+   nothing here anyway — the trailing cells pin the right edge, so the digits
+   still line up down the list without reserving space for their worst case. */
 .row-summary {
   flex: none;
-  width: 88px;
-  text-align: right;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   color: var(--tk-text-2);
@@ -805,9 +863,13 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   flex: 1;
 }
 
-.field input.value,
-.field select.value,
-.set-row select.value {
+/* One control style for both layouts that hold a `.value`: the editor's
+   `.field` (label above control) and the settings pane's `.set-row .ctl`
+   (label beside control). Listing them once through `:is()` is what keeps a
+   new container from silently getting the browser's own white input — which
+   is exactly what the ffmpeg path box did in the dark theme. */
+:is(.field, .set-row) input.value,
+:is(.field, .set-row) select.value {
   height: 28px;
   padding: 0 8px;
   color: var(--tk-text);
@@ -819,26 +881,23 @@ body:not([data-tab="sources"]):not(.recording) .bar {
     background var(--tk-dur) var(--tk-ease);
 }
 
-.field input.value.mono {
+:is(.field, .set-row) input.value.mono {
   font-family: var(--tk-font-mono);
   font-size: 12px;
 }
 
-.field input.value:hover,
-.field select.value:hover,
-.set-row select.value:hover {
+:is(.field, .set-row) input.value:hover,
+:is(.field, .set-row) select.value:hover {
   border-color: var(--tk-border-strong);
 }
 
-.field input.value:focus,
-.field select.value:focus,
-.set-row select.value:focus {
+:is(.field, .set-row) input.value:focus,
+:is(.field, .set-row) select.value:focus {
   outline-offset: -1px;
   border-color: transparent;
 }
 
-.field select.value,
-.set-row select.value {
+:is(.field, .set-row) select.value {
   padding-right: 24px;
   appearance: none;
   background: var(--tk-surface) var(--tk-chevron) no-repeat right 7px center;
@@ -865,7 +924,10 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   min-width: 0;
 }
 
-.field button.browse {
+/* No `.field` prefix: the "…" pickers live in the settings pane's
+   `.set-row .ctl .path-row`, and the old `.field`-scoped rule never matched
+   them — leaving the browser's native button (unreadable in the dark theme). */
+button.browse {
   flex: none;
   width: 28px;
   height: 28px;
@@ -882,7 +944,7 @@ body:not([data-tab="sources"]):not(.recording) .bar {
     color var(--tk-dur) var(--tk-ease);
 }
 
-.field button.browse:hover {
+button.browse:hover {
   border-color: var(--tk-border-strong);
   color: var(--tk-text);
 }
@@ -1118,6 +1180,23 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   font-family: var(--tk-font-mono);
   font-size: 11px;
   color: var(--tk-text-3);
+}
+
+/* A camera registered but sending nothing (its host app is off). The meta
+   text says which host to start; the colour is the alarm. */
+.pick.no-signal .meta {
+  color: var(--tk-warn);
+}
+
+.pick.no-signal .meta::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 999px;
+  background: var(--tk-warn);
+  vertical-align: 1px;
 }
 
 .pick.empty-row {
@@ -1473,6 +1552,11 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   inset: 0;
   display: grid;
   place-items: center;
+  /* The reason is a sentence, and English says it in twice the width of the
+     Chinese: without insets it ran past the right edge and lost its tail. */
+  padding: 18px 24px;
+  text-align: center;
+  line-height: 1.5;
   color: #9a9ca4;
   font-size: 12px;
 }
@@ -1493,6 +1577,30 @@ body:not([data-tab="sources"]):not(.recording) .bar {
 
 .thumb:hover .thumb-cta,
 .thumb:focus-visible .thumb-cta {
+  opacity: 1;
+}
+
+/* The call to action covers the whole thumbnail; leaving the sentence visible
+   underneath it printed the two on top of each other. */
+.thumb:hover .thumb-empty,
+.thumb:focus-visible .thumb-empty {
+  opacity: 0;
+}
+
+/* No picture, no cropping (2026-10-23): a crop is four numbers against a frame
+   the user cannot see, and the state that has no picture — a minimized window —
+   is exactly where measuring blind goes wrong. The reason stays on screen
+   instead of being replaced by the hover invitation. */
+.thumb:disabled {
+  cursor: default;
+}
+
+.thumb:disabled .thumb-cta {
+  display: none;
+}
+
+.thumb:disabled:hover .thumb-empty,
+.thumb:disabled:focus-visible .thumb-empty {
   opacity: 1;
 }
 
@@ -1773,6 +1881,13 @@ body:not([data-tab="sources"]):not(.recording) .bar {
 
 .crop-box.limit {
   outline-color: var(--tk-rec);
+}
+
+/* Edges that leave nothing: the box covers the whole picture and is dashed,
+   because dragging it would not change what the file gets. */
+.crop-box.dropped {
+  outline-style: dashed;
+  cursor: default;
 }
 
 .crop-thirds {

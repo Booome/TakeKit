@@ -222,6 +222,7 @@ mod tests {
             capture: crate::source::Capture::desktop(None),
             fps: 30,
             quality: None,
+            audio: false,
         }
     }
 

@@ -337,6 +337,8 @@ fn snapshot(app: &tauri::AppHandle) -> Value {
             "countdown_secs": cfg.countdown_secs,
             "finalize_panel": cfg.finalize_panel,
             "out_root": cfg.out_root,
+            // `null` = PATH lookup, like `PATCH /config` takes it.
+            "ffmpeg_path": cfg.ffmpeg_path,
             // The same lowercase names `PATCH /config` accepts, `null` =
             // auto — one vocabulary in both directions.
             "encoder": serde_json::to_value(cfg.encoder).unwrap_or(Value::Null),
@@ -501,10 +503,23 @@ fn desktop_group() -> Vec<Value> {
 }
 
 fn camera_group() -> Vec<Value> {
-    takekit_media::devices::list()
-        .cameras
-        .iter()
-        .map(|c| json!({ "name": c.name, "link": c.link }))
+    // The merged enumeration (dshow ∪ MF) the panel's picker also shows, so
+    // an agent and the user look at the same list. Each entry carries the
+    // backends that can open it (`dshow` = the ffmpeg backend, `mf` = the
+    // windows backend) and the DirectShow liveness read: `live: false` is a
+    // registered virtual camera whose host app is off — start the host app
+    // instead of discovering it at record time.
+    takekit_core::devices::cameras(takekit_core::ffmpeg::locate().as_deref())
+        .into_iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "live": c.live,
+                "dshow": c.dshow,
+                "mf": c.mf,
+                "link": c.link,
+            })
+        })
         .collect()
 }
 
@@ -687,12 +702,14 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
                     let capture = if kind == "window" {
                         Capture::Window {
                             hwnd: w.hwnd,
+                            pid: w.pid,
                             title: w.title.clone(),
                             crop,
                         }
                     } else {
                         Capture::WindowAudio {
                             hwnd: w.hwnd,
+                            pid: w.pid,
                             title: w.title.clone(),
                         }
                     };
@@ -830,6 +847,17 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
     // The per-source quality override, only when asked for: `None` means the
     // session-wide quality, which is what the panel's own `addSource` writes.
     source.quality = quality;
+    // "sound": true puts this source's sound into its own file — for a window
+    // its process tree, for the desktop everything the speakers play (Windows
+    // has no per-monitor sound, so "this screen's sound" is the whole
+    // machine's). `kind: window-audio` / `system-audio` stay for recording just
+    // the sound, with no picture to put it in.
+    if matches!(
+        source.capture,
+        Capture::Window { .. } | Capture::Desktop { .. }
+    ) {
+        source.audio = body.get("sound").and_then(Value::as_bool).unwrap_or(false);
+    }
     Ok(source)
 }
 
@@ -887,6 +915,7 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
         "countdown_secs",
         "finalize_panel",
         "out_root",
+        "ffmpeg_path",
         "encoder",
         "backend",
         "marks",
@@ -903,8 +932,14 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
             )));
         }
     }
-    const FROZEN_WHILE_RECORDING: &[&str] =
-        &["out_root", "encoder", "backend", "marks", "raise_sources"];
+    const FROZEN_WHILE_RECORDING: &[&str] = &[
+        "out_root",
+        "ffmpeg_path",
+        "encoder",
+        "backend",
+        "marks",
+        "raise_sources",
+    ];
     if recording_now(app)
         && obj
             .keys()
@@ -964,6 +999,14 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
             }
         }
     }
+    if let Some(v) = obj.get("ffmpeg_path") {
+        // `null` and "" both mean "back to the PATH lookup"; a string is the
+        // path. Anything else is a refusal, like every other key here.
+        let ok = v.is_null() || v.as_str().is_some();
+        if !ok {
+            return Err(bad("ffmpeg_path must be a string or null"));
+        }
+    }
 
     // The registrar is asked before the file is written: a combination Windows
     // refuses must leave the old one working and the config agreeing with it.
@@ -993,6 +1036,11 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
         }
         if let Some(v) = obj.get("out_root") {
             cfg.out_root = v.as_str().map(str::to_string);
+        }
+        if let Some(v) = obj.get("ffmpeg_path") {
+            let path = v.as_str().map(str::to_string).filter(|s| !s.is_empty());
+            takekit_core::ffmpeg::set_path(path.as_deref().map(std::path::PathBuf::from));
+            cfg.ffmpeg_path = path;
         }
         if let Some(v) = obj.get("encoder") {
             cfg.encoder = match v.as_str() {
@@ -1234,6 +1282,10 @@ fn ui_fail(err: &UiError) -> Fail {
         "err.nothing-pending" => "no take is waiting to start",
         "err.save" => "the settings file could not be written",
         "err.internal" => "internal error",
+        // `diagnose` codes: the detail is the device name, so the sentence
+        // can name it exactly the way `diagnose::explain` does for the CLI.
+        "err.cam-no-signal" | "err.cam-not-mf" | "err.device-gone" | "err.cam-open"
+        | "err.ffmpeg-died" => return fail(500, &err.code, diagnose_explain(err)),
         _ => "request failed",
     };
     let message = match &err.detail {
@@ -1241,6 +1293,16 @@ fn ui_fail(err: &UiError) -> Fail {
         None => known.to_string(),
     };
     fail(status, &err.code, message)
+}
+
+/// A `diagnose` code back into its English sentence for the machine face,
+/// with the device name slotted in.
+fn diagnose_explain(err: &UiError) -> String {
+    let wire = match &err.detail {
+        Some(detail) => format!("{}|{detail}", err.code),
+        None => err.code.clone(),
+    };
+    takekit_core::diagnose::explain(&wire)
 }
 
 #[cfg(test)]

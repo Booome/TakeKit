@@ -129,8 +129,11 @@ takekit media --screen 1 --duration 6 --fps 30
 
 1. **验证摄像头**（有 MF 能看见的设备就能跑，代码已就绪）。
 2. ~~系统声音（WASAPI loopback）未实现~~ → ✅ 已做并实测（2026-10-23，见第 8 节）。
-3. **多路漂移观测**：每路估算漂移率（ppm）写进 `take.json`，30 分钟长录拿数据，
-   视结果决定是否做 slew 校正（音频为主时钟是候选方案）。
+3. ~~多路漂移观测~~ → ✅ 已测（2026-10-23，见第 11 节）：**没有可测的时钟漂移**，
+   不做 slew 校正。原计划的 `SourceRecord.drift_ppm` 字段也取消——上报口径修好之后
+   `sources[].duration` 本身就是文件终点，两路相减即漂移量，加字段等于给一个假差做补偿。
+   真正遗留的问题不是漂移，是**音频时间线被一次性事故拉长**（30 分钟里多出 4.9 秒），
+   修法见第 10 节末尾。
 4. ~~把"按帧率补齐"从 CLI 搬进 `takekit-media`~~ → 已由 core 的 `write_frames`
    承担（第 7 节）。
 5. ~~接进 GUI~~ → 已做（第 7 节）。
@@ -323,3 +326,183 @@ MP4 sink 会把轨道重定基到首样本，所以共享原点以**前导填充
    不是 `index.html`。
 3. **MCP 添加的源 `quality: null`**（会话级默认）→ GUI 摘要曾显示 `Qnull`；
    已回落 `DEFAULT_QUALITY` 显示实际生效值。
+
+## 10. 2026-10-23：虚拟摄像头三连改进 A/B/C（Mikey Cam 排查的落地）
+
+背景：Mikey 虚拟摄像头（`softcam.dll` 注册为 DirectShow filter）在宿主未运行时仍
+出现在设备列表，排查结论是"注册常驻、枚举报的是系统注册了什么"——不是 bug。但连带
+发现三个真问题，逐个修掉：
+
+### A. 报错可读化（「存码显文」）
+
+core 产出稳定码 `err.<name>|<device>`，各扇门各自渲染——GUI 走 i18n（`codeText`/
+`uiErrorText`）、CLI 走 `diagnose::explain()` 英文句、MCP/control 面走 `ui_fail`。
+
+| 码 | 触发 | 英文句要点 |
+|---|---|---|
+| `err.cam-no-signal` | `Could not find output pin` | registered but sends no video — start its host app |
+| `err.cam-not-mf` | windows 后端开 dshow-only 相机 | record it on the ffmpeg backend |
+| `err.device-gone` | `Could not find … device` | check the device is connected |
+| `err.cam-open` | `Could not set video options` / `I/O error` | 若是虚拟摄像头先启动宿主，否则可能被占用 |
+| `err.ffmpeg-died` | 无输出无日志 | ffmpeg exited without writing anything |
+
+诊断匹配窗口 `tail(log, 20)`（关键签名行可能不在末 3 行）；未命中回落原文。
+
+### B. 列表标注设备状态（无信号徽标）
+
+`ffmpeg -list_devices` 的内联标记零成本读活性：`(video)` → `live: Some(true)`，
+`(none)` → `Some(false)`（注册但无输出 pin = 虚拟摄像头宿主未启动）。`DshowCamera`
+结构带 `live: Option<bool>`。GUI picker 对 `live: false` 行加 warn 色圆点 +
+「无信号 · 先启动宿主程序」徽标（`.pick.no-signal`），CLI 打 `(no signal)`。
+
+### C. 统一列表口径（dshow ∪ MF 合并枚举）
+
+新模块 `takekit-core/src/devices.rs`：`CameraEntry { name, live, dshow, mf, link }`，
+dshow 顺序优先、MF-only 条目垫底。四扇门消费同一合并列表：
+
+| 扇门 | 位置 |
+|---|---|
+| CLI `takekit list` | `[dshow]`/`[dshow+mf]` 后端标注 |
+| CLI `takekit media --list` | 同上；`resolve_camera` 对 dshow-only 给 `err.cam-not-mf` 句 |
+| GUI `list_devices` invoke | picker meta 显示 `DirectShow`/`Media Foundation`/`DirectShow + MF` |
+| MCP/control `GET /devices?kind=camera` | `{name, live, dshow, mf, link}` |
+
+### 实测矩阵（2026-10-23，Mikey 客户端开/关对照）
+
+| 项 | Mikey OFF | Mikey ON |
+|---|---|---|
+| `takekit list` | `Mikey Cam  (no signal)  [dshow]` ✓ | `Mikey Cam  [dshow]` ✓ |
+| `takekit media --list` | 同上 ✓ | 同上 ✓ |
+| GUI picker（CDP 截图 + DOM 断言） | 徽标「无信号 · 先启动宿主程序」✓ | `DirectShow` 标注、无徽标 ✓ |
+| MCP `/devices?kind=camera` | `{dshow:true, mf:false, live:false}` ✓（修前为 `[]`） | `live:true` ✓ |
+| windows 后端开 Mikey | `err.cam-not-mf` 句（走 ffmpeg 后端）✓ | 同左（MF 不可见） |
+| ffmpeg 后端开 Mikey | `err.cam-open` 句（指宿主程序）✓ | 正常录制 ✓ |
+
+单测 165 通过（含 `devices::tests` 3 个 merge 用例、`diagnose` 8 个签名用例）。
+
+---
+
+## 11. 2026-10-23 晚：多路漂移实测 + 窗口声音改为窗口源的选项
+
+### 11.1 漂移：没有可测的漂移，原来的 0.5 秒是上报口径的 bug
+
+CLI 先补了 `--mic` / `--system-audio`（此前只有 GUI 和 `media` harness 能录音频，`record` 录不了多路）。
+
+第一轮烟测报 `screen 60.473 / mic 59.980`，差 0.493s，表面 8200 ppm——对晶振不可能。
+根因：`write_audio` 的 `seconds = bytes/(rate*ch*2)` 只累加真实到达的 chunk 字节，**不含
+`AudioWriter` 补的前导静音**。麦克风打开花 0.56s，静音垫进了文件却没进上报。
+ffprobe 实测：`screen.mp4 60.533` / `mic.mp4 60.544`，**只差 11ms**，文件本来就是同步的。
+
+修法：`AudioWriter::finish` 返回时间线终点（`next`，含前导静音），`write_audio` 用它当
+`seconds`。修后 20s 复测 delta 从 +0.471 → **+0.023**，`take.json` 与实际文件对齐。
+
+四轮实测：
+
+| 时长 | 上报差 | 文件差 |
+|---|---|---|
+| 20s | +0.023 | — |
+| 180s | +0.016 | +16ms |
+| 600s | +0.041 | — |
+| 1800s | **+4.891** | +4.85s |
+
+结论：**分钟级没有漂移**，差的量级就是 AAC 帧量化（23ms）+ 末缓冲（~40ms）；
+30 分钟那次多出的 4.9 秒是**一次性事故**——10 分钟干净、30 分钟突然多，不是线性速率。
+
+那 4.9 秒是真写进文件的：`84624 × 1024 / 48000 = 1805.312s`，而真实流逝 1800.5s——
+30 分钟里采集 pump 多交了约 23 万个样本（0.27%）。
+
+### 11.2 遗留：音频时间线会被一次性事故拉长（未修）
+
+`AudioWriter::write` 目前**忽略 `chunk.time`**（除首个 chunk），按 `next = start + duration` 连续写：
+
+- 设备真断档 → 洞里补不出声音，但既不补静音也不报错，后续整体前移（同步保住，丢内容）
+- 设备重投/回退 → 字节重复累加，**后续整体后移，永久失去同步** ← 30 分钟那次属于这类
+
+修法：`write` 拿 `chunk.time` 与 `next` 比，容差取 40ms（约一个缓冲）：
+
+- `skew > 容差` → 当真实空洞，写静音补到 `chunk.time`
+- `skew < -容差` → 当重投/回退，**跳过该 chunk**（宁可丢内容，保住同步）
+- 其余 → 仍按 `next` 首尾相接，吸收抖动
+
+### 11.3 窗口声音改为窗口源的选项
+
+原来 picker 里每个窗口出现两次（`Capture::Window` 视频 + `Capture::WindowAudio` 独立音源），
+用户得自己保证两次选的是同一个窗口——选错就是"画面对、声音错"。
+
+现在：`Source` 增 `audio: bool`（`#[serde(default)]`，旧 take.json 照常读）；窗口源的行上有
+一个**喇叭按钮**（有声 / 划掉两态，点一下即生效落盘，不进编辑器），编辑器里同一个字段反过来
+叫「静音」；产物从"视频 + 另一个音频文件"变成**一个文件两条流**。
+
+语义方向要说清，否则两处必然打架：**行内图标表示"现在是什么"，编辑器开关表示"要不要静音"**，
+它们读写的是同一个 `audio`。默认 `audio: false` = 静音 = 喇叭划掉 = 编辑器开关勾上。
+
+实现要点：
+
+- **`MuxSink`**（`takekit-media/src/writer.rs`）：一个 sink 两条流。MF 要求 `AddStream` 早于
+  `BeginWriting`，而视频尺寸要等首帧，所以顺序是：等首帧 → 加视频流 + 音频流 → `begin`。
+- **`write_av`**：一个线程抽两个通道（每轮先抽干音频 `try_recv`，再视频 `recv_timeout(2ms)`）——
+  sink writer 不能交给两个线程。首帧到达前的音频留在队列里（队深 64 chunk ≈ 2.5s，够）。
+- **`VideoWriter::flush` / `AudioWriter::end`**：拆出来，让流可以挂在别人的 sink 上，
+  `finish`/`finish_at` 仍各自负责"自己的文件"。
+- **`window-audio` 源保留**：CLI `--window-audio`、控制面 `kind: "window-audio"` 仍可只录声音
+  不要画面；控制面新增 `kind: "window" + sound: true` 等价于面板里的这个开关。
+
+实测（2026-10-23 16:0x）：
+
+| 项 | 结果 |
+|---|---|
+| `--window "Chrome" --window-sound -d 6` | 一个 `win.mp4`：H.264 6.400s + AAC 6.357s，`mean_volume -17.8 dB / max -4.0 dB`（真内容）✓ |
+| 无声窗口（VirtualBox） | 不报错、视频完好，音轨只覆盖 3.03s（该进程树只交了 3 秒包）——已知行为 |
+| GUI 13/13 | `audio:true` 恢复后行上是"有声"喇叭（无文字，tooltip 说明点击效果）；点一下 → `audio=false` 落盘、图标转静音；再点回 `true`；编辑器「静音」未勾、勾上后写入 `audio=false`；picker 不再重复列窗口 ✓ |
+| `cargo test --workspace` | 172 通过 |
+
+## 12. 2026-10-23：窗口源的身份 = hwnd + pid，标题只是显示缓存
+
+**用户报的问题**：用标题标识窗口，VS Code 换文件、Chrome 换标签都会改标题，程序还认得对吗？
+
+**认得对，但有三处地方说错了话**（全部实测修正）：
+
+| 位置 | 旧行为 | 现在 |
+|---|---|---|
+| 采集身份 | 一直是 `hwnd`（`ScreenTarget::Window`、`captureKey`、预检都只看句柄） | 不变，且**加 pid 校验**：句柄被系统回收给别的进程时，`resolve_window` 直接报错而不是录到陌生窗口 |
+| `resolve_window` | 句柄失效后**按旧标题兜底匹配**（`find_window` + `pick_only`） | 兜底**删掉**。它与「句柄是身份」自相矛盾，而且是最糟的一种：真按旧标题猜中一个同名窗口，就静默录了别人的画面；标题改过则报「没有可见窗口匹配」——窗口明明开着 |
+| 行的名字 | 添加时的标题快照，切文件后永远印旧名 | 每 1.2s 用 `live_title(hwnd)`（`IsWindow` + `GetWindowTextW`，**绝不走 `window_by_hwnd`**，那个内部会 `restore()` 把用户最小化的窗口弹出来）刷新，只更新内存、不写盘 |
+
+**旧配置兼容**：`pid` 用 `#[serde(default)]`，缺省 `0` = 不知道 → 退化为只校验句柄（和以前一样，不会因为读不到 pid 就拒绝一份好好的配置）。单测：`a_window_capture_without_a_pid_still_loads`。
+
+**为什么不在最小化时允许盲裁**：最小化时 `window_capture_size` 给的是 `rcNormalPosition`（恢复后的尺寸），裁剪的四条边缘仍然算得出来，录制前 `place_for_capture` 也会先把窗口恢复——技术上"能裁"，但**没有画面可对照**。2026-10-23 起：无画面 → 缩略图 disabled、点不开工作区，页脚给「恢复窗口」按钮，恢复后自动重抓静帧。
+
+**实测**（`check-ui-matrix`，当时 111/111）：脚本自建一个 WinForms 窗并最小化 → `minimized-no-crop` / `restore-offered` / `crop-closed` 全绿；点「恢复窗口」→ `unminimize` → 重抓 → `restore-window/turns-croppable` 绿。行标题用假标题 `STALE …` 播种验证（`row-title-follows-window`）。
+
+**顺手修掉的一处**：`WindowAudio` 的预检原先调 `window_by_hwnd`，会把用户最小化的窗口恢复回来才检查——声音源根本不需要窗口可见。改用 `window_is_alive`（`IsWindow` + pid），检查不再动用户的屏幕。
+
+## 13. 2026-10-23：桌面源也能带声音（= 整台机器的声音）
+
+**用户问**：整个桌面录制是不是也该支持声音，只不过支持的是全局声音？——**是**，而且只能
+是全局的：Windows 的 WASAPI loopback 按**渲染端点**分，不按显示器分。所谓"录第二块屏的
+声音"在系统里不存在这种东西（除非那台显示器自己有 HDMI 音频端点并成为默认设备）。所以
+选项挂在桌面源上，含义一律是"这台电脑现在放出来的声音"。
+
+**实现**：`start_window_av` 泛化成 `start_av`，按 capture 决定两个 target，其余一字不改
+（同一个 `write_av`、同一个 `MuxSink`）：window → `ScreenTarget::Window(hwnd)` +
+`LoopbackTarget::ProcessTree(pid)`；desktop → `ScreenTarget::Monitor(index)` +
+`LoopbackTarget::All`。`Capture::Desktop` 本身**没有加字段**——声音本来就是 `Source.audio`。
+
+**实测**（`takekit record --windows --desktop-sound -d 6`，ffplay 放 440Hz 正弦）：
+
+| 检查 | 结果 |
+|---|---|
+| 流 | H.264 3440×1440 + AAC 48kHz stereo，两条流一个文件 |
+| 时长 | video 6.3666s / audio 6.3787s（差 12ms，与窗口声音同量级） |
+| 音量 | `mean_volume -6.5 dB / max 0.0 dB`（真内容，非静音） |
+| take.json | `"audio": true`，`duration` 仍是文件终点 |
+
+**顺手修掉一个静默失败**：ffmpeg 后端下 `audio: true` 的源会被 `start_ffmpeg` 当普通视频源
+处理 —— 喇叭是亮的、文件是哑的，与"麦克风坏了"无法区分。现在 `Session::prepare` 直接按名字
+拒绝（"… needs the Windows backend (WGC + MF); ffmpeg has no WASAPI loopback"），单测
+`sound_inside_the_picture_needs_the_windows_backend` 钉住两侧（ffmpeg 拒、windows 收）。
+
+**三端**：CLI 新增 `--desktop-sound`（与 `--window` 互斥，说了原因）；MCP 的 `sound` 白名单
+本来就在，改的是描述与 `kind=desktop` 的生效范围；控制面 `POST /sources` 的 `sound` 判断从
+`Capture::Window` 放开到 `Window | Desktop`。**`check-three-surface` 抓到的正是这一类**：
+字段在 schema 里有、在转发链上被丢掉，只有端到端跑一遍才看得见（现在是 14/14）。

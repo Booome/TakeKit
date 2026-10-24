@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,8 +43,24 @@ def fail(msg: str) -> None:
     failures.append(msg)
 
 
+@lru_cache(maxsize=1)
 def rust_sources() -> list[Path]:
     return sorted((ROOT / "crates").glob("*/src/*.rs"))
+
+
+# Three checks walk the Rust sources (commands, events, i18n), and each used
+# to re-read every file from disk. The corpus is small but the walk is not
+# free, and a stale read inside one run is impossible anyway — the check does
+# not write anything. Read once, share.
+_text_cache: dict[Path, str] = {}
+
+
+def read_cached(path: Path) -> str:
+    text = _text_cache.get(path)
+    if text is None:
+        text = path.read_text(encoding="utf-8")
+        _text_cache[path] = text
+    return text
 
 
 def js_sources() -> list[Path]:
@@ -60,7 +77,7 @@ def html_sources() -> list[Path]:
 def check_commands() -> None:
     defined: set[str] = set()
     for path in rust_sources():
-        text = path.read_text(encoding="utf-8")
+        text = read_cached(path)
         # `#[tauri::command]` sits directly above its fn, but a doc comment
         # of any length can sit between them. Each attribute's own chunk is
         # therefore searched for the first top-level fn, not a fixed window
@@ -105,7 +122,7 @@ def check_commands() -> None:
 def check_events() -> None:
     emitted: set[str] = set()
     for path in rust_sources():
-        text = path.read_text(encoding="utf-8")
+        text = read_cached(path)
         # `emit("x", …)` names the event first; `emit_to(label, "x", …)`
         # names a window label first and the event second. Both forms are
         # matched, the label never being mistaken for the event.
@@ -166,7 +183,7 @@ def check_i18n() -> None:
         asked |= set(re.findall(r"\bt\(\s*[\"']([\w.]+)[\"']", text))
     # …or by name from Rust (UiError codes the UI translates on arrival)…
     for path in rust_sources():
-        text = path.read_text(encoding="utf-8")
+        text = read_cached(path)
         asked |= set(re.findall(r"UiError::(?:new|with_detail)\(\s*\"([\w.]+)\"", text))
     # …or through a template: `t(`crop.handle.${id}`)` covers every
     # `crop.handle.*` key, so a key is used when one of those prefixes

@@ -206,6 +206,7 @@ impl Prepared {
             // starts every channel of this source; a failure there is the same
             // failure the spawn loop used to report inline.
             if let Err(e) = recording.start_media_source(src, Origin::Take) {
+                recording.shutdown_writers();
                 drop(recording);
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(e);
@@ -279,6 +280,7 @@ impl Prepared {
                 // Nothing usable was recorded: stop the encoders that did
                 // start, then remove the folder so a failed start does not
                 // leave a take with no manifest and no frames.
+                recording.shutdown_writers();
                 drop(recording);
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(e);
@@ -629,11 +631,21 @@ struct SoundLane {
 impl SoundLane {
     /// Stop the capture, then drop the channel so the writer drains and the
     /// file closes. Same order the picture path uses, for the same reason.
-    fn stop(&mut self) {
+    /// A capture that reports a failure while stopping says so: the caller
+    /// attaches it to the source's outcome, so a device that died mid-take
+    /// cannot pass as a short successful one.
+    fn stop(&mut self) -> std::result::Result<(), String> {
+        let mut failed = None;
         if let Some(capture) = self.capture.take() {
-            let _ = capture.stop();
+            if let Err(e) = capture.stop() {
+                failed = Some(e.to_string());
+            }
         }
         self.sender.take();
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -653,19 +665,28 @@ impl MediaRunning {
         // The sound goes with its picture; a writer waiting on two channels
         // only ends when both of them are closed.
         if let Some(mut lane) = self.sound.take() {
-            lane.stop();
+            let _ = lane.stop();
         }
         true
     }
 
     /// Stop everything and report. Runs on its own thread inside `stop`.
     fn finish(&mut self) -> Collected {
+        // A capture that failed while stopping is the only witness that the
+        // device died mid-take: dropping the error here made that look like
+        // a short, successful recording. It travels with the source's
+        // outcome, bytes or not — the file is short for a reason.
+        let mut stop_error = None;
         if let Some(handle) = self.handle.take() {
-            let _ = handle.stop();
+            if let Err(e) = handle.stop() {
+                stop_error = Some(e.to_string());
+            }
         }
         self.sender.take();
         if let Some(mut lane) = self.sound.take() {
-            lane.stop();
+            if let Err(e) = lane.stop() {
+                stop_error = stop_error.or(Some(e));
+            }
         }
         // `JoinHandle::join` takes ownership, so the handle leaves `self`.
         let writer = std::mem::replace(
@@ -720,6 +741,14 @@ impl MediaRunning {
                 Some(diagnose::FFMPEG_DIED.to_string()),
             ),
             Err(e) => (None, None, None, None, Vec::new(), 0, Some(e)),
+        };
+        // The writer's own failure is the more specific story; a device that
+        // also failed to stop is appended rather than replacing it. Either
+        // one alone means this source did not record cleanly, no matter how
+        // many bytes landed on disk.
+        let error = match (error, stop_error) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.or(b),
         };
         Collected {
             id: self.id.clone(),
@@ -1993,6 +2022,36 @@ impl Collected {
             probed: self.probed,
             error: self.error.clone(),
             warning: self.length_off().then(|| "len.mismatch".to_string()),
+        }
+    }
+}
+
+impl Recording {
+    /// Stop every capture, drop every channel and join every writer — the
+    /// order a failed start needs before the take folder is removed. A writer
+    /// holds its file open while it drains and finalises, and on Windows an
+    /// open file cannot be deleted: without the join the folder survives as a
+    /// take with no manifest and a half-written source in it. `Drop` stops the
+    /// captures but must not join (it cannot panic), which is why this lives
+    /// beside it.
+    ///
+    /// `drain` is what makes the join possible: `JoinHandle::join` takes
+    /// ownership, and after a failed start nothing is left to report, so the
+    /// list is emptied rather than patched in place. The ffmpeg children go
+    /// first — they hold the folder's files just as a writer does.
+    fn shutdown_writers(&mut self) {
+        for r in &mut self.running {
+            ffmpeg::stop(&mut r.child);
+        }
+        for mut m in self.media.drain(..) {
+            if let Some(handle) = m.handle.take() {
+                let _ = handle.stop();
+            }
+            m.sender.take();
+            if let Some(mut lane) = m.sound.take() {
+                let _ = lane.stop();
+            }
+            let _ = m.writer.join();
         }
     }
 }

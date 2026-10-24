@@ -16,7 +16,6 @@ use windows::Win32::Media::MediaFoundation::{
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID, MF_MT_AUDIO_NUM_CHANNELS,
     MF_MT_AUDIO_SAMPLES_PER_SECOND,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
 use crate::clock::TakeClock;
 use crate::devices::activate;
@@ -133,11 +132,7 @@ fn wait_for_open(
 
 /// Open the microphone and ask it for the PCM it already produces.
 fn open(endpoint: &str) -> Result<(IMFSourceReader, u32, u32)> {
-    // SAFETY: COM has to be initialised on this thread before Media Foundation
-    // is used from it; a thread that already did it answers with a benign error.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    crate::devices::ensure_com();
     let source: IMFMediaSource = activate(
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID,
         &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID,

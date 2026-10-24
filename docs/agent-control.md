@@ -18,16 +18,17 @@
 
 ## 2. 现状：能力全都有，缺的只是门
 
-面板已有 35 个 Tauri 命令（`main.rs` 的 `invoke_handler`），恰好覆盖 Agent 需要的全部动作：
+面板已有 40 个 Tauri 命令（`main.rs` 的 `invoke_handler`），恰好覆盖 Agent 需要的全部动作：
 
 | 领域 | 现有命令 |
 |---|---|
-| 枚举 | `list_windows` / `list_devices` / `env_info` / `source_preview` |
-| Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` |
-| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `stop_source` / `overlay_finish` / `overlay_cancel` |
+| 枚举 | `list_windows` / `list_mics` / `list_devices` / `env_info` / `source_preview` / `source_titles` |
+| Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` / `restore_window` |
+| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `stop_source` / `overlay_finish` / `overlay_cancel` / `preheat_engine` |
 | 状态 | `status`（`StatusInfo`：recording/elapsed/逐源 alive/error）/ `config_get` / `journal_get` |
-| 设置 | `set_hotkey` / `set_countdown` / `set_finalize_panel` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `pick_folder` |
-| 历史 | `journal_seen` / `journal_clear` / `log_delete`（单条删日志）/ `take_delete` / `open_take` |
+| 设置 | `set_hotkey` / `set_countdown` / `set_finalize_panel` / `set_ffmpeg_path` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `set_active_tab` / `pick_folder` / `pick_file` |
+| 历史 | `journal_seen` / `journal_clear` / `log_delete`（单条删日志）/ `log_push` / `take_delete` / `open_take` |
+| 面板自身 | `show_main` / `hide_tray` / `ui_ping` / `ui_settings` |
 
 CLI（`takekit`）是**一次性录制器**（`takekit list` / `takekit record …`），录完就退，
 **不能指挥正在运行的面板**。
@@ -132,6 +133,7 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
     "countdown_secs": 3,
     "finalize_panel": true,
     "out_root": "D:\\takes",
+    "ffmpeg_path": null,
     "encoder": null,
     "backend": "windows",
     "marks": true,
@@ -147,7 +149,8 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
       "capture": { "Window": { "hwnd": 131542, "pid": 20488, "title": "微信",
                                "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
       "fps": 30,
-      "quality": null
+      "quality": null,
+      "audio": false
     }
   ],
   "status": { "recording": false, "elapsed": 0.0, "error": null, "live": [] },
@@ -168,10 +171,10 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
 |---|---|---|
 | `takekit_state` | — | 上面那个快照 |
 | `takekit_list_devices` | `kind` | 枚举窗口/桌面/摄像头/麦克风 |
-| `takekit_add_source` | `kind`, `target`（窗口标题子串 / 摄像头名或链接子串）, `monitor?`, `crop?`, `fps?`, `quality?` | 加一个源 |
+| `takekit_add_source` | `kind`, `target`（窗口标题子串 / 摄像头名或链接子串）, `monitor?`, `crop?`, `fps?`, `quality?`, `sound?` | 加一个源；`sound=true` = 该源的声音写进同一文件（窗口=本进程树回环，桌面=整机系统声音） |
 | `takekit_remove_source` | `index` | 按 `/state` 下标删 |
 | `takekit_set_sources` | `sources[]` | 整表替换 |
-| `takekit_set_settings` | `{ hotkey?, countdown_secs?, out_root?, encoder?, backend?, marks?, raise_sources?, language?, theme?, finalize_panel? }` | 改设置 |
+| `takekit_set_settings` | `{ hotkey?, countdown_secs?, out_root?, ffmpeg_path?, encoder?, backend?, marks?, raise_sources?, language?, theme?, finalize_panel? }` | 改设置；`ffmpeg_path` 传 `null` = 回到 PATH 查找 |
 | `takekit_start_recording` | `quality?`（其余取当前设置，倒计时走 `countdown_secs` 设置） | 开始（含倒计时） |
 | `takekit_stop_recording` | — | 停止，返回落盘目录 |
 | `takekit_history` | — | 历史 + 日志（全景） |
@@ -254,13 +257,25 @@ the capture engine could not be prepared: …                 ← detail（英�
 takekit ctl state                      # 看状态
 takekit ctl devices --kind window      # 列窗口
 takekit ctl add --kind window --target 微信
+takekit ctl add --kind desktop --sound on   # 桌面 + 整机系统声音
 takekit ctl remove --index 1
-takekit ctl set --out-root D:\takes --countdown 5
+takekit ctl config --out-root D:\takes --countdown 5
+takekit ctl config --ffmpeg-path ""    # 清掉 ffmpeg 路径覆盖，回到 PATH 查找
 takekit ctl start
 takekit ctl stop                       # 打印落盘目录
 takekit ctl history
 takekit ctl delete --id 2026-10-21-22-30-00 --confirm
 ```
+
+`ctl add` 的 spec flag：`--kind`（必填，window|desktop|camera|mic|system-audio|window-audio）、
+`--target`（标题/设备名子串）、`--monitor`、`--crop T,B,L,R`、`--fps`、`--quality`、
+`--sound on|off`（window/desktop 才认，其余 400）。
+`ctl config` 的设置 flag（与 MCP `takekit_set_settings` 同键）：`--hotkey`、
+`--countdown`、`--out-root`、`--ffmpeg-path`（空串 = 清掉覆盖）、`--encoder`、
+`--backend`、`--marks on|off`、`--raise on|off`、`--language`、`--theme`、
+`--finalize-panel on|off`。
+其余：`ctl log [--level warn|error]`、`ctl clear-log --confirm`、
+`ctl delete-log --at <unix-ms> --confirm`。
 
 ### 7.3 curl 接入（调试用）
 

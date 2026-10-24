@@ -545,12 +545,10 @@ async fn env_info() -> EnvInfo {
         let encoder = ffmpeg
             .as_deref()
             .map(|f| encoder::pick(f).name().to_string());
-        // trim_end_matches: the env var keeps a trailing separator, which
-        // reads as noise in a text field.
-        let default_out_root = std::env::temp_dir()
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_string();
+        // One definition for the fallback take folder (`control`): this used
+        // to carry its own copy of the expression, so `env_info` and the
+        // control surface could disagree on the same empty setting.
+        let default_out_root = control::default_out_root();
         let monitors = takekit_media::monitors()
             .unwrap_or_default()
             .into_iter()

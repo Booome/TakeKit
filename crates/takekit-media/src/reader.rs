@@ -3,15 +3,12 @@
 //! One source reader drives either a camera or a microphone: the only thing
 //! that differs is which stream is read and which media type is asked for.
 
+use crate::error::{MediaError, Result};
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MFCreateAttributes,
     MFCreateSourceReaderFromMediaSource,
 };
-use windows::Win32::System::Com::COINIT_MULTITHREADED;
-use windows::Win32::System::Com::CoInitializeEx;
-
-use crate::error::{MediaError, Result};
 
 /// The stream index Media Foundation gives a device's video. It is not 0: it is
 /// a sentinel (`0xFFFFFFFE`) standing for "the first video stream", so the
@@ -33,10 +30,7 @@ pub fn create_reader(
 ) -> Result<IMFSourceReader> {
     // COM has to be initialised on the thread that touches Media Foundation,
     // and a thread that already did it answers with a benign error.
-    // SAFETY: `CoInitializeEx` is process-global and idempotent per thread.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    crate::devices::ensure_com();
     // SAFETY: `attributes` and the reader are owned by this frame and the
     // function's return value respectively; no pointer outlives either.
     unsafe {

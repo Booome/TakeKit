@@ -109,8 +109,11 @@ const pickerSearch = $("picker-search");
 function uniqueId(base) {
   if (!state.sources.some((s) => s.id === base)) return base;
   let i = 2;
-  while (state.sources.some((s) => s.id === `${base}${i}`)) i += 1;
-  return `${base}${i}`;
+  // The same shape the control surface generates (`unique_id` in control.rs):
+  // "win", "win-2", "win-3" — an id is a file name, and the two generators
+  // producing "win2" and "win-2" for the same list was a silent split.
+  while (state.sources.some((s) => s.id === `${base}-${i}`)) i += 1;
+  return `${base}-${i}`;
 }
 
 function truncate(text, n) {

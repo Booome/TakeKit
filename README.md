@@ -17,8 +17,9 @@ recording the way a film crew treats a take — every source starts and stops
 together, so the files already line up.
 
 Each source gets **its own encoder**: one ffmpeg child per source on the
-ffmpeg backend, and one in-process writer thread per source on the default
-Windows-API backend (no child processes at all). That is not a shortcut, it is
+ffmpeg backend, and one in-process writer thread per source on the
+Windows-API backend (no child processes at all — the panel runs it by default,
+the CLI opts in with `--windows`). That is not a shortcut, it is
 the point: a single ffmpeg fed several inputs picks the input to read next by
 timestamp, which starves the desktop grabber down to about half the requested
 frame rate. Separate encoders keep every source at its own rate.
@@ -60,14 +61,34 @@ takekit record --desktop --crop 33,0,0,0
 
 `takes/<timestamp>/` then holds `win.mkv`, `cam.mkv` and `take.json`.
 
+**Ctrl-C stops and finalises**, it does not kill the process: the MP4 is closed
+properly and `take.json` is written, so an interrupted take is still a usable
+take. Closing the console window cannot do that (Windows gives ~5s, not enough
+to finalise) — press Ctrl-C first if the take matters.
+
 Options worth knowing:
 
 | Flag | Meaning |
 |---|---|
+| `--windows` | capture through the Windows APIs (WGC + Media Foundation) instead of ffmpeg children; keeps recording a window that sits behind others. **The CLI defaults to ffmpeg** — the panel defaults to the Windows APIs |
+| `--ffmpeg <PATH>` | point at a specific ffmpeg instead of the `PATH` lookup |
+| `--cam <DEVICE>` | also record a video device (see `takekit list`) |
+| `--mic <DEVICE>` | also record a microphone (see `takekit media --list`) |
+| `--system-audio` | also record what the speakers play (WASAPI loopback) |
+| `--window-sound` | write the window's own sound into the same file as its picture (needs `--window`) |
+| `--desktop-sound` | the desktop's sound into its file (the whole machine — Windows has no per-monitor audio) |
 | `--encoder auto\|x264\|nvenc\|qsv\|amf` | default `auto`, picks the best that actually works |
 | `--quality 20` | roughly CRF for x264, CQ for hardware encoders |
 | `--fps 30` | capture rate |
 | `--crop T,B,L,R` | crop inset in pixels, applied per source |
+| `-o, --out <DIR>` | output root; a timestamped directory is created inside (default `takes`) |
+| `--marks true\|false` | mouse effects: click ripples and drag trails (default `true`) |
+
+`takekit media` is the same take through the Windows APIs only (no ffmpeg child at
+all): `--list` enumerates what the APIs can see, `--screen <INDEX>` /
+`--window <HWND>` / `--camera` / `--mic` / `--system-audio` /
+`--window-audio <HWND>` pick the sources, `--bitrate <KBIT/S>` and `--cfr` shape
+the file. Files land in `takes-media/<timestamp>/` by default.
 
 ## Design notes
 
@@ -89,7 +110,7 @@ MIT. See [LICENSE](LICENSE).
 
 录屏通常是拼出来的：一个工具录屏幕、另一个录摄像头，再到剪辑软件里对齐。TakeKit 把一次录制当成电影里的「一条 take」——所有源同时开始、同时结束，文件本来就是对好的。
 
-**每个源一个独立编码器**，这不是偷懒而是必需：ffmpeg 后端下是每个源一个 ffmpeg 子进程，默认的 Windows API 后端则是每个源一个进程内 writer 线程（不 spawn 任何子进程）。单个 ffmpeg 喂多路输入时会按时间戳挑下一个该读谁，抓屏那一路会被饿到只剩一半帧率。编码器分开才能让每路都跑满自己的帧率。
+**每个源一个独立编码器**，这不是偷懒而是必需：ffmpeg 后端下是每个源一个 ffmpeg 子进程，Windows API 后端则是每个源一个进程内 writer 线程（不 spawn 任何子进程；面板默认走这条，CLI 要显式 `--windows`）。单个 ffmpeg 喂多路输入时会按时间戳挑下一个该读谁，抓屏那一路会被饿到只剩一半帧率。编码器分开才能让每路都跑满自己的帧率。
 
 现在能做的：
 
@@ -109,6 +130,8 @@ takekit list
 takekit record --window "VirtualBox" --cam "My Camera" --duration 60
 takekit record --desktop --crop 33,0,0,0
 ```
+
+**Ctrl-C 是「停止并收尾」**，不是杀进程：MP4 正常收尾、`take.json` 照写，中断的 take 仍是能用的 take。直接关控制台窗口做不到（Windows 只给约 5 秒，不够收尾）——在意这条素材就先按 Ctrl-C。
 
 仅支持 Windows；ffmpeg 需在 PATH 里。点击波纹/拖动轨迹由 [MouseShow](https://github.com/Booome/MouseShow) 提供，以库的形式链接。
 
@@ -131,7 +154,7 @@ takekit record --desktop --crop 33,0,0,0
 cargo build --workspace          # 界面资源编译期内嵌，改 JS/HTML/CSS 必须重建
 cargo test --workspace
 node scripts/check-three-surface.mjs   # CLI 参数 + MCP schema/真实调用 → 面板 → 配置
-node scripts/check-ui-matrix.mjs       # zh/en × light/dark × 7 屏，截屏落 target/checks/
+node scripts/check-ui-matrix.mjs       # zh/en × light/dark × 9 屏，截屏落 target/checks/
 node scripts/check-midtake.mjs         # 真录一段：录制中加源，从点击到 take.json 的起点
 ```
 

@@ -19,7 +19,11 @@ const PROTOCOL: &str = "2024-11-05";
 pub fn run() -> Result<(), String> {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
+        // A line that is not valid UTF-8 is skipped, not fatal: one bad
+        // byte used to end the whole MCP service, and an agent that piped
+        // something odd lost its door to the panel for the rest of the
+        // session.
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
@@ -106,6 +110,11 @@ fn tools_call(params: &Value) -> Result<Value, String> {
             // The convenience shape the server resolves: kind + target (+ the
             // optional trim and rates). Nulls left out so the server's own
             // defaults apply.
+            if args.get("kind").and_then(Value::as_str).is_none() {
+                // The schema says `kind` is required; saying it here beats
+                // sending an empty body and reading the server's 400.
+                return Err("add_source needs a kind (window, desktop, camera, mic, system-audio or window-audio)".to_string());
+            }
             let mut body = json!({});
             for key in [
                 "kind", "target", "monitor", "crop", "fps", "quality", "sound",
@@ -147,8 +156,13 @@ fn tools_call(params: &Value) -> Result<Value, String> {
                 "language",
                 "theme",
             ] {
+                // Nulls dropped, exactly like `add_source` above: an agent
+                // passing `"encoder": null` means "leave it alone", not
+                // "set it to null". One rule for both tools.
                 if let Some(value) = args.get(key) {
-                    body[key] = value.clone();
+                    if !value.is_null() {
+                        body[key] = value.clone();
+                    }
                 }
             }
             client.patch("/config", body)

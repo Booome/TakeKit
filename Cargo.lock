@@ -3597,6 +3597,7 @@ dependencies = [
  "takekit-core",
  "takekit-media",
  "ureq",
+ "windows",
 ]
 
 [[package]]

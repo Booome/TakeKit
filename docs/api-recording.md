@@ -109,10 +109,10 @@ takekit media --screen 1 --duration 6 --fps 30
 |---|---|
 | **摄像头链路** | 代码写完，**本机没验证**：Media Foundation 枚举到 0 个摄像头（DirectShow 能看到的都是虚拟摄像头，MF 看不见） |
 | **麦克风链路** | ✅ 已实测（2026-10-23，Focusrite USB 声卡）：AAC 48kHz 立体声，多源同录稳定。两个实测坑见第 8 节 |
-| **窗口源** | `ScreenTarget::Window` 已接上，未实测 |
+| **窗口源** | ✅ 已实测（2026-10-20，后台窗口铁证三联：被完全盖住时桌面录制里已不可见、窗口录制仍完整）；最小化窗口 0 帧，开录前自动恢复 |
 | 系统声音 / 窗口声音 | ✅ 已实测（2026-10-23，`loopback.rs`）：见第 8 节 |
-| 接进 GUI | 未做。目前只有 CLI |
-| 与 `Capture`/`Source` 配置模型对齐 | 未做：媒体层用自己的 `ScreenTarget` / 符号链接 / 端点 ID，还没映回 core 的 `Capture` |
+| 接进 GUI | ✅ 已做（第 7 节；音频源 2026-10-23，见第 9 节） |
+| 与 `Capture`/`Source` 配置模型对齐 | ✅ 已做（第 7 节：`Settings`/`Config`/`StartRequest` 带 `backend`；第 11.3 节 `Source` 增 `audio`） |
 | 编码器选择 | 由 MF 自己挑（软件 H.264）。没有走 core 的 NVENC/QSV/AMF 探测 |
 | 鼠标光标 | ✅ 已对齐（2026-10-21）：`CursorCaptureSettings::WithCursor`（原 `Default` 实测不录光标），与 ffmpeg 的 `draw_mouse=1` 一致。实测：抖动鼠标录 3s，抽帧见白色箭头 |
 | 多显示器 | ✅ 已支持（2026-10-21）：picker 按 `env_info.monitors` 逐屏列出（`Desktop { rect: 屏矩形 }`），`monitor_index_for` 把 rect 映回 `Monitor(index)`；无 rect / 映射落空回落第一屏。**WGC 只能一屏一路**，"整个桌面"行仅 ffmpeg 后端保留 |
@@ -138,7 +138,7 @@ takekit media --screen 1 --duration 6 --fps 30
    承担（第 7 节）。
 5. ~~接进 GUI~~ → 已做（第 7 节）。
 6. 决定要不要保留 ffmpeg 后端做回退（WGC 在某些环境会拿不到帧）。
-7. GUI 音频源（麦克风 + 系统声音/窗口声音）；~~多显示器映射~~ → 已做（2026-10-21，逐屏 picker + rect→Monitor 映射）。
+7. ~~GUI 音频源（麦克风 + 系统声音/窗口声音）~~ → 已做（2026-10-23，第 9 节，实测 23/23）；~~多显示器映射~~ → 已做（2026-10-21，逐屏 picker + rect→Monitor 映射）。
 
 ---
 
@@ -305,7 +305,7 @@ MP4 sink 会把轨道重定基到首样本，所以共享原点以**前导填充
 - **GUI**：picker 新增「麦克风」「声音」两组（声音组 = 系统声音 + 各窗口声音行）；
   `list_mics` 命令供麦克风列表；音频行图标/摘要（`AAC · Qn`）/编辑器隐藏帧率与裁剪。
 
-### E2E（`_scratch/e2e-audio.mjs`，23/23）
+### E2E（一次性 scratch 脚本，23/23；脚本本身不入库，结论如下）
 
 | 环节 | 结果 |
 |---|---|
@@ -441,7 +441,8 @@ ffprobe 实测：`screen.mp4 60.533` / `mic.mp4 60.544`，**只差 11ms**，文�
 - **`MuxSink`**（`takekit-media/src/writer.rs`）：一个 sink 两条流。MF 要求 `AddStream` 早于
   `BeginWriting`，而视频尺寸要等首帧，所以顺序是：等首帧 → 加视频流 + 音频流 → `begin`。
 - **`write_av`**：一个线程抽两个通道（每轮先抽干音频 `try_recv`，再视频 `recv_timeout(2ms)`）——
-  sink writer 不能交给两个线程。首帧到达前的音频留在队列里（队深 64 chunk ≈ 2.5s，够）。
+  sink writer 不能交给两个线程。首帧到达前的音频留在队列里（队深 64 chunk，一块 10ms，
+  合计 ≈0.64s——`takekit-media/src/frame.rs` 的 `AUDIO_QUEUE`，够）。
 - **`VideoWriter::flush` / `AudioWriter::end`**：拆出来，让流可以挂在别人的 sink 上，
   `finish`/`finish_at` 仍各自负责"自己的文件"。
 - **`window-audio` 源保留**：CLI `--window-audio`、控制面 `kind: "window-audio"` 仍可只录声音

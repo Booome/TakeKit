@@ -40,6 +40,10 @@ pub enum Ctl {
         /// Per-source quality (default: the session quality)
         #[arg(long)]
         quality: Option<u8>,
+        /// Record this source's sound into its own file (window or desktop
+        /// kinds; the same switch the HTTP spec and MCP expose)
+        #[arg(long)]
+        sound: Option<String>,
     },
     /// Pause the take: the clock stops and every source closes its current file
     Pause,
@@ -68,6 +72,7 @@ pub enum Ctl {
     },
     /// Remove the source at an index from /state
     Remove {
+        /// Position in the /state sources array (0-based)
         #[arg(long)]
         index: usize,
     },
@@ -75,10 +80,13 @@ pub enum Ctl {
     SetSources,
     /// Change settings; only the flags given are touched
     Config {
+        /// Global stop/start hotkey, e.g. "F9" or "Ctrl+Alt+R"
         #[arg(long)]
         hotkey: Option<String>,
+        /// Seconds of countdown before a take starts (0 = immediately)
         #[arg(long)]
         countdown: Option<u8>,
+        /// Where takes land; a timestamped folder is created inside
         #[arg(long)]
         out_root: Option<String>,
         /// nvenc | qsv | amf | x264 | auto
@@ -90,10 +98,10 @@ pub enum Ctl {
         /// on | off
         #[arg(long)]
         marks: Option<String>,
-        /// on | off
+        /// on | off — raise a window to the front before recording it
         #[arg(long)]
         raise: Option<String>,
-        /// on | off
+        /// on | off — show the per-source checklist when a take finishes
         #[arg(long)]
         finalize_panel: Option<String>,
         /// zh | en
@@ -102,6 +110,9 @@ pub enum Ctl {
         /// auto | light | dark
         #[arg(long)]
         theme: Option<String>,
+        /// Path to a specific ffmpeg (empty string clears the override)
+        #[arg(long)]
+        ffmpeg_path: Option<String>,
     },
     /// Start a take on the current sources
     Start {
@@ -163,6 +174,7 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             crop,
             fps,
             quality,
+            sound,
         } => {
             let mut body = json!({ "kind": kind });
             if let Some(target) = target {
@@ -179,6 +191,14 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             }
             if let Some(quality) = quality {
                 body["quality"] = json!(quality);
+            }
+            if let Some(sound) = sound {
+                // The third door for the source's own sound switch: the HTTP
+                // spec and MCP both take it, and `check-three-surface` exists
+                // because "one surface forgot a field" is the drift that
+                // hurts. Only picture kinds can carry sound; the server
+                // answers 400 for the rest, with the reason.
+                body["sound"] = on_off("sound", &sound)?;
             }
             client.post("/sources", body)?
         }
@@ -235,6 +255,7 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             finalize_panel,
             language,
             theme,
+            ffmpeg_path,
         } => {
             let mut body = json!({});
             if let Some(v) = hotkey {
@@ -266,6 +287,11 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             }
             if let Some(v) = theme {
                 body["theme"] = json!(v);
+            }
+            if let Some(v) = ffmpeg_path {
+                // Empty string clears the override — the same shape the
+                // panel's settings row writes.
+                body["ffmpeg_path"] = if v.is_empty() { Value::Null } else { json!(v) };
             }
             if body.as_object().is_none_or(|o| o.is_empty()) {
                 return Err("nothing to set: pass at least one flag".to_string());

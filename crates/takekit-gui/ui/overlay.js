@@ -146,11 +146,10 @@ function step() {
 const sub = document.getElementById("sub");
 const list = document.getElementById("list");
 
-const fmtClock = (secs) => {
-  const s = Math.max(0, Math.floor(secs));
-  const p2 = (n) => String(n).padStart(2, "0");
-  return `${p2(Math.floor(s / 3600))}:${p2(Math.floor((s % 3600) / 60))}:${p2(s % 60)}`;
-};
+// `clock` comes from shared.js (loaded before this file): the panel, the
+// veil and the popover all print a duration, and a second copy of the
+// formatter here used to be free to drift.
+const fmtClock = (secs) => clock(Math.max(0, secs));
 
 window.__TAURI__.event.listen("take:finalize", (e) => {
   const p = e.payload || {};

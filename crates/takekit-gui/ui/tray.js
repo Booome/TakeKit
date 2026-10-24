@@ -119,7 +119,15 @@ function applySettings(info) {
   tick();
 }
 
-invoke("ui_settings").then(applySettings).catch(() => {});
+// A failed read is not silent: the popover would sit in the default
+// language and theme with nothing to say why. The probe log is where a
+// "why is the tray wrong" question gets answered.
+invoke("ui_settings")
+  .then(applySettings)
+  .catch((e) => {
+    console.error("ui_settings failed:", e);
+    PROBE("tray:ui-settings-failed:" + String(e).slice(0, 120));
+  });
 window.__TAURI__.event.listen("ui:settings", (e) => applySettings(e.payload));
 
 tick();

@@ -29,9 +29,7 @@ use windows::Win32::Media::Audio::{
     WAVE_FORMAT_PCM, WAVEFORMATEX, eMultimedia, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemAlloc,
-};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemAlloc};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows_core::{IUnknown, Interface, Ref, implement};
 
@@ -158,11 +156,7 @@ impl Drop for LoopbackCapture {
 
 /// Bring up a loopback capture client and its capture client.
 fn open(target: LoopbackTarget) -> Result<(IAudioClient, IAudioCaptureClient)> {
-    // SAFETY: COM has to be initialised on this thread before WASAPI is used
-    // from it.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    crate::devices::ensure_com();
     let client = match target {
         LoopbackTarget::All => activate_default()?,
         LoopbackTarget::ProcessTree(pid) => activate_process_tree(pid)?,

@@ -34,11 +34,11 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 ```
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
-- `takekit-core` 有 5 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
-- 基线（2026-10-22 实测）：core 43 / cli 9 / gui 82 / media 21。以 `cargo test` 实际输出为准。
+- `takekit-core` 有 7 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
+- 基线（2026-10-24 实测）：core 57（+7 ignored）/ cli 9 / gui 84 / media 25。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **功能级三端一致性**：`node scripts/check-three-surface.mjs`——真跑 MCP（schema → stdio 调用 → 面板 → 配置）和 CLI 参数。名字对了不等于字段通了：`sound` 曾在 schema 里声明、在 HTTP 转发前被白名单丢掉，`check-contracts.py` 看不见这种漂移。
-- **界面语言×主题**：`node scripts/check-ui-matrix.mjs`——zh/en × light/dark × 7 屏（源列表、卡片、裁剪工作区、添加源、设置…），量横向滚动、文本溢出、WCAG AA 对比度，截图落 `target/checks/ui-matrix/`。它就是抓出「`.field button.browse` 选择器从未匹配、深色下 `…` 对比度 1.02」的那一个。
+- **界面语言×主题**：`node scripts/check-ui-matrix.mjs`——zh/en × light/dark × 9 屏（源列表、卡片、最小化窗口的卡片、裁剪源卡片、裁剪工作区、裁剪被丢弃的卡片与工作区、添加源、设置），量横向滚动、文本溢出、WCAG AA 对比度，截图落 `target/checks/ui-matrix/`。它就是抓出「`.field button.browse` 选择器从未匹配、深色下 `…` 对比度 1.02」的那一个。
   - 它还钉住**尺寸列的口径**：裁剪放不下时，列表 / 卡片 / 工作区三处都必须报「整幅」。这条来自一次真事故——后端 `CropBox::rect_in` 会丢掉放不下的裁剪、整帧原样录，而列表当时照算式印 `1720×1392 → -2280×1392`，报的是一个永远不会存在的文件。**算术正确 ≠ 说得对**，凡是由算式得出的展示值，都要问一句「后端实际会给什么」。
   - 以及**行内空隙**（`row-summary-tight`）：帧率/画质格必须按文字自适应，且离尺寸列只隔 12px。定宽列装不满的那截空白不会溢出、不会截断、不会有滚动条，只有截图看得出来——用户先看到，测试才补上（2026-10-23）。
   - 以及**右侧三列是一条信息线**（`row-speaker-last` + `row-trailing-columns-line-up`）：喇叭必须在帧率之后、在最右；行从右往左排，所以任何宽度可变的格子落在数字左边都会让整列按行横移——不能出声的行因此保留一个同宽的**空槽**（`row-sound-slot`）而非少一格。这两条是同一个教训的两面：**右边的列只有在宽度不随行变化时才成列**。
@@ -73,9 +73,11 @@ crates/
 └─ takekit-gui/
     ├─ main.rs            tauri 命令 + setup（窗口/托盘/提示层/热键）
     ├─ take.rs            take 生命周期：begin / status / stop / stop_source / 热键
-    ├─ config.rs          %APPDATA%\TakeKit\config.json（设置）
+    ├─ config.rs          %APPDATA%\TakeKit\config.json（设置，backend 默认 Windows）
+    ├─ control.rs         本地 HTTP 控制面（docs/agent-control.md：路由 ↔ MCP ↔ ctl）
     ├─ journal.rs         %APPDATA%\TakeKit\journal.json（历史 + 日志）
     ├─ place.rs           窗口位置记忆（-32000 哨兵在这里处理）
+    ├─ preview.rs         编辑器缩略图与裁剪工作区的取图回传
     ├─ reveal.rs          打开 take 目录
     ├─ overlay.rs         全屏提示层窗口
     ├─ tray.rs / tray_panel.rs   托盘图标与迷你面板
@@ -85,7 +87,8 @@ crates/
                           overlay.{html,css,js} · tray.{html,css,js}
 ```
 
-**一次录制的数据流（Windows API 后端，当前默认）**
+**一次录制的数据流（Windows API 后端）**——面板走这条（`config.rs` 默认
+`Backend::Windows`）；**CLI 相反，默认 ffmpeg**，要显式加 `--windows` 才切过来。
 
 ```
 按钮/F9 → main.js toggleRecording()
@@ -116,7 +119,7 @@ ffmpeg 后端的数据流差异：`begin` 里每个窗口源 `bring_to_front` �
 
 ## 4. 实现契约（改前必读，踩过坑才定下的）
 
-1. **窗口的身份是 hwnd，不是标题**。`Capture::Window{hwnd,title,crop}`，`title` 只用于显示和兜底。重名窗口曾导致"按 F9 只闪一下"。
+1. **窗口的身份是 hwnd + pid，不是标题**。`Capture::Window{hwnd,pid,title,crop}`，`title` 只用于显示和兜底，`pid` 记添加时的属主（`0`=未知，老配置都长这样，只做 hwnd 检查）。Windows 会回收句柄号，光有 hwnd 会在窗口死后指向别人的窗口——重名窗口曾导致"按 F9 只闪一下"。
 2. **位置记忆**：物理像素、建窗时定位（不是先摆默认位再移）、拖动 400ms 限流；`-32000` 最小化哨兵**两轴都是才判否**，写入侧拦、读取侧也过滤（详见 DESIGN §4.10）。
 3. **奇数尺寸**：ffmpeg 路径在 `-vf` 链**末尾**加 `crop=trunc(iw/2)*2:trunc(ih/2)*2`（用 crop 不用 scale，不重采样）；API 路径用 `writer::even_frame`（NV12 分平面裁）。
 4. **源可用性只看 hwnd**：`is_recordable` = 存在 + 可见 + 非 cloak；**最小化不算不可用**（`bring_to_front` 会恢复它）。picker 另用 `is_switchable`（任务栏规则）。
@@ -148,7 +151,8 @@ front:<title>=0|1 rank Some(a)->Some(b) / source:stopped <id>
 
 倒计时（按时间顺序）：
 overlay:wake（Rust→遮罩，唤醒音频，无回写探针）
-prepare: [("locate",ms),("encoder",ms),("engine",ms)]   ← 点击路径各段耗时
+prepare: [("locate",ms),("encoder",ms),("engine",ms)]   ← ffmpeg 路径各段耗时；
+         Windows 路径只有 [("validate",ms)]（源可寻址性校验，微秒级）
 engine:Dda|Gdi probed=true|false                        ← false = 本支用 GDI，探测在后台
 spawn: [("id",ms),…]                                    ← 逐源 spawn 耗时
 settings-applied lang=zh|en theme=auto|light|dark hotkey=<显示值>   ← 页面实际应用的值
@@ -165,7 +169,7 @@ js-error:<msg>
 
 **事件 vs 探针**：`take:started`、`take:finalize`、`take:source`、`take:done`、
 `take:cancelled`、`take:failed`、`take:beep`、`overlay:countdown`、`overlay:wake`、
-`hotkey:toggle`、`ui:settings`、`ctl:changed`（控制面写操作后的全量重同步，
+`overlay:stop`、`hotkey:toggle`、`ui:settings`、`ctl:changed`（控制面写操作后的全量重同步，
 见 `docs/agent-control.md`）是 **Tauri 事件**（`emit_to`，前端 `listen` 接），
 不出现在探针里；它们的前端处理才写 `PROBE`。（`take:stopped` 已删除：完成态
 由 `take:done` 单点承担，见 take.rs stop()。）

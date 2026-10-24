@@ -1098,6 +1098,20 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
 
 // ── recording ───────────────────────────────────────────────────────────────
 
+/// Where a take lands when the setting is empty — the same answer
+/// `env_info` gives the panel, trimmed of the trailing separator that reads
+/// as noise in a text field. One definition, so the control surface and the
+/// panel cannot drift apart on the default.
+pub(crate) fn default_out_root() -> String {
+    // trim_end_matches: the temp dir keeps a trailing separator, which reads
+    // as noise in a text field. `env_info` shows the same string, so the two
+    // must come from here.
+    std::env::temp_dir()
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_string()
+}
+
 fn recording_now(app: &tauri::AppHandle) -> bool {
     take::status(app).recording
 }
@@ -1111,7 +1125,12 @@ fn record_start(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
 
     let req = StartRequest {
         sources: cfg.sources.clone(),
-        out_root: cfg.out_root.clone().unwrap_or_else(|| "takes".to_string()),
+        // The same default the panel itself offers (`env_info`): the temp
+        // dir. This used to fall back to a relative "takes", which lands in
+        // whatever directory the panel process happens to run from — an
+        // agent-started take and a panel-started take then went to two
+        // different places for the same empty setting.
+        out_root: cfg.out_root.clone().unwrap_or_else(default_out_root),
         quality,
         marks: cfg.marks,
         encoder: cfg.encoder,

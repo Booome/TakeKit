@@ -27,6 +27,11 @@ use takekit_media::{
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What the manifest and the UI call the encoder on the Windows-API backend:
+/// Media Foundation's H.264, not any ffmpeg encoder. One literal, because
+/// the manifest and the label have to agree.
+const MF_ENCODER_LABEL: &str = "mf-h264";
+
 #[derive(Debug)]
 pub enum Error {
     NoFfmpeg,
@@ -103,7 +108,7 @@ impl Prepared {
     /// Media Foundation, so an ffmpeg encoder name would be a lie.
     pub fn encoder_label(&self) -> &'static str {
         match self.backend {
-            Backend::Windows => "mf-h264",
+            Backend::Windows => MF_ENCODER_LABEL,
             Backend::Ffmpeg => self.encoder.name(),
         }
     }
@@ -146,7 +151,7 @@ impl Prepared {
         )?;
         // The manifest's encoder field would otherwise carry the ffmpeg pick,
         // which this take never used.
-        take.manifest.encoder = "mf-h264".into();
+        take.manifest.encoder = MF_ENCODER_LABEL.into();
         take.manifest.hardware = false;
         let dir = take.dir.clone();
 
@@ -192,6 +197,7 @@ impl Prepared {
                 let (handle_capture, sender, writer) = match started {
                     Ok(triple) => triple,
                     Err(e) => {
+                        recording.shutdown_writers();
                         drop(recording);
                         let _ = std::fs::remove_dir_all(&dir);
                         return Err(e);
@@ -206,7 +212,7 @@ impl Prepared {
                     handle: Some(handle_capture),
                     sender: Some(sender),
                     sound: None,
-                    writer,
+                    writer: Some(writer),
                     out,
                 });
                 continue;
@@ -230,6 +236,7 @@ impl Prepared {
                 let (handle_capture, sender, sound, writer) = match started {
                     Ok(quad) => quad,
                     Err(e) => {
+                        recording.shutdown_writers();
                         drop(recording);
                         let _ = std::fs::remove_dir_all(&dir);
                         return Err(e);
@@ -244,7 +251,7 @@ impl Prepared {
                     handle: Some(handle_capture),
                     sender: Some(sender),
                     sound: Some(sound),
-                    writer,
+                    writer: Some(writer),
                     out,
                 });
                 continue;
@@ -305,6 +312,7 @@ impl Prepared {
             let handle_capture = match started {
                 Ok(handle) => handle,
                 Err(e) => {
+                    recording.shutdown_writers();
                     drop(recording);
                     let _ = std::fs::remove_dir_all(&dir);
                     return Err(spawn_error(e));
@@ -320,7 +328,7 @@ impl Prepared {
                 handle: Some(handle_capture),
                 sender: Some(tx),
                 sound: None,
-                writer: handle,
+                writer: Some(handle),
                 out,
             });
         }
@@ -379,6 +387,7 @@ impl Prepared {
                 let (handle_capture, sender, writer) = match started {
                     Ok(triple) => triple,
                     Err(e) => {
+                        recording.shutdown_writers();
                         drop(recording);
                         let _ = std::fs::remove_dir_all(&dir);
                         return Err(e);
@@ -393,7 +402,7 @@ impl Prepared {
                     handle: Some(handle_capture),
                     sender: Some(sender),
                     sound: None,
-                    writer,
+                    writer: Some(writer),
                     out,
                 });
                 continue;
@@ -405,6 +414,7 @@ impl Prepared {
             let (input, extra_filter) = match src.input_args(self.engine) {
                 Ok(pair) => pair,
                 Err(e) => {
+                    recording.shutdown_writers();
                     drop(recording);
                     let _ = std::fs::remove_dir_all(&dir);
                     return Err(Error::Source(e));
@@ -430,6 +440,7 @@ impl Prepared {
                     // Nothing usable was recorded: stop the encoders that did
                     // start, then remove the folder so a failed start does not
                     // leave a take with no manifest and no frames.
+                    recording.shutdown_writers();
                     drop(recording);
                     let _ = std::fs::remove_dir_all(&dir);
                     return Err(e.into());
@@ -474,7 +485,9 @@ struct MediaRunning {
     /// its own channel, but shares the one writer thread — a sink writer is
     /// not something to hand to two threads.
     sound: Option<SoundLane>,
-    writer: std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
+    /// `None` only between `finish` (or `shutdown_writers`) taking it and the
+    /// struct going away — a slot nobody reads twice.
+    writer: Option<std::thread::JoinHandle<std::result::Result<WriteReport, String>>>,
     out: PathBuf,
 }
 
@@ -487,11 +500,21 @@ struct SoundLane {
 impl SoundLane {
     /// Stop the capture, then drop the channel so the writer drains and the
     /// file closes. Same order the picture path uses, for the same reason.
-    fn stop(&mut self) {
+    /// A capture that reports a failure while stopping says so: the caller
+    /// attaches it to the source's outcome, so a device that died mid-take
+    /// cannot pass as a short successful one.
+    fn stop(&mut self) -> std::result::Result<(), String> {
+        let mut failed = None;
         if let Some(capture) = self.capture.take() {
-            let _ = capture.stop();
+            if let Err(e) = capture.stop() {
+                failed = Some(e.to_string());
+            }
         }
         self.sender.take();
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -511,37 +534,42 @@ impl MediaRunning {
         // The sound goes with its picture; a writer waiting on two channels
         // only ends when both of them are closed.
         if let Some(mut lane) = self.sound.take() {
-            lane.stop();
+            // Mid-take there is no outcome to attach this to — the UI asked
+            // for one source to stop, not for a report on it. `finish`
+            // reports what the remaining sources saw.
+            let _ = lane.stop();
         }
         true
     }
 
     /// Stop everything and report. Runs on its own thread inside `stop`.
     fn finish(&mut self) -> Collected {
+        // A capture that failed while stopping is the only witness that the
+        // device died mid-take: dropping the error here made that look like
+        // a short, successful recording. It travels with the source's
+        // outcome, bytes or not — the file is short for a reason.
+        let mut stop_error = None;
         if let Some(handle) = self.handle.take() {
-            let _ = handle.stop();
+            if let Err(e) = handle.stop() {
+                stop_error = Some(e.to_string());
+            }
         }
         self.sender.take();
         if let Some(mut lane) = self.sound.take() {
-            lane.stop();
+            if let Err(e) = lane.stop() {
+                stop_error = stop_error.or(Some(e));
+            }
         }
         // `JoinHandle::join` takes ownership, so the handle leaves `self`.
-        let writer = std::mem::replace(
-            &mut self.writer,
-            // A placeholder nobody joins twice: this struct is consumed by
-            // `finish`'s caller (`stop`'s scope), so the slot is never read.
-            std::thread::spawn(|| {
-                Ok(WriteReport {
-                    seconds: 0.0,
-                    frames: 0,
-                    width: 0,
-                    height: 0,
-                })
-            }),
-        );
-        let outcome = writer
-            .join()
-            .unwrap_or_else(|_| Err("the writer thread panicked".into()));
+        // Already `None` only if `shutdown_writers` ran first, which is a
+        // failure path that never reaches here.
+        let writer = self.writer.take();
+        let outcome = match writer {
+            Some(writer) => writer
+                .join()
+                .unwrap_or_else(|_| Err("the writer thread panicked".into())),
+            None => Err("the writer thread was already joined".into()),
+        };
         let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);
         // A source counts as recorded only if it produced bytes, exactly like
         // an ffmpeg one that exited without writing a frame.
@@ -550,10 +578,15 @@ impl MediaRunning {
                 Some(report.seconds),
                 Some(report.frames),
                 Some((report.width, report.height)),
-                None,
+                stop_error,
             ),
-            Ok(_) => (None, Some(0), None, Some(diagnose::FFMPEG_DIED.to_string())),
-            Err(e) => (None, None, None, Some(e)),
+            Ok(_) => (
+                None,
+                Some(0),
+                None,
+                Some(stop_error.unwrap_or_else(|| diagnose::FFMPEG_DIED.to_string())),
+            ),
+            Err(e) => (None, None, None, Some(stop_error.unwrap_or(e))),
         };
         Collected {
             id: self.id.clone(),
@@ -613,7 +646,7 @@ fn write_frames(
             // WGC hands over the whole window or monitor; the edges the editor
             // picked are cut here, so a cropped source records the same picture
             // on this backend as it does through ffmpeg's region grab.
-            crop: crop_box(crop),
+            crop: crop.into(),
             sampling: takekit_media::writer::Sampling::EveryFrame,
         },
         clock,
@@ -628,13 +661,17 @@ fn write_frames(
     })
 }
 
-/// The edges the editor picked, in the writer's own vocabulary.
-fn crop_box(crop: crate::source::Crop) -> takekit_media::writer::CropBox {
-    takekit_media::writer::CropBox {
-        top: crop.top,
-        bottom: crop.bottom,
-        left: crop.left,
-        right: crop.right,
+/// The edges the editor picked, in the writer's own vocabulary. A `From` so
+/// the mapping has one home: `Crop` gaining a field used to be a silent
+/// cross-crate miss.
+impl From<crate::source::Crop> for takekit_media::writer::CropBox {
+    fn from(crop: crate::source::Crop) -> Self {
+        takekit_media::writer::CropBox {
+            top: crop.top,
+            bottom: crop.bottom,
+            left: crop.left,
+            right: crop.right,
+        }
     }
 }
 
@@ -720,7 +757,7 @@ fn start_av(
     };
 
     let fps = src.fps.max(1);
-    let crop = crop_box(src.capture.crop());
+    let crop = takekit_media::writer::CropBox::from(src.capture.crop());
     let (vtx, vrx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
     let (atx, arx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = std::sync::mpsc::channel();
@@ -1116,8 +1153,12 @@ impl Recording {
                 id: m.id.clone(),
                 // The writer thread is the source's whole pipeline: once it has
                 // exited, the source is done — usually because the capture was
-                // told to stop, occasionally because writing failed.
-                alive: !m.writer.is_finished(),
+                // told to stop, occasionally because writing failed. A `None`
+                // slot means `finish` already took it, so the source is over.
+                alive: m
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_finished()),
                 usable: is_recordable(&m.capture),
                 bytes: std::fs::metadata(&m.out)
                     .map(|meta| meta.len())
@@ -1300,6 +1341,30 @@ impl Collected {
             frames: self.frames,
             size: self.size,
             error: self.error,
+        }
+    }
+}
+
+impl Recording {
+    /// Stop every capture, drop every channel and join every writer — the
+    /// order a failed start needs before the take folder is removed. A
+    /// writer holds its file open while it drains and finalises, and on
+    /// Windows an open file cannot be deleted: without the join the folder
+    /// survives as a take with no manifest and a half-written source in it.
+    /// `Drop` stops the captures but must not join (it cannot panic), which
+    /// is why this lives beside it.
+    fn shutdown_writers(&mut self) {
+        for m in &mut self.media {
+            if let Some(handle) = m.handle.take() {
+                let _ = handle.stop();
+            }
+            m.sender.take();
+            if let Some(mut lane) = m.sound.take() {
+                let _ = lane.stop();
+            }
+            if let Some(writer) = m.writer.take() {
+                let _ = writer.join();
+            }
         }
     }
 }

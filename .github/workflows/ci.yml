@@ -20,6 +20,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Test
         run: cargo test --release
+      # mouseshow is excluded from the workspace (own release profile, path
+      # dependency), so nothing above compiles — let alone tests — it. Its
+      # checks run against its own manifest, in debug: the suite is four
+      # tests, and its release profile exists for the shipped binary.
+      - name: Mouseshow test
+        run: cargo test --manifest-path mouseshow/Cargo.toml
+      - name: Mouseshow clippy
+        run: cargo clippy --all-targets --manifest-path mouseshow/Cargo.toml -- -D warnings
       - name: Contracts
         run: python docs/tools/check-contracts.py
       - name: Build

@@ -7,7 +7,9 @@
 //      WCAG AA — the background is walked up the tree because this UI paints on
 //      containers, not on the text node.
 //
-// Screens: sources, editor, picker, settings × {zh, en} × {light, dark}.
+// Screens: sources, editor, editor-minimized, editor-crop, crop-workspace,
+// editor-crop-dropped, crop-workspace-dropped, picker, settings
+// × {zh, en} × {light, dark}.
 // Screenshots land in target/checks/ui-matrix/ for the eyeball pass.
 //
 // Usage:  cargo build --workspace && node scripts/check-ui-matrix.mjs
@@ -72,7 +74,10 @@ writeFileSync(
     "  [System.Windows.Forms.Application]::DoEvents()",
     "  Start-Sleep -Milliseconds 100",
     "}",
-  ].join("\n"),
+    // CRLF, not LF: this file is fed to Windows PowerShell via -File, and a
+    // bare-LF script is parsed at 5.1's pleasure (it works today; the day it
+    // doesn't, the symptom is a probe window that never writes its handle).
+  ].join("\r\n"),
   "utf8"
 );
 const probe = spawn(
@@ -80,6 +85,22 @@ const probe = spawn(
   ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PROBE_PS1, "-HandleFile", PROBE_HANDLE],
   { stdio: "ignore" }
 );
+// From here on the script has child processes to answer for: the probe window
+// and (once spawned below) the detached panel. A second panel instance exits
+// on sight, so a leaked GUI turns every later run's panel-start red — the
+// failure then outlives the bug that caused it. One cleanup, hooked to
+// 'exit': that event fires on normal completion, on every process.exit()
+// early-out, and on an uncaught throw alike, where a finally block would not
+// (finally does not run on process.exit). Sync taskkill is legal there.
+let guiPid = 0;
+const killTree = (pid) => {
+  if (!pid) return;
+  try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+};
+process.on("exit", () => {
+  killTree(guiPid);
+  killTree(probe.pid);
+});
 let probeHwnd = 0;
 for (let i = 0; i < 80 && !probeHwnd; i++) {
   await sleep(150);
@@ -202,6 +223,7 @@ const gui = spawn(GUI, [], {
   stdio: "ignore",
 });
 gui.unref();
+guiPid = gui.pid;
 
 const controlFile = path.join(appDir, "control.json");
 let control = null;
@@ -685,7 +707,9 @@ await evalJs(`document.getElementById("editor-restore").click()`);
 let afterRestore = {};
 for (let i = 0; i < 40; i++) {
   await sleep(250);
-  afterRestore = JSON.parse(await evalJs(READ_EDITOR));
+  // A thrown read here (the page navigated, the id vanished) used to take the
+  // whole run down with the panel still up; the retry below is the recovery.
+  try { afterRestore = JSON.parse(await evalJs(READ_EDITOR)); } catch {}
   if (afterRestore.image === true) break;
 }
 record("restore-window/turns-croppable",
@@ -703,18 +727,20 @@ record("restore-window/turns-croppable",
 // agent may carry 0 ("unknown owner"), but a window the user clicked must hand
 // over both halves of its identity — otherwise the recycled-handle check exists
 // everywhere except where sources actually come from.
-const pids = JSON.parse(
-  await evalJs(`JSON.stringify((state.windows || []).slice(0, 6).map((w) => w.pid))`)
-);
+let pids = [];
+try {
+  pids = JSON.parse(
+    await evalJs(`JSON.stringify((state.windows || []).slice(0, 6).map((w) => w.pid))`)
+  );
+} catch {}
 record("picker/window-list-carries-pid",
   pids.length > 0 && pids.every((p) => Number.isInteger(p) && p > 0),
   `pids ${JSON.stringify(pids)}`);
 
 if (worst.cr < 99) say(`\nworst contrast: ${worst.cr} on ${worst.el} "${worst.text}" at ${worst.where}`);
 ws.close();
-try { execFileSync("taskkill", ["/PID", String(gui.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
-// The probe window is ours: take it down whether the run passed or not.
-try { execFileSync("taskkill", ["/PID", String(probe.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+// No taskkill here: the 'exit' handler wired at the probe spawn takes the GUI
+// and the probe window down on this path and on every early-out above.
 const fails = results.filter((r) => !r.ok);
 say(`=== ${results.length - fails.length}/${results.length} screens clean ===`);
 say(`screenshots: ${OUT}`);

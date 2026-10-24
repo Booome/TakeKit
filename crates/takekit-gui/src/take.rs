@@ -73,16 +73,26 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
     }
     let _starting = StartingGuard(&state.starting);
 
-    if state.recording.lock().unwrap().is_some() {
+    if state
+        .recording
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
         return Err(UiError::new("err.already-recording"));
     }
-    if state.pending.lock().unwrap().is_some() {
+    if state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
         return Err(UiError::new("err.countdown"));
     }
     if req.sources.is_empty() {
         return Err(UiError::new("err.no-sources"));
     }
-    *state.last_error.lock().unwrap() = None;
+    *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     // Wake the veil's audio before the probe below: creating an AudioContext
     // inside the first beep makes that beep land late (device init and resume
@@ -167,7 +177,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
                     .unwrap_or_else(|| UiError::with_detail("err.prepare-failed", text))
             }
         };
-        *state.last_error.lock().unwrap() = Some(err.to_string());
+        *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
         crate::probe(&format!("begin:failed {err}"));
         err
     })?;
@@ -194,7 +204,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
     }
 
     if !veil_ok {
-        *state.pending.lock().unwrap() = Some(prepared);
+        *state.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(prepared);
         // From here the take is committed: the panel steps aside, and only the
         // spawn can follow.
         crate::tray::set_recording(app, true);
@@ -219,7 +229,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         // the rejected invoke, not by a `take:failed` event it would show a
         // second time. The UI is put back after the lock is released.
         let outcome = {
-            let mut guard = state.recording.lock().unwrap();
+            let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
             spawn_started(&state, &mut guard)
         };
         return match outcome {
@@ -232,7 +242,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         };
     }
 
-    *state.pending.lock().unwrap() = Some(prepared);
+    *state.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(prepared);
     // From here the take is committed: the panel steps aside, and only the
     // countdown (GO → `spawn`) or Esc (`cancel`) can follow.
     crate::tray::set_recording(app, true);
@@ -283,14 +293,19 @@ fn start_esc_watch(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>) {
         let app = app.clone();
         move || watch_esc(app, stop)
     });
-    *state.esc_watch.lock().unwrap() = Some(stop);
+    *state.esc_watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
 }
 
 /// Retire the Esc watcher, if one is running. The thread exits within one
 /// poll interval; nothing joins it because a sleeping watcher must never delay
 /// the caller (the countdown ending is latency-sensitive).
 fn stop_esc_watch(state: &tauri::State<'_, AppState>) {
-    if let Some(stop) = state.esc_watch.lock().unwrap().take() {
+    if let Some(stop) = state
+        .esc_watch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         stop.store(true, Ordering::Relaxed);
     }
 }
@@ -322,7 +337,7 @@ pub fn spawn(app: &tauri::AppHandle) -> Result<StartResult, UiError> {
     // them, and the main thread may be waiting on this very lock (the window's
     // close handler), which is a deadlock.
     let outcome = {
-        let mut guard = state.recording.lock().unwrap();
+        let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
         // The caller is the veil, which has nothing to show an error with: the
         // panel is hidden by now, so the failure has to travel as an event.
         spawn_started(&state, &mut guard)
@@ -348,14 +363,19 @@ fn spawn_started(
     state: &tauri::State<'_, AppState>,
     guard: &mut Option<Recording>,
 ) -> Result<StartResult, UiError> {
-    let Some(prepared) = state.pending.lock().unwrap().take() else {
+    let Some(prepared) = state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    else {
         // The countdown was cancelled underneath us: nothing to start, and
         // nothing to recover from either — the panel is already back.
         return Err(UiError::new("err.nothing-pending"));
     };
     // The countdown is over: Esc no longer cancels anything.
     stop_esc_watch(state);
-    *state.last_error.lock().unwrap() = None;
+    *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     let engine = match prepared.backend() {
         Backend::Windows => "wgc+mf".to_string(),
@@ -387,7 +407,7 @@ fn spawn_started(
             let text = e.to_string();
             let err = UiError::from_code_string(&text)
                 .unwrap_or_else(|| UiError::with_detail("err.spawn-failed", text));
-            *state.last_error.lock().unwrap() = Some(err.to_string());
+            *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
             crate::probe(&format!("spawn:failed {err}"));
             // Tray, veil and panel are the caller's job — doing that here would
             // run it under the recording lock.
@@ -401,7 +421,13 @@ fn spawn_started(
 /// disk — which is what makes this free.
 pub fn cancel(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
-    if state.pending.lock().unwrap().take().is_none() {
+    if state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_none()
+    {
         // Either the countdown already finished (spawn took the take) or
         // nothing was ever prepared: there is nothing to cancel.
         crate::probe("cancel:nothing");
@@ -424,8 +450,12 @@ pub fn cancel(app: &tauri::AppHandle) {
 
 pub fn status(app: &tauri::AppHandle) -> StatusInfo {
     let state = app.state::<AppState>();
-    let last_error = state.last_error.lock().unwrap().clone();
-    let mut guard = state.recording.lock().unwrap();
+    let last_error = state
+        .last_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     status_of(guard.as_mut(), last_error)
 }
 
@@ -462,7 +492,7 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
 /// behind it. The rest of the take is untouched.
 pub fn stop_source(app: &tauri::AppHandle, id: &str) -> bool {
     let state = app.state::<AppState>();
-    let mut guard = state.recording.lock().unwrap();
+    let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     let stopped = guard.as_mut().is_some_and(|r| r.stop_source(id));
     if stopped {
         crate::probe(&format!("source:stopped {id}"));
@@ -640,7 +670,10 @@ pub fn resolve(current: Option<Shortcut>, spec: &str) -> Result<Resolution, UiEr
 /// to start or stop.
 pub fn install_hotkey(app: &tauri::AppHandle, spec: &str) -> Result<String, UiError> {
     let state = app.state::<AppState>();
-    let resolution = resolve(*state.hotkey.lock().unwrap(), spec)?;
+    let resolution = resolve(
+        *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()),
+        spec,
+    )?;
     let Some(next) = resolution.register else {
         return Ok(resolution.normalized);
     };
@@ -667,7 +700,11 @@ pub fn install_hotkey(app: &tauri::AppHandle, spec: &str) -> Result<String, UiEr
             )
         })?;
 
-    let previous = state.hotkey.lock().unwrap().replace(next);
+    let previous = state
+        .hotkey
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(next);
     if let Some(previous) = previous {
         let _ = app.global_shortcut().unregister(previous);
     }
@@ -698,9 +735,27 @@ mod tests {
     #[test]
     fn a_fresh_state_has_no_pending_take_or_watcher() {
         let state = AppState::default();
-        assert!(state.pending.lock().unwrap().is_none());
-        assert!(state.last_error.lock().unwrap().is_none());
-        assert!(state.esc_watch.lock().unwrap().is_none());
+        assert!(
+            state
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+        assert!(
+            state
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+        assert!(
+            state
+                .esc_watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
     }
 
     #[test]

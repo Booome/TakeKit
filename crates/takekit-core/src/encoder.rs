@@ -195,4 +195,23 @@ mod tests {
         let _ = cached_pick(&mut slot, Path::new("ffmpeg-b"), probe);
         assert_eq!(calls.get(), 6, "a different binary must be probed again");
     }
+
+    #[test]
+    fn encoder_is_lowercase_on_the_wire_both_ways() {
+        // `Encoder` rides in config.json (`encoder: Option<Encoder>`) and in
+        // the control surface's PATCH body. `Backend` once went out as
+        // "Windows" while the panel sent "windows": one rejected field fell
+        // every field back to defaults. The same fence, for the enum that
+        // had none (development.md §6.18: IPC enums are lowercase + tested).
+        for value in ["nvenc", "qsv", "amf", "x264"] {
+            let parsed: Encoder = serde_json::from_str(&format!("\"{value}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{value}\""),
+                "{value} must round-trip unchanged"
+            );
+        }
+        // And the wrong case is still a rejection, not a silent default.
+        assert!(serde_json::from_str::<Encoder>("\"NVENC\"").is_err());
+    }
 }

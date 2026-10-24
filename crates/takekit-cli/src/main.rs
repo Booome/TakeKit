@@ -5,7 +5,6 @@
 
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use takekit_core::encoder::Encoder;
@@ -107,9 +106,12 @@ struct RecordArgs {
     #[arg(short, long, default_value = "takes")]
     out: PathBuf,
 
+    /// Capture rate in frames per second
     #[arg(long, default_value_t = 30)]
     fps: u32,
 
+    /// auto | x264 | nvenc | qsv | amf — auto probes each and picks the
+    /// best that actually works
     #[arg(long, value_enum, default_value_t = EncoderArg::Auto)]
     encoder: EncoderArg,
 
@@ -162,6 +164,7 @@ struct MediaArgs {
     #[arg(short, long, default_value = "takes-media")]
     out: PathBuf,
 
+    /// Capture rate in frames per second
     #[arg(long, default_value_t = 30)]
     fps: u32,
 
@@ -205,6 +208,71 @@ impl std::str::FromStr for CropArg {
             })),
             _ => Err("expected top,bottom,left,right".into()),
         }
+    }
+}
+
+// ── stopping from the console ───────────────────────────────────────────────
+//
+// The default console handler kills the process outright. On the
+// Windows-API backend that is data loss, not an interruption: the MP4 is
+// finalised by `stop`, so a killed process leaves an unplayable file with
+// no `take.json` and no history row. Ctrl-C therefore flips this flag and
+// the wait loops stop the take properly.
+
+#[cfg(windows)]
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+unsafe extern "system" fn on_console_signal(ctrltype: u32) -> windows::core::BOOL {
+    // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1: claim these so the wait loops
+    // can stop the take properly instead of the process dying mid-mux.
+    // Everything else (close / logoff / shutdown) returns FALSE, i.e. "not
+    // handled", so the default handler still runs — the process is on its
+    // way out either way, and the ~5s close grace period is not enough to
+    // finalise an MP4. Claiming those would suppress the default handler
+    // while still being killed, which is strictly worse.
+    match ctrltype {
+        0 | 1 => {
+            STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            windows::core::BOOL(1)
+        }
+        _ => windows::core::BOOL(0),
+    }
+}
+
+/// Ask the console to report Ctrl-C instead of killing the process. Once
+/// per recording command; harmless to call when it is already armed.
+#[cfg(windows)]
+fn arm_console_stop() {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: the handler only touches an atomic bool and returns "handled".
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(on_console_signal), true);
+    }
+}
+
+#[cfg(not(windows))]
+fn arm_console_stop() {}
+
+fn stop_requested() -> bool {
+    #[cfg(windows)]
+    {
+        STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Wait out `secs`, returning early when the console asks to stop. Sliced
+/// into 100ms steps so a Ctrl-C during a long take is noticed at once.
+fn wait_or_stop(secs: f64) {
+    let mut left = std::time::Duration::from_secs_f64(secs.max(0.0));
+    while left > std::time::Duration::ZERO && !stop_requested() {
+        let slice = left.min(std::time::Duration::from_millis(100));
+        std::thread::sleep(slice);
+        left = left.saturating_sub(slice);
     }
 }
 
@@ -308,6 +376,7 @@ fn desktop_capture(crop: Crop) -> Capture {
 }
 
 fn record(args: RecordArgs) -> Result<(), String> {
+    arm_console_stop();
     // `Duration::from_secs_f64` panics on NaN, infinity and values past
     // `u64::MAX`; a day is far past any real take, so it doubles as the cap.
     if !args.duration.is_finite() || !(0.0..=86_400.0).contains(&args.duration) {
@@ -428,12 +497,38 @@ fn record(args: RecordArgs) -> Result<(), String> {
         println!("  {id} -> {}", rec.path_for(id).display());
     }
 
+    // Without a duration the take waits for Enter. A pipe or an agent's
+    // stdin hits EOF immediately, which used to record a 0-second take and
+    // report it as a success.
+    if args.duration <= 0.0 && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let _ = rec.stop();
+        return Err("no --duration and stdin is not a terminal: pass --duration".to_string());
+    }
+
     if args.duration > 0.0 {
-        std::thread::sleep(Duration::from_secs_f64(args.duration));
+        wait_or_stop(args.duration);
     } else {
         println!("press Enter to stop …");
-        let mut line = String::new();
-        let _ = std::io::stdin().lock().read_line(&mut line);
+        // Enter is read on its own thread so the wait stays free to notice a
+        // Ctrl-C: a blocking read_line would sit through it, and the take
+        // would be lost instead of stopped.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            let _ = tx.send(());
+        });
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()
+        {
+            if stop_requested() {
+                break;
+            }
+        }
+    }
+    if stop_requested() {
+        println!("stopping on Ctrl-C …");
     }
 
     let finished = rec.stop().map_err(|e| e.to_string())?;
@@ -506,6 +601,7 @@ fn open_audio(name: &str, path: PathBuf, bitrate: u32) -> AudioWriterStart {
 }
 
 fn media(args: MediaArgs) -> Result<(), String> {
+    arm_console_stop();
     use std::sync::mpsc;
     use std::thread;
 
@@ -679,7 +775,10 @@ fn media(args: MediaArgs) -> Result<(), String> {
     }
 
     println!("recording for {:.1}s into {}", args.duration, dir.display());
-    thread::sleep(Duration::from_secs_f64(args.duration));
+    wait_or_stop(args.duration);
+    if stop_requested() {
+        println!("stopping on Ctrl-C …");
+    }
 
     // The take ends now, for every channel alike.
     end_hint.store(clock.now_100ns(), std::sync::atomic::Ordering::SeqCst);

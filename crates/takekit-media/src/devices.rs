@@ -118,6 +118,18 @@ pub(crate) fn win_capture_error<E: std::fmt::Display>(e: E) -> MediaError {
     MediaError::Capture(e.to_string())
 }
 
+/// COM has to be initialised on the thread that makes the calls, and it is
+/// refcounted per thread. Idempotent, so every entry point can call it: the
+/// one definition four capture threads used to each carry a copy of.
+pub(crate) fn ensure_com() {
+    // SAFETY: process-global and idempotent per thread; a thread that
+    // already initialised COM answers with a benign error, which is
+    // ignored: what matters is that it is initialised.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+}
+
 /// Media Foundation has to be running before any of its calls, and it is
 /// refcounted per process. One start for the lifetime of the process is
 /// deliberate: shutting it down while another thread is mid-enumeration is
@@ -211,15 +223,14 @@ pub(crate) fn activate(kind: GUID, id_key: &GUID, wanted: &str) -> Result<IMFMed
 /// One string attribute off an activated device, freed as soon as it is read.
 fn string_of(device: &IMFActivate, key: &GUID) -> Result<String> {
     // SAFETY: `value` is filled in by the call and freed on this frame; the
-    // string is copied out before that.
+    // string is copied out before that. The copy happens before the free on
+    // both paths — a failed conversion used to return early and leak.
     unsafe {
         let mut value = PWSTR::null();
         device.GetAllocatedString(key, &mut value, std::ptr::null_mut())?;
-        let text = value
-            .to_string()
-            .map_err(|e| MediaError::message(e.to_string()))?;
+        let text = value.to_string();
         CoTaskMemFree(Some(value.as_ptr().cast::<core::ffi::c_void>()));
-        Ok(text)
+        text.map_err(|e| MediaError::message(e.to_string()))
     }
 }
 

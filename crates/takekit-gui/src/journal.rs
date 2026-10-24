@@ -88,10 +88,10 @@ pub struct Journal {
 
 impl Journal {
     pub fn path() -> PathBuf {
-        let base = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        base.join("TakeKit").join("journal.json")
+        // `fsx::app_dir` is the single definition of where the app keeps its
+        // files (config.json, control.json and this); joining the folder by
+        // hand here was the one copy that could drift.
+        takekit_core::fsx::app_dir().join("journal.json")
     }
 
     pub fn load() -> Journal {

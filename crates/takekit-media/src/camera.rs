@@ -15,7 +15,6 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaSource, IMFSourceReader, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
 use crate::clock::TakeClock;
 use crate::devices::activate;
@@ -140,11 +139,7 @@ fn wait_for_open(
 
 /// Open the camera and ask it for NV12.
 fn open(link: &str, fps: u32) -> Result<(IMFSourceReader, u32, u32)> {
-    // SAFETY: COM has to be initialised on this thread before Media Foundation
-    // is used from it; a thread that already did it answers with a benign error.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    crate::devices::ensure_com();
     let source: IMFMediaSource = activate(
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
         &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,

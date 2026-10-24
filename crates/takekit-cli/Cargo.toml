@@ -20,3 +20,10 @@ serde_json.workspace = true
 # Talking to the panel's control surface (docs/agent-control.md). No TLS
 # feature: the server is loopback-only and plain http://127.0.0.1.
 ureq = { version = "2", default-features = false, features = ["json"] }
+
+# Console Ctrl-C: the default handler kills the process mid-write, which on
+# the Windows-API backend loses the whole take (the MP4 is finalised by
+# stop). Same crate and version the media crate already pins.
+[dependencies.windows]
+version = "0.62.2"
+features = ["Win32_System_Console", "Win32_Foundation"]

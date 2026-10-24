@@ -61,7 +61,12 @@ impl Client {
     }
 
     pub fn send(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        // A timeout, because the panel serves one request at a time: a busy
+        // panel (a take finalising) used to leave `ctl`/`mcp` hanging with
+        // no end and no message. Loopback answers in milliseconds; thirty
+        // seconds is a stuck panel, said plainly.
         let request = ureq::request(method, &format!("{}{path}", self.base))
+            .timeout(std::time::Duration::from_secs(30))
             .set("Authorization", &format!("Bearer {}", self.token));
         let response = match body {
             Some(body) => request.send_json(body),

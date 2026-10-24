@@ -51,6 +51,9 @@ pub enum Error {
     Encoder(String),
     /// A source could not be resolved (window not found, bad crop, …).
     Source(String),
+    /// A quality value outside the domain every encoder shares — refused here
+    /// because ffmpeg only says so after the take folder exists.
+    Quality(String),
     Marks(String),
     Io(std::io::Error),
 }
@@ -59,7 +62,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NoFfmpeg => write!(f, "ffmpeg not found on PATH"),
-            Error::Encoder(m) | Error::Source(m) => write!(f, "{m}"),
+            Error::Encoder(m) | Error::Source(m) | Error::Quality(m) => write!(f, "{m}"),
             Error::Marks(m) => write!(f, "cannot start MouseShow: {m}"),
             Error::Io(e) => write!(f, "{e}"),
         }
@@ -2152,6 +2155,7 @@ pub struct Session;
 impl Session {
     pub fn prepare(settings: Settings) -> Result<Prepared> {
         let t0 = std::time::Instant::now();
+        validate_quality(&settings)?;
         validate_sources(&settings.sources)?;
         // Sound inside a picture's file is a Media Foundation mux: ffmpeg has
         // no WASAPI loopback and no way to put one stream's bytes into another
@@ -2328,6 +2332,23 @@ impl Session {
             engine_probed: true,
         })
     }
+}
+
+/// Refuse a quality the encoders cannot honour, before anything is created.
+///
+/// The bound lives in `encoder` (the module that turns the number into flags);
+/// this is the gate every caller passes — CLI, panel and MCP alike — because
+/// `-crf 200` is only rejected by ffmpeg *after* the take folder exists, and
+/// the in-process path would just clamp it silently.
+fn validate_quality(settings: &Settings) -> Result<()> {
+    encoder::check_quality(settings.quality).map_err(Error::Quality)?;
+    for src in &settings.sources {
+        if let Some(q) = src.quality {
+            encoder::check_quality(q)
+                .map_err(|m| Error::Quality(format!("source {:?}: {m}", src.id)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject source lists that would misbehave on disk before anything starts.
@@ -2557,6 +2578,42 @@ mod tests {
         };
         let d = f.delta().unwrap();
         assert!((d - 0.333).abs() < 1e-9, "got {d}");
+    }
+
+    /// A quality the encoders cannot honour must be refused by `prepare`, not
+    /// by ffmpeg after the take folder exists — and the source override is
+    /// held to the same domain as the session-wide value.
+    #[test]
+    fn an_out_of_range_quality_stops_the_take_before_it_starts() {
+        let settings = |quality: u8, pinned: Option<u8>| {
+            let mut s = source("screen");
+            s.quality = pinned;
+            Settings {
+                sources: vec![s],
+                out_root: std::env::temp_dir(),
+                quality,
+                encoder: None,
+                marks: false,
+                backend: Backend::Windows,
+            }
+        };
+
+        let err = validate_quality(&settings(52, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0..=51") && err.contains("got 52"), "{err}");
+
+        let err = validate_quality(&settings(20, Some(200)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"screen\"") && err.contains("got 200"),
+            "{err}"
+        );
+
+        // Both ends of the domain stay legal, and `None` never fails.
+        assert!(validate_quality(&settings(0, None)).is_ok());
+        assert!(validate_quality(&settings(51, Some(51))).is_ok());
     }
 
     #[test]

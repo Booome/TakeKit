@@ -115,8 +115,9 @@ struct RecordArgs {
     #[arg(long, value_enum, default_value_t = EncoderArg::Auto)]
     encoder: EncoderArg,
 
-    /// Quality: roughly CRF for x264, CQ for hardware encoders
-    #[arg(long, default_value_t = 20)]
+    /// Quality 0..=51: roughly CRF for x264, CQ/QP for hardware encoders
+    /// (0 = lossless). Out of range is refused before the take folder exists.
+    #[arg(long, default_value_t = takekit_core::encoder::DEFAULT_QUALITY)]
     quality: u8,
 
     /// Mouse effects (the panel's "鼠标效果"): draw click ripples and drag

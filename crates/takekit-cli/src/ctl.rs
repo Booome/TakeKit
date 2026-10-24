@@ -37,7 +37,7 @@ pub enum Ctl {
         /// Frames per second (default 30)
         #[arg(long)]
         fps: Option<u32>,
-        /// Per-source quality (default: the session quality)
+        /// Per-source quality 0..=51 (default: the session quality)
         #[arg(long)]
         quality: Option<u8>,
         /// Record this source's sound into its own file (window or desktop
@@ -116,7 +116,7 @@ pub enum Ctl {
     },
     /// Start a take on the current sources
     Start {
-        /// Session quality for this take (default 20)
+        /// Session quality 0..=51 for this take (default 20)
         #[arg(long)]
         quality: Option<u8>,
     },

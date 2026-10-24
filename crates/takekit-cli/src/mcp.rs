@@ -308,7 +308,7 @@ fn tool_list() -> Vec<Value> {
                     "monitor": prop("monitor number for kind=desktop (see list_devices)", "number"),
                     "crop": prop("edges to trim: {top,bottom,left,right} in pixels (pictures only)", "object"),
                     "fps": prop("frames per second, default 30", "number"),
-                    "quality": prop("per-source quality override", "number"),
+                    "quality": prop("per-source quality override, 0..=51 (0 = lossless)", "number"),
                     "sound": prop("kind=window or desktop: also record its sound into the same file (per-process loopback for a window, system sound for the desktop)", "boolean"),
                 }),
                 &["kind"],
@@ -355,7 +355,7 @@ fn tool_list() -> Vec<Value> {
                             the full-screen countdown runs first (started=false in the reply); \
                             the encoders start when it reaches GO.",
             "inputSchema": object(
-                json!({ "quality": prop("quality for this take, default 20", "number") }),
+                json!({ "quality": prop("quality for this take, 0..=51, default 20 (0 = lossless)", "number") }),
                 &[],
             ),
         }),

@@ -78,7 +78,7 @@ Options worth knowing:
 | `--window-sound` | write the window's own sound into the same file as its picture (needs `--window`) |
 | `--desktop-sound` | the desktop's sound into its file (the whole machine — Windows has no per-monitor audio) |
 | `--encoder auto\|x264\|nvenc\|qsv\|amf` | default `auto`, picks the best that actually works |
-| `--quality 20` | roughly CRF for x264, CQ for hardware encoders |
+| `--quality 20` | 0..=51（越界在创建 take 目录前就拒）：roughly CRF for x264, CQ/QP for hardware encoders，0 = lossless |
 | `--fps 30` | capture rate |
 | `--crop T,B,L,R` | crop inset in pixels, applied per source |
 | `-o, --out <DIR>` | output root; a timestamped directory is created inside (default `takes`) |

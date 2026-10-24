@@ -94,7 +94,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 | `DELETE /sources/{index}` | 同上 | — | 新快照 |
 | `PUT /sources` | `save_session` | `Source[]` | 新快照 |
 | `PATCH /config` | `set_*` 系列合并 | Config 子集 | 新快照 |
-| `POST /record/start` | `start_recording` | `{ quality? }`（其余取当前设置） | `{ started, countdown_secs }` |
+| `POST /record/start` | `start_recording` | `{ quality? }`（0..=51，默认 20；其余取当前设置） | `{ started, countdown_secs }` |
 | `POST /record/stop` | `stop_recording` | — | `StopResult`（含 `dir`） |
 | `GET /history` | `journal_get` | — | `{ takes, log }` |
 | `GET /log?level=warn\|error` | `journal.log` 单独一面 | — | `LogRecord[]`（诊断第一步） |
@@ -168,11 +168,11 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
 |---|---|---|
 | `takekit_state` | — | 上面那个快照 |
 | `takekit_list_devices` | `kind` | 枚举窗口/桌面/摄像头/麦克风 |
-| `takekit_add_source` | `kind`, `target`（窗口标题子串 / 摄像头名或链接子串）, `monitor?`, `crop?`, `fps?`, `quality?`, `sound?` | 加一个源；`sound=true` = 该源的声音写进同一文件（窗口=本进程树回环，桌面=整机系统声音） |
+| `takekit_add_source` | `kind`, `target`（窗口标题子串 / 摄像头名或链接子串）, `monitor?`, `crop?`, `fps?`, `quality?`（0..=51）, `sound?` | 加一个源；`sound=true` = 该源的声音写进同一文件（窗口=本进程树回环，桌面=整机系统声音） |
 | `takekit_remove_source` | `index` | 按 `/state` 下标删 |
 | `takekit_set_sources` | `sources[]` | 整表替换 |
 | `takekit_set_settings` | `{ hotkey?, countdown_secs?, out_root?, ffmpeg_path?, encoder?, backend?, marks?, raise_sources?, language?, theme?, finalize_panel? }` | 改设置；`ffmpeg_path` 传 `null` = 回到 PATH 查找 |
-| `takekit_start_recording` | `quality?`（其余取当前设置，倒计时走 `countdown_secs` 设置） | 开始（含倒计时） |
+| `takekit_start_recording` | `quality?`（0..=51，默认 20；其余取当前设置，倒计时走 `countdown_secs` 设置） | 开始（含倒计时） |
 | `takekit_stop_recording` | — | 停止，返回落盘目录 |
 | `takekit_history` | — | 历史 + 日志（全景） |
 | `takekit_log` | `level?`（warn/error） | **只有日志**——「出了什么事」的第一站，含控制面自己失败操作的留痕 |

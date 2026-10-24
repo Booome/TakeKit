@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use tauri::Emitter;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use takekit_core::encoder::{DEFAULT_QUALITY, MAX_QUALITY, quality_message};
 use takekit_core::source::{Backend, Capture, Crop, ScreenRect, Source};
 
 use crate::config;
@@ -29,8 +30,7 @@ use crate::proto::{StartRequest, UiError};
 use crate::take;
 
 /// The session-wide quality a start request falls back on, the same number the
-/// panel's `DEFAULT_QUALITY` sends.
-const DEFAULT_QUALITY: u8 = 20;
+/// panel's `DEFAULT_QUALITY` sends — the one in `takekit_core::encoder`.
 /// Same for a source's frame rate when the convenience form does not say.
 const DEFAULT_FPS: u32 = 30;
 /// A request body bigger than this is refused rather than buffered: the
@@ -659,13 +659,16 @@ fn bounded_fps(body: &Value) -> Result<u32, Fail> {
 
 /// `None` when absent — the session-wide quality applies — and out of range
 /// is a refusal, never a wrap into a different number.
+///
+/// The bound and the wording come from `takekit_core::encoder`, the same two
+/// the CLI and `Session::prepare` use: this door is not allowed to be the
+/// lenient one (a `256` here used to be rejected with its own private
+/// sentence, while `52` reached ffmpeg and failed after the folder existed).
 fn bounded_quality(body: &Value) -> Result<Option<u8>, Fail> {
     match body.get("quality").and_then(Value::as_u64) {
         None => Ok(None),
-        Some(q) if q <= 51 => Ok(Some(q as u8)),
-        Some(q) => Err(bad(format!(
-            "quality must be 0..=51 (CRF-flavoured), got {q}"
-        ))),
+        Some(q) if q <= MAX_QUALITY as u64 => Ok(Some(q as u8)),
+        Some(q) => Err(bad(quality_message(q))),
     }
 }
 
@@ -1478,6 +1481,16 @@ mod tests {
         let zero = json!({ "fps": 0, "quality": 0 });
         assert!(bounded_fps(&zero).is_err());
         assert_eq!(bounded_quality(&zero).unwrap(), Some(0));
+
+        // One step over the top is refused in the core's own words, so the
+        // panel, the CLI and `Session::prepare` cannot describe the bound
+        // differently — a private sentence here is how 52 used to reach ffmpeg.
+        let over = json!({ "quality": 52 });
+        let (_, _, msg) = bounded_quality(&over).unwrap_err();
+        assert!(
+            msg.contains(&takekit_core::encoder::quality_message(52)),
+            "{msg}"
+        );
     }
 
     #[test]

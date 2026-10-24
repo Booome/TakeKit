@@ -14,6 +14,43 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+/// The quality knob's domain, in the units every encoder here takes: CRF for
+/// x264, CQ/QP for the hardware ones.
+///
+/// Why these numbers: 51 is the top of H.264's QP range and what x264's CRF
+/// stops at — above it every encoder here either refuses the value or clamps
+/// it, so the file looks the same and the setting is a lie. 0 is lossless,
+/// which x264 really does and the hardware encoders read as their lowest QP.
+/// Values outside this range used to pass straight through to `-crf 200`,
+/// where ffmpeg fails *after* the take folder exists.
+pub const MIN_QUALITY: u8 = 0;
+pub const MAX_QUALITY: u8 = 51;
+/// What a take uses when nobody says otherwise.
+pub const DEFAULT_QUALITY: u8 = 20;
+
+/// The one message every surface shows for an out-of-range quality.
+///
+/// Takes the value as anything printable so the panel can report a number it
+/// could not even narrow to `u8` (`{"quality": 256}`) in the same words.
+pub fn quality_message(got: impl std::fmt::Display) -> String {
+    format!(
+        "quality must be {MIN_QUALITY}..={MAX_QUALITY} (CRF for x264, CQ/QP for the \
+         hardware encoders; {MIN_QUALITY} = lossless), got {got}"
+    )
+}
+
+/// `Ok(())` inside the domain, otherwise the one message every surface shows.
+///
+/// One function so the CLI, the panel and MCP cannot disagree about the bound
+/// or about how it is worded.
+pub fn check_quality(quality: u8) -> Result<(), String> {
+    if (MIN_QUALITY..=MAX_QUALITY).contains(&quality) {
+        Ok(())
+    } else {
+        Err(quality_message(quality))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoder {
@@ -194,6 +231,24 @@ mod tests {
         let _ = cached_pick(&mut slot, Path::new("ffmpeg-a"), probe);
         let _ = cached_pick(&mut slot, Path::new("ffmpeg-b"), probe);
         assert_eq!(calls.get(), 6, "a different binary must be probed again");
+    }
+
+    #[test]
+    fn quality_domain_is_0_to_51_and_nothing_else() {
+        // The ends are included, one step outside each is not: this is the
+        // gate `Session::prepare` applies to every take.
+        assert!(check_quality(MIN_QUALITY).is_ok(), "0 = lossless is legal");
+        assert!(check_quality(MAX_QUALITY).is_ok(), "51 is H.264's top QP");
+        assert!(check_quality(DEFAULT_QUALITY).is_ok());
+        assert!(check_quality(MAX_QUALITY + 1).is_err());
+        assert!(check_quality(u8::MAX).is_err());
+
+        // The message must name both ends and the value that was refused —
+        // the panel and the CLI show this string as-is.
+        let err = check_quality(60).unwrap_err();
+        assert!(err.contains("0..=51"), "{err}");
+        assert!(err.contains("got 60"), "{err}");
+        assert_eq!(err, quality_message(60), "one wording, two entry points");
     }
 
     #[test]

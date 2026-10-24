@@ -16,6 +16,7 @@ pub mod loopback;
 pub mod mediatype;
 pub mod mic;
 pub mod reader;
+pub mod runner;
 pub mod screen;
 pub mod snapshot;
 pub mod writer;

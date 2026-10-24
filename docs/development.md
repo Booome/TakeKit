@@ -35,7 +35,7 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
 - `takekit-core` 有 7 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
-- 基线（2026-10-24 实测）：core 57（+7 ignored）/ cli 9 / gui 84 / media 25。以 `cargo test` 实际输出为准。
+- 基线（2026-10-24 实测）：core 59（+7 ignored）/ cli 9 / gui 84 / media 28。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **功能级三端一致性**：`node scripts/check-three-surface.mjs`——真跑 MCP（schema → stdio 调用 → 面板 → 配置）和 CLI 参数。名字对了不等于字段通了：`sound` 曾在 schema 里声明、在 HTTP 转发前被白名单丢掉，`check-contracts.py` 看不见这种漂移。
 - **界面语言×主题**：`node scripts/check-ui-matrix.mjs`——zh/en × light/dark × 9 屏（源列表、卡片、最小化窗口的卡片、裁剪源卡片、裁剪工作区、裁剪被丢弃的卡片与工作区、添加源、设置），量横向滚动、文本溢出、WCAG AA 对比度，截图落 `target/checks/ui-matrix/`。它就是抓出「`.field button.browse` 选择器从未匹配、深色下 `…` 对比度 1.02」的那一个。
@@ -71,6 +71,8 @@ crates/
 │   ├─ screen.rs          WGC 抓屏/抓窗口（被遮挡窗口可录）
 │   ├─ camera.rs / mic.rs Media Foundation 设备读取（NV12 / PCM）
 │   ├─ loopback.rs        WASAPI 回环：系统声音 / 单窗口进程树声音
+│   ├─ runner.rs          DeviceCapture：三种设备捕获共用的线程骨架
+│   │                     （开设备→报格式→读循环→stop/失败槽/Drop）
 │   └─ writer.rs          MF SinkWriter：H.264+AAC 写 MP4（含前导黑帧/静音对齐）
 ├─ takekit-cli/           ← 薄壳，bin 名 `takekit`
 └─ takekit-gui/

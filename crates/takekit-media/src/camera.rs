@@ -4,12 +4,13 @@
 //! re-plug and a restart, and is asked for NV12 at its own resolution: the
 //! format it produces natively, and the one an encoder takes without a
 //! conversion.
+//!
+//! The thread, the stop flag and the failure slot are `runner::DeviceCapture`;
+//! what is left here is what a camera does differently — how it opens and how
+//! its samples are turned into frames.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::SyncSender;
 
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaSource, IMFSourceReader, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
@@ -22,9 +23,7 @@ use crate::error::{MediaError, Result};
 use crate::frame::{MediaFrame, PixelFormat, VideoFrame};
 use crate::mediatype::{camera_type, frame_size};
 use crate::reader::{VIDEO_STREAM, create_reader, native_type, next_sample, sample_bytes};
-
-/// How long a camera is given to open before the take is called off.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::runner::{CaptureCtx, DeviceCapture, Pump};
 
 /// What a camera turned out to produce, which the writer needs before it can
 /// size a single frame.
@@ -36,14 +35,9 @@ pub struct CameraFormat {
 }
 
 /// A running camera capture. Dropping it stops it.
-pub struct CameraCapture {
-    stop: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<String>>>,
-    thread: Option<JoinHandle<()>>,
-    format: CameraFormat,
-}
+pub type CameraCapture = DeviceCapture<CameraFormat>;
 
-impl CameraCapture {
+impl DeviceCapture<CameraFormat> {
     /// Start capturing `link` into `out`.
     pub fn start(
         link: &str,
@@ -51,89 +45,19 @@ impl CameraCapture {
         out: SyncSender<MediaFrame>,
         clock: TakeClock,
     ) -> Result<Self> {
-        let (ready, opened) = std::sync::mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let failure = Arc::new(Mutex::new(None));
-
         let link = link.to_string();
-        let thread_stop = stop.clone();
-        let thread_failure = failure.clone();
-        // Everything Media Foundation has to be created on the thread that
-        // reads it: its objects are not `Send`, and COM has to be initialised
-        // on that thread anyway.
-        let thread = std::thread::spawn(move || match open(&link, fps) {
-            Ok((reader, width, height)) => {
-                let _ = ready.send(Ok(CameraFormat { width, height, fps }));
-                if let Err(e) = pump(&reader, width, height, thread_stop, out, clock)
-                    && let Ok(mut slot) = thread_failure.lock()
-                {
-                    *slot = Some(e.to_string());
-                }
-            }
-            Err(e) => {
-                let _ = ready.send(Err(e.to_string()));
-            }
-        });
-
-        let (format, thread) = wait_for_open(opened, thread)?;
-        Ok(Self {
-            stop,
-            failure,
-            thread: Some(thread),
-            format,
-        })
-    }
-
-    pub fn format(&self) -> CameraFormat {
-        self.format
-    }
-
-    /// Stop the capture and wait for the read loop to leave its blocking call.
-    pub fn stop(mut self) -> Result<()> {
-        self.stop.store(true, Ordering::SeqCst);
-        self.join()
-    }
-
-    fn join(&mut self) -> Result<()> {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let failure = self
-            .failure
-            .lock()
-            .map_err(|e| MediaError::message(e.to_string()))?
-            .take();
-        match failure {
-            Some(e) => Err(MediaError::message(e)),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for CameraCapture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Wait for the camera to report its format, turning a camera that never opens
-/// into an error instead of a take that records nothing and says so at the end.
-fn wait_for_open(
-    opened: Receiver<std::result::Result<CameraFormat, String>>,
-    thread: JoinHandle<()>,
-) -> Result<(CameraFormat, JoinHandle<()>)> {
-    match opened.recv_timeout(OPEN_TIMEOUT) {
-        Ok(Ok(format)) => Ok((format, thread)),
-        Ok(Err(e)) => Err(MediaError::message(e)),
-        Err(_) => {
-            let _ = thread.join();
-            Err(MediaError::message(
-                "the camera did not open within ten seconds",
-            ))
-        }
+        Self::spawn(
+            "the camera did not open within ten seconds",
+            out,
+            clock,
+            move || {
+                let (reader, width, height) = open(&link, fps)?;
+                Ok((
+                    CameraFormat { width, height, fps },
+                    Box::new(move |ctx| pump(&reader, width, height, ctx)) as Pump,
+                ))
+            },
+        )
     }
 }
 
@@ -165,28 +89,21 @@ fn open(link: &str, fps: u32) -> Result<(IMFSourceReader, u32, u32)> {
     Ok((reader, width, height))
 }
 
-fn pump(
-    reader: &IMFSourceReader,
-    width: u32,
-    height: u32,
-    stop: Arc<AtomicBool>,
-    out: SyncSender<MediaFrame>,
-    clock: TakeClock,
-) -> Result<()> {
+fn pump(reader: &IMFSourceReader, width: u32, height: u32, ctx: CaptureCtx) -> Result<()> {
     // Bridged once, at the first sample: the camera's clock counts from its
     // own origin and knows nothing about the take's.
     let mut anchor: Option<i64> = None;
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if ctx.stop.load(Ordering::SeqCst) {
             return Ok(());
         }
         let Some((sample, time)) = next_sample(reader, VIDEO_STREAM)? else {
             return Ok(());
         };
-        let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(time));
+        let anchor = *anchor.get_or_insert_with(|| ctx.clock.device_anchor(time));
         let data = sample_bytes(&sample)?;
         if !crate::frame::offer(
-            &out,
+            &ctx.out,
             MediaFrame::Video(VideoFrame {
                 width,
                 height,

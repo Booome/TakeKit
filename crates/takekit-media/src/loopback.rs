@@ -10,10 +10,8 @@
 //! `IMMDevice::Activate` cannot carry them. It is asynchronous, so a small COM
 //! completion handler rendezvous with the caller.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Sender, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::Win32::Foundation::S_OK;
@@ -36,6 +34,7 @@ use windows_core::{IUnknown, Interface, Ref, implement};
 use crate::clock::TakeClock;
 use crate::error::{MediaError, Result};
 use crate::frame::{AudioChunk, MediaFrame};
+use crate::runner::{CaptureCtx, DeviceCapture, Pump};
 
 /// What a loopback should listen to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,97 +59,31 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u32 = 2;
 
 /// A running loopback capture. Dropping it stops it.
-pub struct LoopbackCapture {
-    stop: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<String>>>,
-    thread: Option<JoinHandle<()>>,
-    format: LoopbackFormat,
-}
+pub type LoopbackCapture = DeviceCapture<LoopbackFormat>;
 
-impl LoopbackCapture {
+impl DeviceCapture<LoopbackFormat> {
     pub fn start(
         target: LoopbackTarget,
         out: SyncSender<MediaFrame>,
         clock: TakeClock,
     ) -> Result<Self> {
-        let (ready, opened) = std::sync::mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let failure = Arc::new(Mutex::new(None));
-
-        let thread_stop = stop.clone();
-        let thread_failure = failure.clone();
-        // The capture and its COM objects are made on this thread and stay
-        // there, like every other device in this crate.
-        let thread = std::thread::spawn(move || match open(target) {
-            Ok((client, capture)) => {
-                let _ = ready.send(Ok(LoopbackFormat {
-                    sample_rate: SAMPLE_RATE,
-                    channels: CHANNELS,
-                }));
-                if let Err(e) = pump(&client, &capture, thread_stop, out, clock)
-                    && let Ok(mut slot) = thread_failure.lock()
-                {
-                    *slot = Some(e.to_string());
-                }
-            }
-            Err(e) => {
-                let _ = ready.send(Err(e.to_string()));
-            }
-        });
-
-        let format = match opened.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(format)) => format,
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                return Err(MediaError::message(e));
-            }
-            Err(_) => {
-                let _ = thread.join();
-                return Err(MediaError::message(
-                    "the system audio capture did not open within ten seconds",
-                ));
-            }
-        };
-
-        Ok(Self {
-            stop,
-            failure,
-            thread: Some(thread),
-            format,
-        })
-    }
-
-    pub fn format(&self) -> LoopbackFormat {
-        self.format
-    }
-
-    pub fn stop(mut self) -> Result<()> {
-        self.stop.store(true, Ordering::SeqCst);
-        self.join()
-    }
-
-    fn join(&mut self) -> Result<()> {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let failure = self
-            .failure
-            .lock()
-            .map_err(|e| MediaError::message(e.to_string()))?
-            .take();
-        match failure {
-            Some(e) => Err(MediaError::message(e)),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for LoopbackCapture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // The capture and its COM objects are made on the capture thread and
+        // stay there, like every other device in this crate.
+        Self::spawn(
+            "the system audio capture did not open within ten seconds",
+            out,
+            clock,
+            move || {
+                let (client, capture) = open(target)?;
+                Ok((
+                    LoopbackFormat {
+                        sample_rate: SAMPLE_RATE,
+                        channels: CHANNELS,
+                    },
+                    Box::new(move |ctx| pump(&client, &capture, ctx)) as Pump,
+                ))
+            },
+        )
     }
 }
 
@@ -296,20 +229,14 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationDone_Impl {
 }
 
 /// Read the mix until told to stop.
-fn pump(
-    client: &IAudioClient,
-    capture: &IAudioCaptureClient,
-    stop: Arc<AtomicBool>,
-    out: SyncSender<MediaFrame>,
-    clock: TakeClock,
-) -> Result<()> {
+fn pump(client: &IAudioClient, capture: &IAudioCaptureClient, ctx: CaptureCtx) -> Result<()> {
     // SAFETY: starting and stopping the client only moves its state.
     unsafe { client.Start()? };
 
     let bytes_per_frame = CHANNELS as usize * 2;
     let mut anchor: Option<i64> = None;
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if ctx.stop.load(Ordering::SeqCst) {
             break;
         }
         // SAFETY: `pending` is filled by the API on this frame.
@@ -343,9 +270,9 @@ fn pump(
 
             // WASAPI's device time is in 100 ns units, the take's timeline too.
             let device_time = device_time as i64;
-            let anchor = *anchor.get_or_insert_with(|| clock.device_anchor(device_time));
+            let anchor = *anchor.get_or_insert_with(|| ctx.clock.device_anchor(device_time));
             if !crate::frame::offer(
-                &out,
+                &ctx.out,
                 MediaFrame::Audio(AudioChunk {
                     data: chunk,
                     time: device_time - anchor,

@@ -40,6 +40,7 @@ crates/takekit-media/
 ├─ camera.rs     Media Foundation 读摄像头，要 NV12
 ├─ mic.rs        Media Foundation 读麦克风，要 PCM 16 位
 ├─ loopback.rs   WASAPI loopback：系统声音 / 单窗口声音（进程树）
+├─ runner.rs     DeviceCapture：三者的线程骨架（停标志 / 失败槽 / 打开超时）
 ├─ mediatype.rs  媒体类型的构建与拆解（尺寸/帧率打包成 u64）
 ├─ reader.rs     Source Reader 的读循环
 ├─ writer.rs     Sink Writer：H.264+AAC 写 MP4
@@ -247,7 +248,7 @@ MP4 sink 会把轨道重定基到首样本，所以共享原点以**前导填充
 | 桌面 crop | 忽略（prepare 不再报错；面板默认无 crop 不受影响） |
 | 光标 | ~~仍不录（`CursorCaptureSettings::Default`）~~ → ✅ 已对齐（2026-10-21，`WithCursor`，见 §5） |
 | 摄像头 / 麦克风 | 代码就绪，本机无设备未验证 |
-| 编码器 | MF 自选（软件 H.264），quality 映射为分档 bitrate（`bitrate_for`） |
+| 编码器 | MF 自选（软件 H.264），quality（0..=51，`Session::prepare` 校验）映射为分档 bitrate（`bitrate_for`） |
 
 ---
 

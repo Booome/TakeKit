@@ -100,9 +100,19 @@ def check_commands() -> None:
 
     invoked: set[str] = set()
     for path in js_sources():
-        invoked |= set(
-            re.findall(r"\binvoke\(\s*[\"'](\w+)[\"']", path.read_text(encoding="utf-8"))
-        )
+        text = path.read_text(encoding="utf-8")
+        # A leading literal — `invoke("state")`.
+        invoked |= set(re.findall(r"\binvoke\(\s*[\"'](\w+)[\"']", text))
+        # Both arms of a ternary — `invoke(going ? "pause_recording" :
+        # "resume_recording")`. Reading only the leading literal saw neither
+        # arm, so the pair was reported as "never invoked" while the button
+        # worked. Names are not filtered against the command list afterwards:
+        # `invoked - registered` is what catches a misspelt name, and dropping
+        # the unknown ones here would quietly retire that check.
+        for m in re.finditer(
+            r"\binvoke\(\s*[^\"')]*\?\s*[\"'](\w+)[\"']\s*:\s*[\"'](\w+)[\"']", text
+        ):
+            invoked |= {m.group(1), m.group(2)}
 
     for name in sorted(defined - registered):
         fail(f"commands: `{name}` is #[tauri::command] but not in invoke_handler")

@@ -41,6 +41,10 @@ pub enum Ctl {
         #[arg(long)]
         quality: Option<u8>,
     },
+    /// Pause the take: the clock stops and every source closes its current file
+    Pause,
+    /// Resume a paused take; each source opens its next file
+    Resume,
     /// Add one source to the take that is recording right now
     AddLive {
         /// window | desktop | camera | mic | system-audio | window-audio
@@ -207,6 +211,8 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             // to place it later.
             client.post("/record/sources", body)?
         }
+        Ctl::Pause => client.post("/record/pause", Value::Null)?,
+        Ctl::Resume => client.post("/record/resume", Value::Null)?,
         Ctl::Remove { index } => client.delete(&format!("/sources/{index}"), Value::Null)?,
         Ctl::SetSources => {
             // stdin, not an argument: a full source list is long, and shells

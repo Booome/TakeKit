@@ -41,6 +41,10 @@ const state = {
   // the stop progress lives on this panel's status bar alone.
   finalizePanel: true,
   recording: false,
+  // The take's clock is stopped: sources are alive, nothing is being written.
+  paused: false,
+  // How long the pause in progress has lasted, straight from the backend.
+  pauseLen: 0,
   // True between "begin accepted" and the veil saying GO: the panel is hidden
   // and the take is not running yet. F9 again in that window cancels it.
   countdown: false,
@@ -599,7 +603,25 @@ function paintTransport() {
   if (state.finalizing) return;
   const btn = $("rec-btn");
   btn.textContent = state.recording ? t("bar.stop") : t("bar.rec");
-  btn.classList.toggle("live", state.recording && !state.countdown);
+  // Not "live" while paused: the dot means bytes are moving, and they are not.
+  btn.classList.toggle("live", state.recording && !state.paused && !state.countdown);
+
+  // Pause only exists mid-take, and only where it can be exact: the ffmpeg
+  // backend runs a child per source with a clock of its own, and stopping that
+  // is not a pause but a corrupted timeline. Disabled with the reason in the
+  // tooltip rather than hidden, so the answer is there when the question comes.
+  const pause = $("pause-btn");
+  pause.hidden = !state.recording;
+  pause.disabled = state.backend !== "windows" || state.countdown;
+  pause.textContent = state.paused ? t("bar.resume") : t("bar.pause");
+  pause.title = state.backend !== "windows" ? t("bar.pauseNeedsWin") : "";
+
+  // The clock already stops by itself (elapsed comes from the take's own
+  // clock), but a frozen number with no explanation reads as a hang.
+  const badge = $("paused-badge");
+  badge.classList.toggle("hidden", !state.paused);
+  if (state.paused) badge.textContent = t("bar.pausedFor", { at: offsetClock(state.pauseLen) });
+  document.body.classList.toggle("paused", state.paused);
 }
 
 function render() {
@@ -1267,7 +1289,16 @@ function applyPickerFilter() {
 }
 
 function openPicker() {
-  if (state.recording) return;
+  // Mid-take this is the door to `Recording::add_source`: what is picked joins
+  // the take that is running. Before GO it only plans the next one. There used
+  // to be `if (state.recording) return` here — a leftover of the days when the
+  // list was frozen at GO — and it made the whole mid-take path unreachable
+  // from the panel while every layer under it was ready for it.
+  //
+  // The tab comes first: the picker is anchored to the add button's header, and
+  // the tray's 添加源 can arrive with the panel on any tab. Opening a popover
+  // over Settings would put it above a pane with no sources to add to.
+  selectTab("sources");
   picker.classList.remove("hidden");
   pickerSearch.value = "";
   applyPickerFilter();
@@ -1320,6 +1351,8 @@ function resetToIdle() {
   // The next take has its own timeline; these offsets belong to the last one.
   state.starts.clear();
   state.recording = false;
+  state.paused = false;
+  state.pauseLen = 0;
   state.countdown = false;
   state.finalizing = false;
   state.error = null;
@@ -1505,6 +1538,9 @@ async function tick() {
   try {
     const s = await invoke("status");
     state.elapsed = s.elapsed;
+    state.paused = s.paused;
+    state.pauseLen = s.pause_len;
+    paintTransport();
     // A source added mid-take reports its start a moment after it appears (the
     // first sample has to arrive first); this is where that late number lands.
     for (const live of s.sources) {
@@ -1529,6 +1565,22 @@ async function tick() {
 }
 
 $("add-btn").addEventListener("click", openPicker);
+
+// Pause is a button, not a setting: it does the thing now. The label only flips
+// once the backend has actually stopped the clock — a failure says why and
+// leaves the bar telling the truth about what the take is doing.
+$("pause-btn").addEventListener("click", async () => {
+  const going = !state.paused;
+  $("pause-btn").disabled = true;
+  try {
+    await invoke(going ? "pause_recording" : "resume_recording");
+    state.paused = going;
+    if (!going) state.pauseLen = 0;
+  } catch (e) {
+    notify("warn", uiErrorText(e));
+  }
+  paintTransport();
+});
 
 // The popover's "添加源": it brought the panel back and asks for the picker.
 // Mid-take that is the only way to grow a take from the tray, so the picker has
@@ -1687,6 +1739,33 @@ window.__TAURI__.event.listen("ui:settings", (e) => {
   applySettings(e.payload);
 });
 
+// A take can start and stop outside this panel: `POST /record/start`, the
+// `takekit record` CLI and the MCP tools all reach the same Rust side without
+// going through a button here. `state.recording` used to be written only by
+// `toggleRecording`, so such a take left the panel convinced it was idle — the
+// bar said 开始录制 over a running take, no row showed its offset, and a pick
+// from the picker went into the *next* session instead of joining this one.
+// `status` is the truth; adopting it is the fix.
+//
+// The countdown and the finalise own these flags: the first has a take that is
+// committed but not started, the second one that is already writing out, and
+// `status` says "not recording" for both.
+function adoptStatus(s) {
+  if (!s || state.countdown || state.finalizing) return;
+  state.recording = s.recording;
+  state.paused = s.paused;
+  state.pauseLen = s.pause_len;
+  state.elapsed = s.elapsed;
+  // Late offsets (a source added a moment ago whose first sample has only just
+  // landed) arrive here too, so the chips are right on the first paint.
+  for (const live of s.sources) {
+    if (live.start != null) state.starts.set(live.id, live.start);
+  }
+  // The recording controls configure the *next* take and lock while one runs;
+  // a state adopted from elsewhere has to lock them the same way.
+  setParamsDisabled(s.recording);
+}
+
 // The agent's writes land here (docs/agent-control.md): the panel must show
 // them the moment they happen, or the user is looking at a screen that quietly
 // disagrees with what was just recorded. A full re-sync rather than a
@@ -1699,6 +1778,9 @@ window.__TAURI__.event.listen("ctl:changed", async () => {
     state.sources = [];
     applySaved(cfg);
     await pruneSources();
+    // Same event covers "/record/start" and "/record/stop", so the take's own
+    // state has to come along with the list.
+    adoptStatus(await invoke("status").catch(() => null));
     render();
     renderSettingsState();
     await refreshJournal();

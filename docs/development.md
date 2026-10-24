@@ -44,6 +44,9 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
   - 以及**右侧三列是一条信息线**（`row-speaker-last` + `row-trailing-columns-line-up`）：喇叭必须在帧率之后、在最右；行从右往左排，所以任何宽度可变的格子落在数字左边都会让整列按行横移——不能出声的行因此保留一个同宽的**空槽**（`row-sound-slot`）而非少一格。这两条是同一个教训的两面：**右边的列只有在宽度不随行变化时才成列**。
   - 还会**自己造一个最小化的窗口**（WinForms 表单 + 最小化，脚本里 `probe` 那段）来测「没画面就不给裁」与「恢复窗口后能裁」；行标题则靠塞一个假标题（`STALE …`）来验证「显示的是窗口现在的名字」。这两条都是 2026-10-23 用户报的问题，靠读代码看不出来。
   - 以及**喇叭的作用域**（`row-speaker-scope`）：window 与 desktop 行必须有喇叭，mic 与 camera 行必须没有。判断种类用 `row.dataset.kind`（产品代码为测试加的语义钩子），不匹配图标 SVG——图标一改，断言就悄悄失效，那是最糟的一种绿。
+- **录制中加源的真路**：`node scripts/check-midtake.mjs`——13 条断言，唯一**真录一段**的检查。它走的路是：控制面 `POST /record/start`（面板没参与）→ 面板必须自己认出「正在录」→ `rec-btn` 显示停止、每行带起点 → 点 `#add-btn` 列表必须出来 → 点一个源必须**真加入这一条 take**（`status.sources` 1→2、多出一行带起点）→ 停下后 `take.json` 两个 `start` 都在、后加的那个 `> 0`。
+  - 为什么另起一个检查：`check-ui-matrix` 里那条 `add-source-opens-while-recording` 是**把 `state.recording` 设成 `true` 再点按钮**，它证明渲染，不证明门。2026-10-24 就正因如此，一个「录制中点了添加源没列表」的面板通过了 151/151——`openPicker` 里留着 `if (state.recording) return`，而这条测试替它把状态摆好了。**凡是「状态由别处产生」的功能，测试都得从产生那一端开始。**
+  - 同一次还查出一个真 bug：`state.recording` 只有 `toggleRecording` 会写，所以控制面 / CLI / MCP 起的那条 take 面板一直以为自己是空闲的（栏里写着「开始录制」，没有任何一行有起点，此时选中的源会进「下一次」而不是「这一次」）。修法是在 `ctl:changed` 里用 `status` 对账（`adoptStatus`）。
 - **隔离运行**（不碰用户真实配置）与 WebView2 双缓解：见 `docs/webview2-agent-sandbox.md` §4（唯一出处，配方与两条铁律都在那里）。
 
 **开发约定**：沟通中文；代码、注释、标识符一律英文；`docs/` 下文档用中文。新行为走 TDD（先写失败测试）。不自动 commit / push——只有用户明确发话才提交。
@@ -128,6 +131,31 @@ crates/
 `start` 怎么来的——`frames` = 首帧自己的时间戳（Windows 后端，准），`spawn` = ffmpeg 子进程
 启动时刻（该后端看不到帧，误差 = 启动延迟）。`added_at` 只在录制中加入的源上出现，它和 `start`
 的差就是设备唤醒花了多久。
+
+**暂停与分段（2026-10-24）**
+
+```
+面板「暂停」/ 托盘 / ctl pause / MCP takekit_pause_recording
+  → POST /record/pause
+  → Recording::pause()
+       ├─ TakeClock::pause()：钟一停，之后盖的时间戳全落在同一点
+       └─ 各 writer 在循环顶部看到 is_paused()：
+            先 try_recv 排空队列（这些帧是暂停前的，属于本段）
+            → close_segment(frozen) 收尾当前文件
+            → 之后只丢帧，不写盘；采集线程不停（这是恢复零延迟的原因）
+  → POST /record/resume
+  → TakeClock::resume()：把这段暂停时长记入 paused_total
+       └─ writer 用**切点**（不是"发现钟又走了"的时刻）开下一段；
+          窗口没重绘时用持有的最后一帧开（WGC 是变化驱动的，不重绘就没有新帧）
+  → 停止时 ffprobe 逐段复核；`paused` 与 `segments` 写进 take.json
+```
+
+**为什么不用"停止后再切文件"**：MP4 只能切在关键帧上，而 `open_for` 没有显式设 GOP（默认
+几秒一个），`-c copy` 的边界会被挪到最近的 IDR；精确切只能重编码。录制时就切，段边界落在
+文件第一帧，天然是 IDR，零误差，也不占双倍磁盘。
+
+**只有 Windows 后端能暂停**。ffmpeg 子进程各自计时（`start_clock: spawn`），挂起进程只会让
+设备缓冲溢出、恢复后突发涌入，那不是暂停而是把时间轴搞乱——所以那里明确拒绝。
 
 ffmpeg 后端的数据流差异：`begin` 里每个窗口源 `bring_to_front` → `Session::prepare`
 带最长 2 秒的编码器/引擎探测 → 每源 spawn 一个 ffmpeg 子进程（详见 `source.rs` 的

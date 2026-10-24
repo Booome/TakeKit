@@ -197,7 +197,6 @@ impl Prepared {
             engine: self.engine,
             spawn_ms: Vec::new(),
             marks,
-            started: Instant::now(),
         };
 
         for src in &self.settings.sources {
@@ -265,7 +264,6 @@ impl Prepared {
             engine: self.engine,
             spawn_ms: Vec::new(),
             marks,
-            started: Instant::now(),
         };
 
         for src in &self.settings.sources {
@@ -349,8 +347,13 @@ impl Recording {
         };
 
         if src.capture.is_audio() {
-            let (handle_capture, sender, writer) =
-                start_audio_media(src, out.clone(), self.clock, audio_kbps, first.clone())?;
+            let (handle_capture, sender, writer) = start_audio_media(
+                src,
+                out.clone(),
+                self.clock.clone(),
+                audio_kbps,
+                first.clone(),
+            )?;
             self.remember(src, handle_capture, sender, None, writer, out, origin);
             return Ok(watch);
         }
@@ -359,7 +362,7 @@ impl Recording {
             let (handle_capture, sender, sound, writer) = start_av(
                 src,
                 out.clone(),
-                self.clock,
+                self.clock.clone(),
                 self.end_hint.clone(),
                 bitrate,
                 audio_kbps,
@@ -395,7 +398,7 @@ impl Recording {
             out: out.clone(),
             fps,
             bitrate,
-            clock: self.clock,
+            clock: self.clock.clone(),
             end_hint: self.end_hint.clone(),
             crop: src.capture.crop(),
             origin,
@@ -408,18 +411,23 @@ impl Recording {
                 ScreenTarget::Monitor(monitor_index(*rect)),
                 src.fps,
                 tx.clone(),
-                self.clock,
+                self.clock.clone(),
             )
             .map(MediaCapture::Screen),
             Capture::Window { hwnd, .. } => {
                 // No raise, and none needed: WGC keeps recording a window
                 // that sits behind others. That is the whole point of this
                 // backend for a window source.
-                ScreenCapture::start(ScreenTarget::Window(*hwnd), src.fps, tx.clone(), self.clock)
-                    .map(MediaCapture::Screen)
+                ScreenCapture::start(
+                    ScreenTarget::Window(*hwnd),
+                    src.fps,
+                    tx.clone(),
+                    self.clock.clone(),
+                )
+                .map(MediaCapture::Screen)
             }
             Capture::Camera { device, .. } => match camera_link(device) {
-                Ok(link) => CameraCapture::start(&link, src.fps, tx.clone(), self.clock)
+                Ok(link) => CameraCapture::start(&link, src.fps, tx.clone(), self.clock.clone())
                     .map(MediaCapture::Camera),
                 Err(e) => Err(e),
             },
@@ -668,6 +676,7 @@ impl MediaRunning {
                 Ok(WriteReport {
                     seconds: 0.0,
                     frames: 0,
+                    segments: Vec::new(),
                     width: 0,
                     height: 0,
                     start: None,
@@ -677,28 +686,40 @@ impl MediaRunning {
         let outcome = writer
             .join()
             .unwrap_or_else(|_| Err("the writer thread panicked".into()));
-        let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);
-        // A source counts as recorded only if it produced bytes, exactly like
-        // an ffmpeg one that exited without writing a frame.
-        let (start, seconds, frames, size, error) = match outcome {
-            Ok(report) if bytes > 0 => (
-                // The writer's own measurement wins over the optimistic value
-                // a from-the-start source was registered with: it is the one
-                // that came from a sample.
-                report.start.or(self.start),
-                Some(report.seconds),
-                Some(report.frames),
-                Some((report.width, report.height)),
-                None,
-            ),
+        // Every file this source produced, not just `out`: a paused take splits
+        // the source, and a size that counted only the first one would report a
+        // tenth of what is on disk.
+        let (start, seconds, frames, size, segments, bytes, error) = match outcome {
+            Ok(report) if !report.segments.is_empty() => {
+                let bytes: u64 = report
+                    .segments
+                    .iter()
+                    .map(|s| std::fs::metadata(&s.file).map(|m| m.len()).unwrap_or(0))
+                    .sum();
+                (
+                    // The writer's own measurement wins over the optimistic
+                    // value a from-the-start source was registered with: it is
+                    // the one that came from a sample.
+                    report.start.or(self.start),
+                    Some(report.seconds),
+                    Some(report.frames),
+                    Some((report.width, report.height)),
+                    report.segments.iter().map(Seg::from).collect(),
+                    bytes,
+                    None,
+                )
+            }
+            // The writer never opened a file.
             Ok(_) => (
                 None,
                 None,
                 Some(0),
                 None,
+                Vec::new(),
+                std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0),
                 Some(diagnose::FFMPEG_DIED.to_string()),
             ),
-            Err(e) => (None, None, None, None, Some(e)),
+            Err(e) => (None, None, None, None, Vec::new(), 0, Some(e)),
         };
         Collected {
             id: self.id.clone(),
@@ -709,6 +730,7 @@ impl MediaRunning {
             size,
             probed: None,
             fps: self.fps,
+            segments,
             error,
         }
     }
@@ -782,6 +804,7 @@ fn write_frames(
     Ok(WriteReport {
         seconds: report.seconds,
         frames: report.frames,
+        segments: report.segments,
         width: report.width,
         height: report.height,
         start: report.start,
@@ -887,6 +910,9 @@ fn start_av(
     let (vtx, vrx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
     let (atx, arx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = std::sync::mpsc::channel();
+    // Owned by the writer thread; the captures below keep the other copy. A
+    // `move` closure would take the only one and leave nothing to capture with.
+    let writer_clock = clock.clone();
     let handle = std::thread::spawn(move || {
         write_av(
             vrx,
@@ -896,7 +922,7 @@ fn start_av(
             fps,
             bitrate,
             audio_bitrate_kbps,
-            clock,
+            writer_clock,
             end_hint,
             crop,
             origin,
@@ -907,7 +933,7 @@ fn start_av(
     // The picture first: if it cannot be captured there is nothing to put the
     // sound into, and the loopback is the more expensive open.
     let screen =
-        ScreenCapture::start(video_target, fps, vtx.clone(), clock).map_err(spawn_error)?;
+        ScreenCapture::start(video_target, fps, vtx.clone(), clock.clone()).map_err(spawn_error)?;
     let loopback = LoopbackCapture::start(audio_target, atx.clone(), clock).map_err(spawn_error)?;
     let f = loopback.format();
     format_tx
@@ -952,92 +978,229 @@ fn write_av(
     first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> std::result::Result<WriteReport, String> {
     use std::sync::atomic::Ordering;
-    use takekit_media::writer::{crop_frame, even_frame};
+    use takekit_media::writer::{SegmentReport, crop_frame, even_frame, segment_path};
 
     let (rate, channels) = format_rx
         .recv()
         .map_err(|_| "the sound capture never reported a format".to_string())?;
 
-    let first_frame = loop {
-        match vrx.recv() {
-            Ok(MediaFrame::Video(frame)) => break frame,
-            Ok(_) => {}
-            Err(_) => return Err("the window never delivered a frame".into()),
-        }
-    };
-    // The file's timeline, latched off the first picture: zero is the take's
-    // origin for a source that was there from the start, and this frame's own
-    // instant for one that joined mid-take (see `Origin`).
-    let base = match origin {
-        Origin::Take => 0,
-        Origin::FirstSample => first_frame.time,
-    };
-    if let Some(tx) = first.as_ref() {
-        let _ = tx.try_send(base);
-    }
-    let first = even_frame(crop_frame(first_frame, crop));
-    let size = (first.width, first.height);
+    // One segment at a time: a pause closes this file and the next picture
+    // opens the following one, so the cut lands on a keyframe by construction.
+    let mut sink: Option<MuxSink> = None;
+    let mut video: Option<takekit_media::writer::VideoWriter> = None;
+    let mut audio: Option<takekit_media::AudioWriter> = None;
+    let mut segments: Vec<SegmentReport> = Vec::new();
+    let mut base: Option<i64> = None;
+    let mut seg_frames = 0u64;
+    let mut frames = 0u64;
+    let mut reported = false;
+    let mut size = (0u32, 0u32);
+    // The last picture written — what a resume with nothing new opens with.
+    let mut held: Option<takekit_media::VideoFrame> = None;
 
-    let sink = MuxSink::create(&out).map_err(|e| e.to_string())?;
-    let mut video = sink
-        .add_video(first.format, first.width, first.height, fps, bitrate)
-        .map_err(|e| e.to_string())?;
-    let mut audio = sink
-        .add_audio(rate, channels, audio_bitrate_kbps)
-        .map_err(|e| e.to_string())?;
-    // Sound that was buffered before this picture arrived belongs to this
-    // file, shifted onto its timeline like everything else.
-    audio.set_origin(base);
-    sink.begin().map_err(|e| e.to_string())?;
-    video
-        .write_at(&first, first.time - base)
-        .map_err(|e| e.to_string())?;
-
-    let mut frames = 1u64;
     loop {
+        if clock.is_paused() {
+            // Sound first and pictures second, the same order as the live loop:
+            // what is already queued was captured before the cut.
+            let frozen = clock.now_100ns();
+            while let Ok(frame) = arx.try_recv() {
+                if let MediaFrame::Audio(chunk) = frame {
+                    if let Some(a) = audio.as_mut() {
+                        a.write(&chunk).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            while let Ok(frame) = vrx.try_recv() {
+                if let MediaFrame::Video(frame) = frame {
+                    if let (Some(v), Some(at)) = (video.as_mut(), base) {
+                        frames += 1;
+                        seg_frames += 1;
+                        let frame = even_frame(crop_frame(frame, crop));
+                        v.write_at(&frame, frame.time - at)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            close_av(
+                &mut sink,
+                &mut video,
+                &mut audio,
+                &mut segments,
+                base,
+                seg_frames,
+                &out,
+                frozen,
+            )?;
+            seg_frames = 0;
+            base = None;
+            // The capture keeps running through the pause; that is what makes
+            // "继续" instant instead of a window warming up again.
+            let _ = vrx.recv_timeout(std::time::Duration::from_millis(20));
+            continue;
+        }
+
         // Sound first in every turn: a chunk is a couple of kilobytes and must
         // not queue behind a picture the encoder is busy with.
         while let Ok(frame) = arx.try_recv() {
             if let MediaFrame::Audio(chunk) = frame {
-                audio.write(&chunk).map_err(|e| e.to_string())?;
+                if let Some(a) = audio.as_mut() {
+                    a.write(&chunk).map_err(|e| e.to_string())?;
+                }
             }
         }
-        match vrx.recv_timeout(std::time::Duration::from_millis(2)) {
-            Ok(MediaFrame::Video(frame)) => {
+        // One picture per turn: a frame that arrived, or — if the clock just
+        // started again and the window has not repainted — the picture the
+        // previous file ended with. Without the second case a resumed segment
+        // would never open on a still window, because the capture never stopped
+        // and so never sends a fresh first frame.
+        let arrived = match vrx.recv_timeout(std::time::Duration::from_millis(2)) {
+            Ok(MediaFrame::Video(frame)) => Some((frame, true)),
+            Ok(_) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let picked = match arrived {
+            Some((frame, true)) => {
                 let at = frame.time;
+                Some((frame, at, false))
+            }
+            _ if sink.is_none() => held
+                .as_ref()
+                .map(|frame| (frame.clone(), clock.now_100ns(), true)),
+            _ => None,
+        };
+        if let Some((frame, at_time, seeded)) = picked {
+            if sink.is_none() {
+                // A new segment starts here. Its own zero is its first sample,
+                // never the take's: the manifest's `start` places it, and
+                // padding every resume back to the take's origin would be a
+                // wall of black. The one exception is the very first file of a
+                // from-the-start source, which pays for a late device with
+                // black lead-in (see `Origin`).
+                let at = match origin {
+                    Origin::Take if segments.is_empty() && !seeded => 0,
+                    _ => at_time,
+                };
+                if !reported {
+                    reported = true;
+                    if let Some(tx) = first.as_ref() {
+                        let _ = tx.try_send(at);
+                    }
+                }
+                base = Some(at);
+                let first_frame = even_frame(crop_frame(frame, crop));
+                size = (first_frame.width, first_frame.height);
+                let path = segment_path(&out, segments.len() + 1);
+                let s = MuxSink::create(&path).map_err(|e| e.to_string())?;
+                let mut v = s
+                    .add_video(
+                        first_frame.format,
+                        first_frame.width,
+                        first_frame.height,
+                        fps,
+                        bitrate,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let mut a = s
+                    .add_audio(rate, channels, audio_bitrate_kbps)
+                    .map_err(|e| e.to_string())?;
+                // Sound buffered before this picture arrived belongs to this
+                // file, on its timeline.
+                a.set_origin(at);
+                s.begin().map_err(|e| e.to_string())?;
+                v.write_at(&first_frame, first_frame.time - at)
+                    .map_err(|e| e.to_string())?;
+                // A seeded file holds a picture that was already counted.
+                if !seeded {
+                    seg_frames = 1;
+                    frames += 1;
+                }
+                held = Some(first_frame);
+                sink = Some(s);
+                video = Some(v);
+                audio = Some(a);
+            } else if let (Some(v), Some(at)) = (video.as_mut(), base) {
                 let frame = even_frame(crop_frame(frame, crop));
-                video
-                    .write_at(&frame, at - base)
+                v.write_at(&frame, at_time - at)
                     .map_err(|e| e.to_string())?;
                 frames += 1;
+                seg_frames += 1;
+                held = Some(frame);
             }
-            Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
     // What the sound still held, then the picture's last frame held until the
     // stop time — the same end every other file in the take gets.
     while let Ok(frame) = arx.try_recv() {
         if let MediaFrame::Audio(chunk) = frame {
-            audio.write(&chunk).map_err(|e| e.to_string())?;
+            if let Some(a) = audio.as_mut() {
+                a.write(&chunk).map_err(|e| e.to_string())?;
+            }
         }
     }
     let end = match end_hint.load(Ordering::SeqCst) {
         0 => clock.now_100ns(),
         t => t,
     };
-    let span = (end - base).max(0);
-    video.flush(Some(span)).map_err(|e| e.to_string())?;
-    let audio_end = audio.end();
-    sink.finalize().map_err(|e| e.to_string())?;
+    close_av(
+        &mut sink,
+        &mut video,
+        &mut audio,
+        &mut segments,
+        base,
+        seg_frames,
+        &out,
+        end,
+    )?;
+
+    let total: f64 = segments.iter().map(|s| s.seconds).sum();
     Ok(WriteReport {
-        seconds: span.max(audio_end) as f64 / 10_000_000.0,
+        seconds: total,
         frames,
         width: size.0,
         height: size.1,
-        start: Some(base),
+        start: segments.first().map(|s| s.start),
+        segments,
     })
+}
+
+/// Close the file a picture-with-sound source has open, at take-time `end`.
+///
+/// The picture is held to `end` so the two tracks finish together; the sound
+/// cannot be held (there is no such thing as a frame of silence to stretch), so
+/// the longer of the two decides how long the file claims to be.
+// Same shape as `write_av`, and for the same reason: a file being closed needs
+// its three handles plus where it started, and packaging those into a struct
+// only to pass it once would not make the call easier to read.
+#[allow(clippy::too_many_arguments)]
+fn close_av(
+    sink: &mut Option<MuxSink>,
+    video: &mut Option<takekit_media::writer::VideoWriter>,
+    audio: &mut Option<takekit_media::AudioWriter>,
+    segments: &mut Vec<takekit_media::writer::SegmentReport>,
+    base: Option<i64>,
+    frames: u64,
+    out: &Path,
+    end: i64,
+) -> std::result::Result<(), String> {
+    let Some(s) = sink.take() else {
+        return Ok(());
+    };
+    let at = base.unwrap_or(end);
+    let span = (end - at).max(0);
+    if let Some(mut v) = video.take() {
+        v.flush(Some(span)).map_err(|e| e.to_string())?;
+    }
+    let audio_end = audio.take().map(|a| a.end()).unwrap_or(0);
+    s.finalize().map_err(|e| e.to_string())?;
+    segments.push(takekit_media::writer::SegmentReport {
+        file: takekit_media::writer::segment_path(out, segments.len() + 1),
+        start: at,
+        seconds: span.max(audio_end) as f64 / 10_000_000.0,
+        frames,
+    });
+    Ok(())
 }
 
 /// What one source's writer saw. `frames` is what the capture actually
@@ -1048,6 +1211,10 @@ fn write_av(
 struct WriteReport {
     seconds: f64,
     frames: u64,
+    /// One entry per file the writer produced. A pause closes the current one
+    /// and the next sample opens the next, so this is where a take that was
+    /// paused becomes several clips instead of one.
+    segments: Vec<takekit_media::writer::SegmentReport>,
     /// The size the file was written at; `0 x 0` when nothing was written.
     width: u32,
     height: u32,
@@ -1110,7 +1277,11 @@ fn start_audio_media(
     // to back) — only a writer stuck for whole seconds should ever fill it.
     let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || write_audio(rx, format_rx, out, bitrate_kbps, first));
+    // The writer thread owns one copy, the capture below keeps the other.
+    let writer_clock = clock.clone();
+    let handle = std::thread::spawn(move || {
+        write_audio(rx, format_rx, out, bitrate_kbps, writer_clock, first)
+    });
 
     let (capture, format) = match &src.capture {
         Capture::Mic { device } => {
@@ -1171,38 +1342,114 @@ fn write_audio(
     format_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     out: PathBuf,
     bitrate_kbps: u32,
+    clock: TakeClock,
     first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> std::result::Result<WriteReport, String> {
     use takekit_media::AudioWriter;
+    use takekit_media::writer::{SegmentReport, segment_path};
 
     let (rate, channels) = format_rx
         .recv()
         .map_err(|_| "the audio capture never reported a format".to_string())?;
-    let mut writer =
-        AudioWriter::create(&out, rate, channels, bitrate_kbps).map_err(|e| e.to_string())?;
-    let mut chunks = 0u64;
+    let mut writer: Option<AudioWriter> = None;
+    let mut segments: Vec<SegmentReport> = Vec::new();
+    // Take-time of the chunk the open file starts with.
     let mut origin: Option<i64> = None;
-    while let Ok(frame) = rx.recv() {
-        if let MediaFrame::Audio(chunk) = frame {
-            if origin.is_none() {
-                origin = Some(chunk.time);
-                writer.set_origin(chunk.time);
-                if let Some(tx) = first.as_ref() {
-                    let _ = tx.try_send(chunk.time);
+    let mut seg_chunks = 0u64;
+    let mut chunks = 0u64;
+    let mut reported = false;
+
+    loop {
+        if clock.is_paused() {
+            // Drain first: these chunks were captured before the cut.
+            let mut at = origin;
+            while let Ok(frame) = rx.try_recv() {
+                if let MediaFrame::Audio(chunk) = frame {
+                    if let Some(w) = writer.as_mut() {
+                        chunks += 1;
+                        seg_chunks += 1;
+                        if at.is_none() {
+                            at = Some(chunk.time);
+                            w.set_origin(chunk.time);
+                        }
+                        w.write(&chunk).map_err(|e| e.to_string())?;
+                    }
                 }
             }
-            chunks += 1;
-            writer.write(&chunk).map_err(|e| e.to_string())?;
+            if let Some(w) = writer.take() {
+                let end = w.finish().map_err(|e| e.to_string())?;
+                segments.push(SegmentReport {
+                    file: segment_path(&out, segments.len() + 1),
+                    start: at.unwrap_or(end),
+                    seconds: end as f64 / 10_000_000.0,
+                    frames: seg_chunks,
+                });
+            }
+            origin = None;
+            seg_chunks = 0;
+            // The device keeps running through the pause; nothing of it is kept.
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(20));
+            continue;
+        }
+
+        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(MediaFrame::Audio(chunk)) => {
+                if writer.is_none() {
+                    writer = Some(
+                        AudioWriter::create(
+                            &segment_path(&out, segments.len() + 1),
+                            rate,
+                            channels,
+                            bitrate_kbps,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    );
+                    // A chunk's own instant is its file's zero: the manifest's
+                    // per-segment `start` says where it belongs on the take.
+                    origin = Some(chunk.time);
+                    writer
+                        .as_mut()
+                        .expect("opened above")
+                        .set_origin(chunk.time);
+                    if !reported {
+                        reported = true;
+                        if let Some(tx) = first.as_ref() {
+                            let _ = tx.try_send(chunk.time);
+                        }
+                    }
+                }
+                chunks += 1;
+                seg_chunks += 1;
+                writer
+                    .as_mut()
+                    .expect("opened above")
+                    .write(&chunk)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let end = writer.finish().map_err(|e| e.to_string())?;
-    let at = origin.unwrap_or(end);
+
+    if let Some(w) = writer.take() {
+        let end = w.finish().map_err(|e| e.to_string())?;
+        segments.push(SegmentReport {
+            file: segment_path(&out, segments.len() + 1),
+            start: origin.unwrap_or(end),
+            seconds: end as f64 / 10_000_000.0,
+            frames: seg_chunks,
+        });
+    }
+    let total: f64 = segments.iter().map(|s| s.seconds).sum();
+    let start = segments.first().map(|s| s.start);
     Ok(WriteReport {
-        seconds: (end - at).max(0) as f64 / 10_000_000.0,
+        seconds: total,
         frames: chunks,
+        segments,
         width: 0,
         height: 0,
-        start: origin,
+        start,
     })
 }
 
@@ -1283,7 +1530,6 @@ pub struct Recording {
     /// the skew the capture starts with before any frame is written.
     spawn_ms: Vec<(String, u64)>,
     marks: Option<Marks>,
-    started: Instant,
 }
 
 /// Per-source snapshot for a UI that polls while recording.
@@ -1302,8 +1548,56 @@ pub struct LiveSource {
 }
 
 impl Recording {
+    /// Recorded time, not wall time: a take paused for a minute reads a minute
+    /// less, which is exactly what its files will add up to.
     pub fn elapsed(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+        self.clock.now_100ns() as f64 / 10_000_000.0
+    }
+
+    /// Stop the clock and close every source's current file.
+    ///
+    /// The clock stops first, so anything stamped after this instant belongs to
+    /// the pause and gets dropped. Then each writer sees the frozen clock,
+    /// drains what was already queued for this file, and closes it exactly
+    /// there. Because they all read one clock, they cut on the same instant —
+    /// and the next sample after `resume` opens the next file, which is how a
+    /// take that was paused comes out as several clips with exact boundaries
+    /// instead of one file that has to be split at a keyframe later.
+    pub fn pause(&mut self) -> Result<()> {
+        // ffmpeg records each source in a child process with a clock of its own;
+        // there is no way to stop it that does not also corrupt its timestamps
+        // (a suspended decoder keeps the device queue filling and drains it in a
+        // burst afterwards). Refused by name rather than silently ignored.
+        if self.backend != Backend::Windows {
+            return Err(Error::Source(
+                "pausing a take needs the Windows backend (WGC + MF); this take is recording \
+                 through ffmpeg children, which each file their own clock"
+                    .into(),
+            ));
+        }
+        self.clock.pause();
+        Ok(())
+    }
+
+    /// Start the clock again. Every source opens its next file on the first
+    /// sample after this, with no device warm-up: the captures never stopped.
+    pub fn resume(&mut self) -> Result<()> {
+        self.clock.resume();
+        Ok(())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.clock.is_paused()
+    }
+
+    /// How long the pause in progress has lasted, or 0 while running.
+    pub fn pause_len(&self) -> f64 {
+        self.clock.pause_len_100ns() as f64 / 10_000_000.0
+    }
+
+    /// Paused time banked by pauses that have already ended.
+    pub fn paused_total(&self) -> f64 {
+        self.clock.paused_100ns() as f64 / 10_000_000.0
     }
 
     pub fn spawn_timings(&self) -> &[(String, u64)] {
@@ -1475,6 +1769,22 @@ impl Recording {
                 self.take
                     .set_start(&c.id, c.start.map(|t| t as f64 / 10_000_000.0));
                 self.take.set_probed(&c.id, c.probed);
+                let files: Vec<crate::take::SegmentRecord> = c
+                    .segments
+                    .iter()
+                    .map(|s| crate::take::SegmentRecord {
+                        file: s
+                            .file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        start: s.start as f64 / 10_000_000.0,
+                        duration: s.seconds,
+                        probed: s.probed,
+                        frames: s.frames,
+                    })
+                    .collect();
+                self.take.set_segments(&c.id, files);
             }
             sources.push(c.outcome());
         }
@@ -1486,6 +1796,12 @@ impl Recording {
             .iter()
             .filter_map(|s| s.duration)
             .reduce(f64::max);
+        // Only when it happened: a take that was never paused should not carry
+        // a `paused: 0.0` that invites the question of what it means.
+        let paused = self.paused_total();
+        if paused > 0.0 {
+            self.take.manifest.paused = Some(paused);
+        }
         // Best effort: the .mkv files are complete and the journal is what the
         // panel lists, so a disk hiccup writing metadata must not turn a
         // finished take into a failed one (the caller would then record it as
@@ -1521,6 +1837,7 @@ fn collect_ffmpeg(r: &Running) -> Collected {
             size: None,
             probed: None,
             fps: r.fps,
+            segments: Vec::new(),
             error: Some(match diagnose::classify(&wide, device) {
                 Some(code) => code,
                 None => {
@@ -1543,6 +1860,7 @@ fn collect_ffmpeg(r: &Running) -> Collected {
         size: None,
         probed: None,
         fps: r.fps,
+        segments: Vec::new(),
         error: None,
     }
 }
@@ -1565,7 +1883,32 @@ struct Collected {
     /// installed or ffprobe could not read the container.
     probed: Option<f64>,
     fps: u32,
+    /// One entry per file the source produced. Empty on the ffmpeg path (a
+    /// child writes one file and never splits); a single entry otherwise when
+    /// the take was never paused.
+    segments: Vec<Seg>,
     error: Option<String>,
+}
+
+/// One file of one source, with what ffprobe made of it.
+struct Seg {
+    file: PathBuf,
+    start: i64,
+    seconds: f64,
+    frames: u64,
+    probed: Option<f64>,
+}
+
+impl From<&takekit_media::writer::SegmentReport> for Seg {
+    fn from(r: &takekit_media::writer::SegmentReport) -> Self {
+        Self {
+            file: r.file.clone(),
+            start: r.start,
+            seconds: r.seconds,
+            frames: r.frames,
+            probed: None,
+        }
+    }
 }
 
 impl Collected {
@@ -1581,20 +1924,62 @@ impl Collected {
         if self.bytes == 0 {
             return;
         }
-        let Some(file) = files.iter().find(|(id, _)| *id == self.id).map(|(_, p)| p) else {
+        if self.segments.is_empty() {
+            // The ffmpeg path: a child writes one file and never splits, so
+            // ffprobe's reading is the only length this source will ever have.
+            let Some(file) = files.iter().find(|(id, _)| *id == self.id).map(|(_, p)| p) else {
+                return;
+            };
+            let probed = if probe.as_os_str().is_empty() {
+                None
+            } else {
+                ffmpeg::duration(probe, file)
+            };
+            if self.seconds.is_none() {
+                self.seconds = probed;
+            }
+            self.probed = probed;
+            if let (Some(start), Some(seconds)) = (self.start, self.seconds) {
+                self.segments.push(Seg {
+                    file: file.clone(),
+                    start,
+                    seconds,
+                    frames: self.frames.unwrap_or(0),
+                    probed,
+                });
+            }
             return;
-        };
-        let probed = if probe.as_os_str().is_empty() {
-            None
-        } else {
-            ffmpeg::duration(probe, file)
-        };
-        // The ffmpeg path has no in-process writer to ask, so ffprobe's reading
-        // is the only length it will ever have.
-        if self.seconds.is_none() {
-            self.seconds = probed;
         }
-        self.probed = probed;
+        // In-process writer: every file gets its own reading. Checking only the
+        // total would let a short segment hide behind a long one, and a paused
+        // take is exactly where that happens.
+        let mut total = 0.0;
+        let mut complete = true;
+        for seg in &mut self.segments {
+            seg.probed = if probe.as_os_str().is_empty() {
+                None
+            } else {
+                ffmpeg::duration(probe, &seg.file)
+            };
+            match seg.probed {
+                Some(p) => total += p,
+                None => complete = false,
+            }
+        }
+        self.probed = complete.then_some(total);
+    }
+
+    /// Whether any one file disagrees with the manifest about its length.
+    ///
+    /// Per file rather than summed: a take that was paused has several, and a
+    /// segment that came out short is invisible in the total.
+    fn length_off(&self) -> bool {
+        if self.segments.is_empty() {
+            return crate::take::length_mismatch(self.seconds, self.probed, self.fps);
+        }
+        self.segments
+            .iter()
+            .any(|s| crate::take::length_mismatch(Some(s.seconds), s.probed, self.fps))
     }
 
     fn outcome(&self) -> Outcome {
@@ -1607,8 +1992,7 @@ impl Collected {
             size: self.size,
             probed: self.probed,
             error: self.error.clone(),
-            warning: crate::take::length_mismatch(self.seconds, self.probed, self.fps)
-                .then(|| "len.mismatch".to_string()),
+            warning: self.length_off().then(|| "len.mismatch".to_string()),
         }
     }
 }
@@ -1965,6 +2349,7 @@ mod tests {
             size: Some((1920, 1080)),
             probed: Some(1.02),
             fps: 30,
+            segments: Vec::new(),
             error: None,
         }
         .outcome();
@@ -1983,6 +2368,7 @@ mod tests {
             size: None,
             probed: None,
             fps: 30,
+            segments: Vec::new(),
             error: Some("boom".into()),
         }
         .outcome();
@@ -2004,6 +2390,7 @@ mod tests {
             size: Some((1920, 1080)),
             probed: Some(10.6),
             fps: 30,
+            segments: Vec::new(),
             error: None,
         };
         assert_eq!(c.outcome().warning.as_deref(), Some("len.mismatch"));

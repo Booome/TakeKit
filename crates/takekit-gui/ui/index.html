@@ -331,8 +331,18 @@
         <path d="M5 0 10 5 5 10 0 5z" fill="currentColor" />
       </svg>
       <span class="clock mono" id="clock">00:00:00</span>
+      <span class="paused-badge hidden" id="paused-badge"></span>
       <span class="hint" id="hint">0 个源</span>
       <button class="ghost flat" id="logs-btn" type="button" hidden data-i18n="bar.viewLogs">查看日志</button>
+      <button
+        class="ghost flat pause"
+        id="pause-btn"
+        type="button"
+        hidden
+        data-i18n="bar.pause"
+      >
+        暂停
+      </button>
       <button class="rec" id="rec-btn" type="button" disabled data-i18n="bar.rec">开始录制</button>
     </footer>
 

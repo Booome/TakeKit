@@ -47,7 +47,35 @@ pub struct SourceRecord {
     /// being worth reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probed: Option<f64>,
+    /// The files this source actually produced, in order.
+    ///
+    /// One entry until the take is paused; every pause closes the current file
+    /// and the next sample after "继续" opens the next. They are contiguous on
+    /// the take's timeline — a pause removes time instead of recording it — so
+    /// `start + duration` of one is the next one's `start`.
+    ///
+    /// The top-level `file` is the first of these, kept because every other
+    /// reader of a take (the panel's journal, the control surface's history)
+    /// wants "the file for this source" and should not have to know that a
+    /// pause can split it.
+    #[serde(default)]
+    pub segments: Vec<SegmentRecord>,
     pub source: Source,
+}
+
+/// One file of one source.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SegmentRecord {
+    pub file: String,
+    /// Where it sits on the take's timeline, in seconds.
+    pub start: f64,
+    /// How much of the timeline it covers.
+    pub duration: f64,
+    /// What ffprobe measured in this file alone, when it could be run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed: Option<f64>,
+    #[serde(default)]
+    pub frames: u64,
 }
 
 impl SourceRecord {
@@ -96,6 +124,13 @@ pub struct Manifest {
     /// latency, up to a couple of hundred milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_clock: Option<String>,
+    /// Seconds the take spent paused, banked across every pause.
+    ///
+    /// Recorded time, not wall time: `duration` and every file already exclude
+    /// the pause, so this is the only place that says it happened. Wall time
+    /// from GO to STOP is `duration + paused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<f64>,
     pub sources: Vec<SourceRecord>,
 }
 
@@ -146,6 +181,7 @@ impl Take {
             hardware: encoder.is_hardware(),
             started_at: stamp,
             duration: None,
+            paused: None,
             start_clock: None,
             sources: sources
                 .iter()
@@ -161,6 +197,7 @@ impl Take {
                     frames: None,
                     added_at: None,
                     probed: None,
+                    segments: Vec::new(),
                     source: s.clone(),
                 })
                 .collect(),
@@ -184,6 +221,7 @@ impl Take {
             frames: None,
             added_at: Some(added_at),
             probed: None,
+            segments: Vec::new(),
             source: src.clone(),
         });
     }
@@ -206,6 +244,18 @@ impl Take {
     pub fn set_probed(&mut self, id: &str, seconds: Option<f64>) {
         if let Some(s) = self.manifest.sources.iter_mut().find(|s| s.id == id) {
             s.probed = seconds;
+        }
+    }
+
+    /// The files this source produced. Written once, at stop.
+    pub fn set_segments(&mut self, id: &str, segments: Vec<SegmentRecord>) {
+        if let Some(s) = self.manifest.sources.iter_mut().find(|s| s.id == id) {
+            // `file` stays the first one: a reader that does not care about
+            // pauses asks for "the file" and must keep getting an answer.
+            if let Some(first) = segments.first() {
+                s.file = first.file.clone();
+            }
+            s.segments = segments;
         }
     }
 

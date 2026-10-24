@@ -80,7 +80,15 @@ pub struct LiveSourceInfo {
 #[derive(Serialize)]
 pub struct StatusInfo {
     pub recording: bool,
+    /// Recorded seconds — a paused take stops counting, because that is what
+    /// its files add up to.
     pub elapsed: f64,
+    /// Whether the clock is stopped right now.
+    pub paused: bool,
+    /// How long the pause in progress has lasted, 0 while running. Drives the
+    /// "已暂停 0:12" badge; the manifest keeps the total of the pauses that
+    /// ended.
+    pub pause_len: f64,
     pub sources: Vec<LiveSourceInfo>,
     /// Why the last begin/spawn failed. Cleared when a new take is asked for,
     /// and what the panel's failed state reads (B5).
@@ -171,12 +179,18 @@ mod tests {
         let json = serde_json::to_value(&StatusInfo {
             recording: false,
             elapsed: 0.0,
+            paused: false,
+            pause_len: 0.0,
             sources: Vec::new(),
             error: Some("boom".to_string()),
         })
         .unwrap();
         assert_eq!(json["error"], "boom");
         assert_eq!(json["recording"], false);
+        // The panel keys the pause badge off these two, so they must always be
+        // in the payload — an absent field would read as `undefined` there.
+        assert_eq!(json["paused"], false);
+        assert_eq!(json["pause_len"], 0.0);
     }
 
     #[test]

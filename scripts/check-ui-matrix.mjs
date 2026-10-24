@@ -217,8 +217,20 @@ if (!control?.port) {
   process.exit(1);
 }
 
-const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`);
-const list = JSON.parse(await resp.text());
+// The control port is up before the renderer's debug port is: `panel-start`
+// passes and the fetch below is refused for a second or two. Waiting for it is
+// the difference between a harness that reports on the UI and one that fails
+// whenever the machine is a little slower than the last run.
+let list = null;
+for (let i = 0; i < 50 && !list; i += 1) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`);
+    list = JSON.parse(await resp.text());
+  } catch {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+if (!list) { record("cdp-target", false, `no debug port on ${CDP_PORT} after 10s`); process.exit(1); }
 const target =
   list.find((t) => t.type === "page" && /tauri\.localhost/.test(t.url || "")) ||
   list.find((t) => t.type === "page" && /TakeKit/i.test(t.title || ""));
@@ -233,12 +245,42 @@ ws.onmessage = (e) => {
   const w = waits.get(m.id);
   if (w) { waits.delete(m.id); w(m); }
 };
-const send = (method, params = {}) =>
-  new Promise((res) => { const i = id++; waits.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
+// A evaluate whose promise never settles (an `invoke` that never comes back,
+// say) used to wedge the whole run: no assertion, no summary, just a node
+// process sitting there. Ten seconds is far longer than any of these calls
+// takes when the app is healthy, so hitting it is a finding, not a flake.
+const SEND_TIMEOUT_MS = 10_000;
+const send = (method, params = {}, timeoutMs = SEND_TIMEOUT_MS) =>
+  new Promise((res) => {
+    const i = id++;
+    const timer = setTimeout(() => {
+      waits.delete(i);
+      res({ __timeout: true });
+    }, timeoutMs);
+    waits.set(i, (m) => { clearTimeout(timer); res(m); });
+    ws.send(JSON.stringify({ id: i, method, params }));
+  });
 const evalJs = async (expression) => {
   const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+  // `"null"`, not an object: half the callers feed this straight into
+  // `JSON.parse`, and a sentinel object turns a slow screen into a crashed run.
+  // Whatever assertion wanted a value now gets null and fails on its own terms.
+  if (r.__timeout) return "null";
   if (r.result?.exceptionDetails) return { __error: r.result.exceptionDetails.text };
   return r.result?.result?.value;
+};
+
+// Parse what the page said, and hand back `fallback` when it said nothing
+// usable. Every `JSON.parse` over an `evalJs` result goes through this: one
+// silent screen must fail the assertion that cares, not abort the whole run.
+const evalJson = async (expr, fallback = []) => {
+  const raw = await evalJs(expr);
+  try {
+    const v = JSON.parse(raw);
+    return v === null ? fallback : v;
+  } catch {
+    return fallback;
+  }
 };
 
 // The audit runs inside the page: contrast needs the computed style and the
@@ -335,7 +377,7 @@ async function editorState(tries = 25) {
   let st = {};
   for (let i = 0; i < tries; i++) {
     try {
-      st = JSON.parse(await evalJs(READ_EDITOR));
+      st = await evalJson(READ_EDITOR, {});
     } catch {}
     if (st.loading === false) return st;
     await sleep(200);
@@ -504,7 +546,7 @@ for (const lang of LANGS) {
     await sleep(400);
     const rowsRaw = await evalJs(READ_ROWS);
     let rows = [];
-    try { rows = JSON.parse(rowsRaw); } catch {}
+    try { rows = JSON.parse(rowsRaw) ?? []; } catch {}
     const cropped = rows.filter((r) => r.geo.includes("→"));
     // Two cropped rows are seeded — a window and the desktop — so the column is
     // measured against both a title and a label on either side of it.
@@ -574,7 +616,7 @@ for (const lang of LANGS) {
       render();
     })()`);
     await sleep(300);
-    const chipped = JSON.parse(await evalJs(READ_ROWS));
+    const chipped = await evalJson(READ_ROWS);
     const noChip = chipped.filter((r) => !r.startText);
     record(`${tag}/row-start-chip-present`, noChip.length === 0,
       noChip.length ? `missing on ${noChip.map((r) => r.name).join(", ")}` : `${chipped.length} rows chipped`);
@@ -614,10 +656,105 @@ for (const lang of LANGS) {
       render();
     })()`);
     await sleep(200);
-    const pending = JSON.parse(await evalJs(READ_ROWS));
+    const pending = await evalJson(READ_ROWS);
     record(`${tag}/row-start-chip-pending`, pending.every((r) => r.startText === "—"),
       pending.map((r) => r.startText).join(","));
+
+    // ── the door itself ───────────────────────────────────────────────────
+    // The chip above proves the *row* is ready for a mid-take source. It says
+    // nothing about whether a source can be added at all: the picker used to
+    // refuse to open while recording, and a test that sets `state.recording`
+    // and calls `render()` walks straight past that. So: click the real button
+    // mid-take and require the picker to actually appear — then from another
+    // tab, which is where the tray's 添加源 lands.
+    const opened = await evalJs(`(() => {
+      state.recording = true;
+      render();
+      document.getElementById("add-btn").click();
+      const shown = !document.getElementById("picker").classList.contains("hidden");
+      return { shown, tab: document.body.dataset.tab };
+    })()`);
+    record(`${tag}/add-source-opens-while-recording`, opened.shown === true,
+      `picker ${opened.shown ? "opened" : "did NOT open"}`);
+    await evalJs(`closePicker()`);
+    const fromOtherTab = await evalJs(`(() => {
+      selectTab("settings");
+      document.getElementById("add-btn").click();
+      const shown = !document.getElementById("picker").classList.contains("hidden");
+      const tab = document.body.dataset.tab;
+      return { shown, tab };
+    })()`);
+    // The picker is anchored to the sources header; opening it over Settings
+    // would put a list of windows above a pane with no sources in it.
+    record(`${tag}/add-source-lands-on-sources-tab`,
+      fromOtherTab.shown === true && fromOtherTab.tab === "sources",
+      `picker ${fromOtherTab.shown ? "opened" : "closed"}, tab=${fromOtherTab.tab}`);
     await evalJs(`(() => {
+      closePicker();
+      selectTab("sources");
+      render();
+    })()`);
+
+    // ── the pause key ─────────────────────────────────────────────────────
+    // Three things have to be true about a control that stops the take's clock:
+    // it is not there when nothing is recording, it says which way it goes, and
+    // it refuses where it cannot be exact. The last one is the ffmpeg backend,
+    // where each source is a child with a clock of its own.
+    const idle = await evalJs(`(() => {
+      state.recording = false;
+      render();
+      return document.getElementById("pause-btn").hidden;
+    })()`);
+    record(`${tag}/pause-hidden-when-idle`, idle === true, `hidden=${idle}`);
+
+    const running = await evalJs(`(() => {
+      state.recording = true;
+      state.paused = false;
+      state.backend = "windows";
+      render();
+      const b = document.getElementById("pause-btn");
+      return { hidden: b.hidden, off: b.disabled, text: b.textContent.trim() };
+    })()`);
+    record(`${tag}/pause-offered-while-recording`,
+      running.hidden === false && running.off === false &&
+        running.text === (lang === "zh" ? "暂停" : "Pause"),
+      JSON.stringify(running));
+
+    const pausedUi = await evalJs(`(() => {
+      state.paused = true;
+      state.pauseLen = 12;
+      render();
+      const b = document.getElementById("pause-btn");
+      const badge = document.getElementById("paused-badge");
+      return {
+        text: b.textContent.trim(),
+        badge: badge.textContent.trim(),
+        shown: !badge.classList.contains("hidden"),
+        dimmed: document.body.classList.contains("paused"),
+      };
+    })()`);
+    // The badge is the only thing that says the frozen clock is a pause and not
+    // a hang, so it has to name the length, not just the state.
+    const wantBadge = lang === "zh" ? "已暂停 0:12" : "Paused 0:12";
+    record(`${tag}/pause-badge-counts`,
+      pausedUi.shown === true && pausedUi.badge === wantBadge &&
+        pausedUi.text === (lang === "zh" ? "继续" : "Resume") && pausedUi.dimmed === true,
+      JSON.stringify(pausedUi));
+
+    const ff = await evalJs(`(() => {
+      state.backend = "ffmpeg";
+      state.paused = false;
+      render();
+      const b = document.getElementById("pause-btn");
+      return { off: b.disabled, hasReason: b.title.length > 0 };
+    })()`);
+    record(`${tag}/pause-disabled-on-ffmpeg`, ff.off === true && ff.hasReason === true,
+      JSON.stringify(ff));
+
+    await evalJs(`(() => {
+      state.backend = "windows";
+      state.paused = false;
+      state.pauseLen = 0;
       state.recording = false;
       state.starts.clear();
       render();
@@ -657,10 +794,18 @@ for (const lang of LANGS) {
       }
       const raw = await evalJs(AUDIT);
       let a;
-      try { a = JSON.parse(raw); } catch { record(`${tag}/${screen.name}`, false, String(raw).slice(0, 120)); continue; }
+      try { a = JSON.parse(raw); } catch {}
+      if (!a) { record(`${tag}/${screen.name}`, false, String(raw).slice(0, 120)); continue; }
 
-      const shot = await send("Page.captureScreenshot", { format: "png" });
-      writeFileSync(path.join(OUT, `${tag}-${screen.name}.png`), Buffer.from(shot.result.data, "base64"));
+      // A minimised window has nothing to composite, and the screenshot then
+      // never comes back. Generous timeout, and a missing frame is a recorded
+      // failure rather than an exception that takes the whole run with it.
+      const shot = await send("Page.captureScreenshot", { format: "png" }, 25_000);
+      if (!shot.result?.data) {
+        record(`${tag}/${screen.name}-shot`, false, "the window produced no frame to capture");
+      } else {
+        writeFileSync(path.join(OUT, `${tag}-${screen.name}.png`), Buffer.from(shot.result.data, "base64"));
+      }
 
       for (const l of a.low) if (l.cr < worst.cr) worst = { cr: l.cr, ...l, where: `${tag}/${screen.name}` };
       const ok = a.low.length === 0 && a.spill.length === 0 && a.hScroll <= 0;
@@ -681,7 +826,7 @@ for (const lang of LANGS) {
         // And the picture must not be a door: clicking it with nothing to crop
         // against used to open the workspace on a blank stage.
         await evalJs(`document.getElementById("editor-thumb").click()`);
-        const ws = JSON.parse(await evalJs(READ_EDITOR));
+        const ws = await evalJson(READ_EDITOR, {});
         record(`${tag}/minimized-crop-closed`, ws.workspace === false, `workspace=${ws.workspace}`);
       }
       if (screen.name === "crop-workspace") {
@@ -693,7 +838,7 @@ for (const lang of LANGS) {
           label: document.getElementById("crop-output").textContent,
         })`);
         let g = {};
-        try { g = JSON.parse(geo); } catch {}
+        try { g = JSON.parse(geo) ?? {}; } catch {}
         const inside = g.box && g.plane && g.box.width > 0 && g.box.width < g.plane.width - 1 && g.box.left > g.plane.left - 1;
         record(`${tag}/workspace-crop-box-inside`, inside, `box=${Math.round(g.box?.width)} plane=${Math.round(g.plane?.width)} label="${g.label}"`);
       }
@@ -712,7 +857,7 @@ for (const lang of LANGS) {
           return JSON.stringify({ sw: el.scrollWidth, cw: el.clientWidth, text: (el.textContent || "").slice(0, 30) });
         })()`);
         let e = {};
-        try { e = JSON.parse(empty); } catch {}
+        try { e = JSON.parse(empty) ?? {}; } catch {}
         record(`${tag}/thumb-note-fits`, (e.sw || 0) <= (e.cw || 0) + 1, `${e.sw}/${e.cw}px "${e.text}"`);
       }
       if (screen.name === "crop-workspace-dropped") {
@@ -724,7 +869,7 @@ for (const lang of LANGS) {
           dashed: document.getElementById("crop-box").classList.contains("dropped"),
         })`);
         let s = {};
-        try { s = JSON.parse(state); } catch {}
+        try { s = JSON.parse(state) ?? {}; } catch {}
         // The box covers the whole picture (a narrower one would dim the stage
         // and read as a broken viewer) and is dashed so it does not look like
         // a crop that will happen.

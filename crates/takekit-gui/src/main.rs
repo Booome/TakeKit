@@ -895,6 +895,19 @@ async fn stop_recording(
         .map_err(|e| UiError::with_detail("err.internal", e))?
 }
 
+/// Stop the take's clock. Every source closes the file it is writing, so what
+/// comes out is a clip per source instead of one file with dead time in it.
+#[tauri::command]
+async fn pause_recording(app: tauri::AppHandle) -> Result<(), UiError> {
+    take::pause_recording(&app)
+}
+
+/// Start it again; each source opens its next clip on its next sample.
+#[tauri::command]
+async fn resume_recording(app: tauri::AppHandle) -> Result<(), UiError> {
+    take::resume_recording(&app)
+}
+
 /// Add one source to the take that is recording right now.
 ///
 /// The other half of `stop_source`: a take can grow while it runs, and what it
@@ -1230,6 +1243,8 @@ fn main() {
             overlay_cancel,
             status,
             stop_recording,
+            pause_recording,
+            resume_recording,
             add_live_source,
             stop_source,
             show_main,

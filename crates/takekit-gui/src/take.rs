@@ -438,6 +438,8 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
         Some(r) => StatusInfo {
             recording: true,
             elapsed: r.elapsed(),
+            paused: r.is_paused(),
+            pause_len: r.pause_len(),
             sources: r
                 .snapshot()
                 .into_iter()
@@ -454,10 +456,53 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
         None => StatusInfo {
             recording: false,
             elapsed: 0.0,
+            paused: false,
+            pause_len: 0.0,
             sources: Vec::new(),
             error: last_error,
         },
     }
+}
+
+/// Stop the take's clock and close every source's current file.
+///
+/// The file that was being written stays complete: a pause is a cut, not a
+/// truncation. `resume_recording` opens the next file per source, so what comes
+/// out of a paused take is a set of clips that start where the previous one
+/// ended — nothing to find on a timeline afterwards.
+pub fn pause_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
+    let state = app.state::<AppState>();
+    let mut guard = state.recording.lock().unwrap();
+    let Some(rec) = guard.as_mut() else {
+        return Err(UiError::new("err.not-recording"));
+    };
+    match rec.pause() {
+        Ok(()) => {
+            crate::probe(&format!("take:paused at {:.3}", rec.elapsed()));
+            Ok(())
+        }
+        Err(e) => {
+            let text = e.to_string();
+            Err(UiError::from_code_string(&text)
+                .unwrap_or_else(|| UiError::with_detail("err.pause-failed", text)))
+        }
+    }
+}
+
+/// Start the clock again; every source opens its next file on its next sample.
+pub fn resume_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
+    let state = app.state::<AppState>();
+    let mut guard = state.recording.lock().unwrap();
+    let Some(rec) = guard.as_mut() else {
+        return Err(UiError::new("err.not-recording"));
+    };
+    rec.resume().map_err(|e| {
+        let text = e.to_string();
+        UiError::from_code_string(&text)
+            .unwrap_or_else(|| UiError::with_detail("err.pause-failed", text))
+    })?;
+    crate::probe(&format!("take:resumed at {:.3}", rec.elapsed()));
+    Ok(())
 }
 
 /// What the take that is running now is recording — `None` when nothing is.

@@ -25,6 +25,7 @@
   --tk-ok: #0e700e;
   --tk-ok-soft: rgba(14, 112, 14, 0.12);
   --tk-warn: #8a5300;
+  --tk-warn-soft: rgba(138, 83, 0, 0.12);
   --tk-radius-sm: 6px;
   --tk-radius-md: 8px;
   --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
@@ -62,6 +63,8 @@
     --tk-ok: #6ccb5f;
     --tk-ok-soft: rgba(108, 203, 95, 0.18);
     --tk-warn: #e8b339;
+  --tk-warn-soft: rgba(232, 179, 57, 0.18);
+    --tk-warn-soft: rgba(232, 179, 57, 0.18);
   }
 }
 
@@ -82,6 +85,7 @@
   --tk-ok: #6ccb5f;
   --tk-ok-soft: rgba(108, 203, 95, 0.18);
   --tk-warn: #e8b339;
+  --tk-warn-soft: rgba(232, 179, 57, 0.18);
   --tk-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
   --tk-shadow-2: 0 2px 8px rgba(0, 0, 0, 0.45);
 }
@@ -479,6 +483,33 @@ body.recording .row-name {
    an empty cell would read as "0". */
 .row-start.pending {
   color: var(--tk-text-3);
+}
+
+/* ── paused ───────────────────────────────────────────────────────────────
+   The clock has stopped because the user stopped it. Two things have to read at
+   a glance: the number is not moving (so it is not a hang) and nothing is being
+   written (so "停止" is safe to press). The badge names the second, the dimmed
+   clock the first. */
+
+.paused-badge {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--tk-warn-soft);
+  color: var(--tk-warn);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+body.paused .clock {
+  color: var(--tk-text-3);
+}
+
+/* The pause key sits next to the stop key and must never look like it: stop is
+   the red one, this is a quiet text button. */
+#pause-btn.pause {
+  flex: none;
 }
 
 /* The size column (2026-10-21 方案 A): source size, `→ cropped size` when a

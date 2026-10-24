@@ -272,6 +272,8 @@ fn route(
         }
         (Method::Patch, "/config") => patch_config(app, body),
         (Method::Post, "/record/sources") => add_live_source(app, body),
+        (Method::Post, "/record/pause") => record_pause(app, true),
+        (Method::Post, "/record/resume") => record_pause(app, false),
         (Method::Post, "/record/start") => record_start(app, body),
         (Method::Post, "/record/stop") => record_stop(app),
         (Method::Delete, "/log") => clear_log(app, body),
@@ -354,6 +356,8 @@ fn snapshot(app: &tauri::AppHandle) -> Value {
         "status": {
             "recording": status.recording,
             "elapsed": status.elapsed,
+            "paused": status.paused,
+            "pause_len": status.pause_len,
             "error": status.error,
             "live": status.sources,
         },
@@ -1133,6 +1137,33 @@ fn add_live_source(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
     // saved list grew with it.
     mirror(app, "sources");
     Ok(json!({ "id": added.id, "start": added.start }))
+}
+
+/// `POST /record/pause` and `POST /record/resume` — stop or restart the take's
+/// clock.
+///
+/// Two routes rather than one with a body: a pause is an event a caller fires
+/// without asking what state it is in, and an idempotent "make it paused" reads
+/// as a setting when it is really a button.
+///
+/// A pause closes the file each source is writing and the resume opens the next
+/// one, so the reply says which state the take is in now — `paused` — rather
+/// than echoing the request.
+fn record_pause(app: &tauri::AppHandle, paused: bool) -> Result<Value, Fail> {
+    let result = if paused {
+        take::pause_recording(app)
+    } else {
+        take::resume_recording(app)
+    };
+    result.map_err(|e| ui_fail(&e))?;
+    // The panel's transport bar and the popover both read this state.
+    mirror(app, "status");
+    let status = take::status(app);
+    Ok(json!({
+        "paused": status.paused,
+        "pause_len": status.pause_len,
+        "elapsed": status.elapsed,
+    }))
 }
 
 /// `POST /record/start`. The take runs on the current setup (what `/state`

@@ -35,6 +35,10 @@ frame rate. Separate encoders keep every source at its own rate.
 - **A take can grow while it records**: add a window, screen, camera or sound
   source mid-take and it joins immediately. Its own file begins at its first
   frame, and that instant goes into the manifest.
+- **A take can be paused, and the pause is cut out**: the clock stops, every
+  source closes the file it is writing, and the resume opens the next one on the
+  exact frame the last ended. What comes out is clips that already sit next to
+  each other on a timeline — nothing to find and trim. Windows backend only.
 - **Hardware encoding when it works**: NVENC, then QSV, then AMF, falling back to
   libx264. Each candidate is probed with a one-frame encode, so a machine that
   reports an encoder but cannot actually use it still gets a working run.
@@ -95,6 +99,8 @@ MIT. See [LICENSE](LICENSE).
   ——所以录到一半加进来的源也是清单说了算，不靠猜
 - **录到一半还能加源**：窗口、桌面、摄像头、声音都可以中途加入，立刻开录；新文件从它自己的
   第一帧起算，那个时刻写进清单
+- **暂停会把这段时间真的切掉**：停钟 → 各源收尾当前文件 → 恢复时下一帧开新文件，边界正好
+  接上。产出直接是一堆现成的段（`win.mp4`、`win-2.mp4`…），不用事后找时间切。仅 Windows 后端
 - **有硬件就用**：NVENC → QSV → AMF → libx264，每个都用一帧试编来验证，避免「驱动说有、实际用不了」
 - 录完报告各源之间的时长差
 
@@ -126,12 +132,21 @@ cargo build --workspace          # 界面资源编译期内嵌，改 JS/HTML/CSS
 cargo test --workspace
 node scripts/check-three-surface.mjs   # CLI 参数 + MCP schema/真实调用 → 面板 → 配置
 node scripts/check-ui-matrix.mjs       # zh/en × light/dark × 7 屏，截屏落 target/checks/
+node scripts/check-midtake.mjs         # 真录一段：录制中加源，从点击到 take.json 的起点
 ```
 
 | 检查 | 抓什么 | 判据 |
 |---|---|---|
 | `check-three-surface` | MCP schema 声明了字段却在转发前丢掉、CLI 缺参数、三端字段名各说各话 | 14/14 |
 | `check-ui-matrix` | 页面横向滚动、文字溢出压到邻居、对比度低于 WCAG AA、**尺寸列说假话**、**行里凭空多出的空隙**、**标题不跟随窗口**、**没画面也能裁**、**喇叭出现在不能出声的行上**、**喇叭插在两个数字中间**、**加一条麦克风行就让整列数字横移** | 123/123，且 `low=0 spill=0 hScroll=0` |
+| `check-midtake` | **录制中「添加源」整条真路**：面板没参与的那次开始能不能被面板认出来、录制中点按钮列表出不出来、选中的源有没有真加入这一条 take、`take.json` 里的起点是不是晚于 0 | 13/13 |
+
+`check-midtake` 是唯一**真录**的检查：它自己造两个纯色 WinForms 窗口当素材
+（一个当第一段源、一个当录到一半才加入的源），录进 `target/checks/midtake/`，
+不碰用户屏幕上的任何东西。它存在的理由和 `check-ui-matrix` 里那条
+「add-source-opens-while-recording」不一样——那条只把 `state.recording` 设成
+`true` 再点，能证明渲染，证明不了门；2026-10-24 就正是这样让一个「录制中打不开
+列表」的面板通过了 151/151。
 
 `check-ui-matrix` 输出里 `trunc` 是省略号截断（设计意图，不算失败），`low` 是实测对比度
 （背景沿 DOM 向上找到第一个不透明容器再算），`spill` 是没有滚动条却超出容器的文本。

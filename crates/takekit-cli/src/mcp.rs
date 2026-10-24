@@ -178,6 +178,8 @@ fn tools_call(params: &Value) -> Result<Value, String> {
             }
             client.post("/record/sources", body)
         }
+        "takekit_pause_recording" => client.post("/record/pause", json!({})),
+        "takekit_resume_recording" => client.post("/record/resume", json!({})),
         "takekit_stop_recording" => client.post("/record/stop", json!({})),
         "takekit_history" => client.get("/history"),
         "takekit_log" => {
@@ -363,6 +365,23 @@ fn tool_list() -> Vec<Value> {
                 }),
                 &["kind"],
             ),
+        }),
+        json!({
+            "name": "takekit_pause_recording",
+            "description": "Pause the take that is recording. The clock stops, so the pause is \
+                            removed from the timeline instead of recorded: every source closes \
+                            the file it is writing and the next one starts where that one ended. \
+                            The take comes out as clips with exact boundaries — nothing to find \
+                            and cut afterwards. Windows backend only (ffmpeg children keep \
+                            their own clocks).",
+            "inputSchema": object(json!({}), &[]),
+        }),
+        json!({
+            "name": "takekit_resume_recording",
+            "description": "Resume a paused take. Every source opens its next clip on its next \
+                            sample; the captures never stopped, so there is no device warm-up \
+                            to lose.",
+            "inputSchema": object(json!({}), &[]),
         }),
         json!({
             "name": "takekit_stop_recording",

@@ -733,6 +733,23 @@ pub struct StreamReport {
     /// is made of: it says where the file belongs on the take's timeline, and
     /// `seconds` says how much of it the file covers.
     pub start: Option<i64>,
+    /// One entry per file, in order. A source that was never paused has exactly
+    /// one; every pause starts the next, so the files really do begin and end
+    /// where the user did.
+    pub segments: Vec<SegmentReport>,
+}
+
+/// One file of one source.
+#[derive(Clone, Debug)]
+pub struct SegmentReport {
+    pub file: std::path::PathBuf,
+    /// Take-time of its first sample, in 100 ns units.
+    pub start: i64,
+    /// How much of the take it covers — the same span in seconds, measured from
+    /// that first sample rather than from the file's own zero.
+    pub seconds: f64,
+    /// Frames written into this file.
+    pub frames: u64,
 }
 
 /// Where a file's own timeline begins.
@@ -789,6 +806,56 @@ fn latch_origin(
     origin
 }
 
+/// The path of segment `n` (1-based) for a source whose first file is `base`:
+/// `win.mp4`, `win-2.mp4`, `win-3.mp4` …
+///
+/// A separate file per pause is the only way to cut a video exactly. MP4 can
+/// only be split between keyframes, and nothing here sets a GOP — the encoder's
+/// default is seconds long — so a split after the fact would land wherever the
+/// last IDR happened to be. Starting a new file puts the boundary at frame
+/// zero, where it is exact by construction.
+pub fn segment_path(base: &std::path::Path, n: usize) -> std::path::PathBuf {
+    if n <= 1 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "take".into());
+    match base.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) if !ext.is_empty() => base.with_file_name(format!("{stem}-{n}.{ext}")),
+        _ => base.with_file_name(format!("{stem}-{n}")),
+    }
+}
+
+/// Close the file a source has open and record what it covered. A no-op when
+/// nothing is open, so callers do not have to ask.
+///
+/// `end` is take-time, not file-time: the file's own length is measured from
+/// the sample it starts with.
+fn close_segment(
+    video: &mut Option<VideoWriter>,
+    segments: &mut Vec<SegmentReport>,
+    base: Option<i64>,
+    frames: u64,
+    out: &std::path::Path,
+    end: i64,
+) -> Result<()> {
+    let Some(w) = video.take() else {
+        return Ok(());
+    };
+    let at = base.unwrap_or(end);
+    let span = (end - at).max(0);
+    w.finish_at(Some(span))?;
+    segments.push(SegmentReport {
+        file: segment_path(out, segments.len() + 1),
+        start: at,
+        seconds: span as f64 / 10_000_000.0,
+        frames,
+    });
+    Ok(())
+}
+
 /// Drain one source's frame channel into its own MP4. The writer opens on the
 /// first frame (that is when the real dimensions are known) and closes with
 /// `end_hint` — latched when the take stops — so every channel covers the same
@@ -820,10 +887,27 @@ pub fn write_stream(
     // The output's size: whatever the first kept frame came out as.
     let mut size = (0u32, 0u32);
     let mut frames = 0u64;
+    // Frames written into the segment that is open now. Reset at every cut, so
+    // each file reports its own share of the delivery.
+    let mut seg_frames = 0u64;
+    let mut segments: Vec<SegmentReport> = Vec::new();
     let mut latest: Option<VideoFrame> = None;
+    // The last picture written, kept so a resume has something to open with.
+    // A window that never repaints delivers no frame at all — its first frame
+    // came when the capture started, and a pause does not restart the capture —
+    // so without this the file after a pause would only appear once the user
+    // happened to touch that window.
+    let mut held: Option<VideoFrame> = None;
+    // The instant the last segment was cut at. The file after a pause starts
+    // there, not at "whenever the writer noticed the clock running again" —
+    // the loop sleeps through the pause, so those two differ by up to a poll
+    // interval and would leave a sliver of timeline belonging to no file.
+    let mut cut_at: Option<i64> = None;
     let mut due_slot = 0u64;
-    // Where this file's timeline begins: zero for a source that was there from
-    // the start, the first sample's take-time for one added mid-take.
+    // Where the open file's timeline begins. Zero for a source that was there
+    // from the start — but only for its first file: after a cut the file must
+    // start at its own first sample, or every resume would pad back to the
+    // take's origin with black.
     let mut base = match origin {
         Origin::Take => Some(0),
         Origin::FirstSample => None,
@@ -831,10 +915,67 @@ pub fn write_stream(
     let mut reported = false;
 
     loop {
+        if clock.is_paused() {
+            // The clock was stopped before the cut reached here, so whatever is
+            // already queued was captured before the pause and belongs in this
+            // file. Write it, then close the file exactly at the frozen
+            // instant. A frame still in a capture's hand is the only thing this
+            // can lose: one frame, at the cut, and the pause was the user's own
+            // doing.
+            let frozen = clock.now_100ns();
+            if let Sampling::EveryFrame = sampling {
+                while let Ok(msg) = rx.try_recv() {
+                    if let MediaFrame::Video(frame) = msg {
+                        frames += 1;
+                        seg_frames += 1;
+                        let frame = even_frame(crop_frame(frame, crop));
+                        let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
+                        if video.is_none() {
+                            size = (frame.width, frame.height);
+                            video = Some(open_for(&frame, out, fps, bitrate)?);
+                        }
+                        video
+                            .as_mut()
+                            .expect("opened above")
+                            .write_at(&frame, frame.time - at)?;
+                    }
+                }
+            }
+            if video.is_some() {
+                cut_at = Some(frozen);
+            }
+            close_segment(&mut video, &mut segments, base, seg_frames, out, frozen)?;
+            seg_frames = 0;
+            base = None;
+            // Nothing more to write until the clock runs again. The capture
+            // keeps running throughout, which is what makes a resume instant
+            // instead of a device warming up from cold.
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(20));
+            continue;
+        }
+
+        // Back from a pause with nothing new to show. The next file opens on
+        // the picture the last one ended with, at the instant the clock started
+        // again — which is what the encoder would have done with it anyway, had
+        // the file not been closed in between.
+        if video.is_none() {
+            if let Some(frame) = held.as_ref() {
+                let at = cut_at.take().unwrap_or_else(|| clock.now_100ns());
+                base = Some(at);
+                size = (frame.width, frame.height);
+                // `segment_path`, not `out`: the first file is on disk and must
+                // not be truncated by the second one opening over it.
+                let path = segment_path(out, segments.len() + 1);
+                video = Some(open_for(frame, &path, fps, bitrate)?);
+                video.as_mut().expect("opened above").write_at(frame, 0)?;
+            }
+        }
+
         match sampling {
-            Sampling::EveryFrame => match rx.recv() {
+            Sampling::EveryFrame => match rx.recv_timeout(interval) {
                 Ok(MediaFrame::Video(frame)) => {
                     frames += 1;
+                    seg_frames += 1;
                     let frame = even_frame(crop_frame(frame, crop));
                     let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
                     if video.is_none() {
@@ -845,9 +986,13 @@ pub fn write_stream(
                         .as_mut()
                         .expect("opened above")
                         .write_at(&frame, frame.time - at)?;
+                    held = Some(frame);
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                // Idle is not the end: a paused clock advances nothing, so the
+                // loop has to come back around and look.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             },
             Sampling::KeepLatest => {
                 match rx.recv_timeout(interval) {
@@ -880,6 +1025,7 @@ pub fn write_stream(
                             .as_mut()
                             .expect("opened above")
                             .write_at(frame, slot_time - at)?;
+                        seg_frames += 1;
                     }
                     due_slot += 1;
                 }
@@ -887,15 +1033,6 @@ pub fn write_stream(
         }
     }
 
-    let Some(w) = video.take() else {
-        return Ok(StreamReport {
-            seconds: 0.0,
-            frames,
-            width: 0,
-            height: 0,
-            start: None,
-        });
-    };
     // How long the last frame was on screen is something only the caller
     // knows: nothing arrives after it. Without this a take of a still screen
     // is a zero-second file. The latched end wins so all channels stop
@@ -904,18 +1041,19 @@ pub fn write_stream(
         0 => clock.now_100ns(),
         t => t,
     };
-    // Measured from this file's own origin: for a source that started with the
-    // take that is the take's length, for one added mid-take it is the stretch
-    // it actually covered.
-    let at = base.unwrap_or(end);
-    let span = (end - at).max(0);
-    w.finish_at(Some(span))?;
+    close_segment(&mut video, &mut segments, base, seg_frames, out, end)?;
+
+    // The source's own span: its files back to back. Because a pause removes
+    // time from the timeline instead of recording it, those files really are
+    // contiguous — `start + seconds` of one segment is the next one's `start`,
+    // and the sum is the stretch of the take this source covers.
     Ok(StreamReport {
-        seconds: span as f64 / 10_000_000.0,
+        seconds: segments.iter().map(|s| s.seconds).sum(),
         frames,
         width: size.0,
         height: size.1,
-        start: Some(at),
+        start: segments.first().map(|s| s.start),
+        segments,
     })
 }
 

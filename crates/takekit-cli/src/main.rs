@@ -565,6 +565,10 @@ fn media(args: MediaArgs) -> Result<(), String> {
         let bitrate = args.bitrate;
         let cfr = args.cfr;
         let writer_end = end_hint.clone();
+        // A copy per source: the closure runs once for every device the harness
+        // was given, and each writer thread needs its own handle on the one
+        // shared (pausable) clock.
+        let writer_clock = clock.clone();
         let handle = thread::spawn(move || -> Result<(String, u64), String> {
             // The one writer loop again (`write_stream`): --cfr picks the
             // keep-latest sampler, everything else writes what arrives.
@@ -586,7 +590,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
                     origin: writer::Origin::Take,
                     first: None,
                 },
-                clock,
+                writer_clock,
                 writer_end,
             )
             .map_err(string_of)?;
@@ -601,7 +605,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
             senders.push(tx.clone());
             writers.push(handle);
             Some(
-                ScreenCapture::start(ScreenTarget::Monitor(index), args.fps, tx, clock)
+                ScreenCapture::start(ScreenTarget::Monitor(index), args.fps, tx, clock.clone())
                     .map_err(string_of)?,
             )
         }
@@ -614,7 +618,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
             senders.push(tx.clone());
             writers.push(handle);
             Some(
-                ScreenCapture::start(ScreenTarget::Window(hwnd), args.fps, tx, clock)
+                ScreenCapture::start(ScreenTarget::Window(hwnd), args.fps, tx, clock.clone())
                     .map_err(string_of)?,
             )
         }
@@ -627,7 +631,7 @@ fn media(args: MediaArgs) -> Result<(), String> {
             let (tx, handle) = open("camera");
             senders.push(tx.clone());
             writers.push(handle);
-            Some(CameraCapture::start(&link, args.fps, tx, clock).map_err(string_of)?)
+            Some(CameraCapture::start(&link, args.fps, tx, clock.clone()).map_err(string_of)?)
         }
         None => None,
     };
@@ -637,7 +641,8 @@ fn media(args: MediaArgs) -> Result<(), String> {
             let endpoint = resolve_mic(&devices, name)?;
             let (tx, format_tx, handle) =
                 open_audio("mic", dir.join("mic.mp4"), args.bitrate.min(256));
-            let capture = MicCapture::start(&endpoint, tx.clone(), clock).map_err(string_of)?;
+            let capture =
+                MicCapture::start(&endpoint, tx.clone(), clock.clone()).map_err(string_of)?;
             let format = capture.format();
             format_tx
                 .send((format.sample_rate, format.channels))
@@ -671,7 +676,8 @@ fn media(args: MediaArgs) -> Result<(), String> {
             }),
             args.bitrate.min(256),
         );
-        let capture = LoopbackCapture::start(target, tx.clone(), clock).map_err(string_of)?;
+        let capture =
+            LoopbackCapture::start(target, tx.clone(), clock.clone()).map_err(string_of)?;
         let format = capture.format();
         format_tx
             .send((format.sample_rate, format.channels))

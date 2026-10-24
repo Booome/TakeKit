@@ -1,9 +1,11 @@
 # TakeKit 开发笔记（常设）
 
 > 后续开发的常设参考。交接文档（HANDOFF）已解散，其长期有效的内容都收在这里；
-> 进度与待办在根 `README.md`，设计契约在 `DESIGN.md`，沙箱规程在
-> `docs/webview2-agent-sandbox.md`，API 采集后端在 `docs/api-recording.md`。
-> **本文件只收"以后还会用到"的东西**；一次性进度不要往这里写。
+> 设计契约在 `DESIGN.md`，沙箱规程在 `docs/webview2-agent-sandbox.md`，
+> API 采集后端在 `docs/api-recording.md`。
+> **进度与待办收在本文件 §7**（滚动维护，读者是维护者，不对外）。
+> **除 §7 外只收"以后还会用到"的东西**；一次性进度不要往这里写。
+> 面向使用者的介绍在双语 `README.md`（英文）/ `README.zh-CN.md`（中文），那里不放开发细节。
 
 ---
 
@@ -45,6 +47,29 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
   - 还会**自己造一个最小化的窗口**（WinForms 表单 + 最小化，脚本里 `probe` 那段）来测「没画面就不给裁」与「恢复窗口后能裁」；行标题则靠塞一个假标题（`STALE …`）来验证「显示的是窗口现在的名字」。这两条都是 2026-10-23 用户报的问题，靠读代码看不出来。
   - 以及**喇叭的作用域**（`row-speaker-scope`）：window 与 desktop 行必须有喇叭，mic 与 camera 行必须没有。判断种类用 `row.dataset.kind`（产品代码为测试加的语义钩子），不匹配图标 SVG——图标一改，断言就悄悄失效，那是最糟的一种绿。
 - **隔离运行**（不碰用户真实配置）与 WebView2 双缓解：见 `docs/webview2-agent-sandbox.md` §4（唯一出处，配方与两条铁律都在那里）。
+
+### 2.1 界面矩阵钉住的规则（2026-10-23，从 README 搬来）
+
+`check-ui-matrix.mjs` 与 `check-three-surface.mjs` 的断言数**跟着「屏幕 × 语言 × 主题」增长**，
+别把某一次的数字抄进文档当常量（2026-10-25 有 123 这个数，同一批断言在加屏幕后就变了）。
+判据是脚本自己那行汇总全绿（`N/N`）+ `low=0 spill=0 hScroll=0`；`check-three-surface.mjs`
+2026-10-25 实测 `14/14`。输出里 `trunc` 是省略号截断（设计意图，不算失败），`low` 是实测对比度
+（背景沿 DOM 向上找到第一个不透明容器再算），`spill` 是没有滚动条却超出容器的文本。
+
+| 断言 | 它保证什么 |
+|---|---|
+| `row-summary-tight` | 帧率/画质格按文字自适应（`slack ≤ 1px`），且离尺寸列只隔行本身的 12px（`gap ≤ 16px`）。它曾是定宽 88px 装 58px 的字，30px 死白不溢出、不截断、不出滚动条，只有截图看得出来 |
+| `row-speaker-last` + `row-trailing-columns-line-up` | 右侧三列是一条信息线：行从右往左排，任何宽度可变的格子落在数字左边都会让整列按行横移；喇叭因此在**帧率之后、× 之前**，且不能出声的行留**同宽空槽**而不是少一格。实测 `fps→785 / ×→835` 七行全等 |
+| `row-title-follows-window` | 行上印的是窗口**现在**的标题。脚本给一个源塞假标题 `STALE …`，跑完必须查无此名且真标题在场（只查前半条，一行涂白也能过） |
+| `minimized-no-crop` / `minimized-restore-offered` / `minimized-crop-closed` | 窗口最小化时缩略图必须 disabled、点它不开工作区、「恢复窗口」在页脚 |
+| `restore-window/turns-croppable` | 按下「恢复窗口」后同一张卡片变成可裁：`unminimize` → 重抓静帧 → 有图才放行 |
+| `row-speaker-scope` | 喇叭只长在能出声的画面上：window 与 desktop 每行都有，mic 与 camera 一个都没有（那里是空槽）。`row.dataset.kind` 就是为这条加的语义钩子，不匹配图标 markup |
+| `desktop-sound-says-whole-machine` | 桌面行的提示必须说清「整台电脑的声音」；不写这句，用户会以为是这块屏的声音 |
+| `picker/window-list-carries-pid` | 选择器递上来的窗口带着 `pid`——pid 校验只在播种数据里存在等于没有 |
+| `row-crop-*` / `card-dropped-*` / `workspace-*` | 尺寸列的**三处口径**（列表行 / 卡片角标 + 输出行 / 裁剪工作区）：裁剪放不下时三处都报整幅，与 `CropBox::rect_in`（留不下 2px 就整帧原样录）一致。只改一处，另两处就会印出 `0 × 1392` 这种写不出来的尺寸 |
+
+两脚本都以 `target/checks/` 为隔离 APPDATA，**跑之前先关掉正在运行的面板**（单实例会让第二个进程
+直接退出，脚本拿不到控制端口）。新增界面加进 `SCREENS`，新增语言/主题扩 `LANGS` / `THEMES`。
 
 **开发约定**：沟通中文；代码、注释、标识符一律英文；`docs/` 下文档用中文。新行为走 TDD（先写失败测试）。不自动 commit / push——只有用户明确发话才提交。
 
@@ -252,3 +277,41 @@ js-error:<msg>
     ② 点击拦截不能只拦 `click`，行的打开监听挂在祖先上，子按钮必须 `stopPropagation`。
     另：**凡删磁盘内容的命令都要有"这是不是我们的东西"闸门**（`take_delete` 只删含
     `take.json` 的目录），journal 里的路径是可被手改的输入，不是可信值。
+
+---
+
+## 7. 进度与待办（滚动，读者是维护者）
+
+> 这一节从根 `README.md` 搬来（2026-10-24，README 改成对外双语版）。
+> 对外只承诺 `README.md`「Limitations」那几条；这里的日期、决策编号、待办优先级都是内部的。
+
+**面板已可日常使用**：源列表、设置记忆、F9 开/停、托盘、录制历史、日志页签、倒计时 3/2/1/GO +
+提示音 + Esc 取消、快捷键/语言/主题设置。录制后端默认走 **Windows API**（WGC + Media Foundation），
+窗口被遮挡也能录；ffmpeg 后端保留为回退。
+
+**待办**（大致按优先级）：
+
+1. **音频通道已补全**（2026-10-23）：麦克风 / 系统声音（WASAPI loopback）/ 单窗口声音均已实现并
+   实测通过（`docs/api-recording.md` §8），GUI 选择器同步跟进；摄像头仍缺 MF 可见设备未验证。
+   **窗口声音已改为窗口源的一个开关**（2026-10-23 晚）：一条源、一个文件、两条流
+   （`docs/api-recording.md` §11.3），picker 里每个窗口只出现一次。
+2. ~~多路漂移观测~~ ✅（2026-10-23 晚，`docs/api-recording.md` §11.1）：**没有可测的时钟漂移**
+   （20s/180s/600s 差 ≤0.04s，量级就是 AAC 帧量化），不做 slew 校正，`drift_ppm` 字段也不加。
+   顺带修了一个上报口径 bug（前导静音没算进 `seconds`，导致 60 秒录制凭空少 0.5s）。
+   **遗留**：30 分钟那次多出 4.9 秒的音频是设备一次性重投造成的，会让之后的音频永久后移 ——
+   修法（用 `chunk.time` 检测空洞/重投）见 §11.2，未做。
+3. ~~待拍板 5 项~~ ✅（2026-10-23 全部拍板并落地：单实例二次启动聚焦已有窗口；提示层创建失败降级为
+   "无提示层 + 记探针"；历史「清空」连磁盘文件一起删（删不动的行保留）；CLI `--marks` 与
+   UI「鼠标效果」文案对齐；ffmpeg 路径可配置（设置行 + CLI `--ffmpeg` + 控制面 `ffmpeg_path`）；
+   另修历史行双击开两个资源管理器窗口的节流）。
+4. 未实测：150% 缩放、多显示器双屏真机、深色主题下历史页浮窗/徽章观感。
+5. ~~B4 收尾流程~~ ✅（2026-10-21：`take:finalize|source|done` 事件流 + 提示层逐源清单 +
+   状态条 `正在写入… n/m`，「已保存」横幅按口径不做；`finalize_panel` 开关已进设置）。
+6. ~~状态条 failed 态~~ ✅（2026-10-21：菱形 + 原因单行 + 查看日志）。
+7. ~~光标/多屏对齐~~ ✅（2026-10-21：`WithCursor` 实测光标进画；picker 逐屏 + rect→Monitor）。
+
+**性能 review**（2026-10-23）：录制热路径已过一遍。帧通道原为无界 `mpsc::channel`，与"队列满则丢帧"
+的注释矛盾 —— 写入端落后时帧会在内存无限堆积（4K BGRA 帧约 33 MB）。已改为有界 `sync_channel` +
+`offer()`（满则丢帧、writer 断开才停采集），视频队深 3、音频队深 64
+（`takekit-media/src/frame.rs`）；KeepLatest 采样顺修积压时取最新帧而非队头帧（`newest_of_burst`）。
+其余热点（250ms tick 链、`spare` 复用、`copy_frame`）已是优化后形态，无改动。

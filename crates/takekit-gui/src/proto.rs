@@ -38,6 +38,16 @@ pub struct StartResult {
     pub encoder: String,
 }
 
+/// What came back from giving a running take one more source.
+#[derive(Serialize)]
+pub struct AddSourceResult {
+    pub id: String,
+    /// Take-time its file begins at, in seconds. `null` when the device has
+    /// not delivered a frame within the wait — the manifest fills it in as
+    /// soon as one does.
+    pub start: Option<f64>,
+}
+
 /// The capture setup the panel remembers between runs. Deliberately not the
 /// whole `Config`: the hotkey and the feedback switches are owned by Rust, and
 /// a panel that echoed a stale copy of them back would clobber them.
@@ -61,6 +71,10 @@ pub struct LiveSourceInfo {
     /// the panel cuts that one source off rather than let it run on.
     pub usable: bool,
     pub bytes: u64,
+    /// Where its file begins on the take's timeline, in seconds — `0` for a
+    /// source that was there at GO, the moment it joined for one added later.
+    /// `null` until the first sample of a just-added source has arrived.
+    pub start: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -175,9 +189,14 @@ mod tests {
 #[derive(Clone, Serialize)]
 pub struct OutcomeInfo {
     pub id: String,
+    /// Where its file begins on the take's timeline, in seconds.
+    pub start: Option<f64>,
     pub seconds: Option<f64>,
     pub bytes: u64,
     pub error: Option<String>,
+    /// A code for "recorded, but the bookkeeping disagrees" (`len.mismatch`).
+    /// Separate from `error`: the file is fine, the manifest is what is off.
+    pub warning: Option<String>,
     /// The size the file was written at. `0 x 0` when the backend cannot say
     /// (the ffmpeg path) — the stop checklist shows the resolution when it
     /// has one and leaves the cell blank when it does not.
@@ -190,9 +209,11 @@ impl From<&takekit_core::session::Outcome> for OutcomeInfo {
         let (width, height) = o.size.unwrap_or((0, 0));
         Self {
             id: o.id.clone(),
+            start: o.start,
             seconds: o.seconds,
             bytes: o.bytes,
             error: o.error.clone(),
+            warning: o.warning.clone(),
             width,
             height,
         }

@@ -208,7 +208,15 @@ body.live .dot {
 
 .acts {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+/* Stop takes the whole first line; the two ways out of the popover share the
+   second. Three buttons abreast in 220px is where a translated label gets
+   truncated, and the stop key is the one that must never be hard to hit. */
+.acts .stop {
+  flex: 1 1 100%;
 }
 
 button {

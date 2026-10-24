@@ -93,6 +93,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 | `DELETE /sources/{index}` | 同上 | — | 新快照 |
 | `PUT /sources` | `save_session` | `Source[]` | 新快照 |
 | `PATCH /config` | `set_*` 系列合并 | Config 子集 | 新快照 |
+| `POST /record/sources` | `Recording::add_source` | 与 `POST /sources` 同两种 Shape；加进**正在录的这一条 take** | `{ id, start }`——`start` 是新文件在该 take 时间轴上的起点（秒），也是 `take.json` 里那个数 |
 | `POST /record/start` | `start_recording` | `{ quality? }`（其余取当前设置） | `{ started, countdown_secs }` |
 | `POST /record/stop` | `stop_recording` | — | `StopResult`（含 `dir`） |
 | `GET /history` | `journal_get` | — | `{ takes, log }` |

@@ -41,6 +41,27 @@ pub enum Ctl {
         #[arg(long)]
         quality: Option<u8>,
     },
+    /// Add one source to the take that is recording right now
+    AddLive {
+        /// window | desktop | camera | mic | system-audio | window-audio
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// What to capture: a window title substring, a camera name or a mic name
+        #[arg(long)]
+        target: Option<String>,
+        /// Monitor number for --kind desktop (from `devices`); whole desktop when omitted
+        #[arg(long)]
+        monitor: Option<usize>,
+        /// Trim the capture: "top,bottom,left,right" in pixels
+        #[arg(long)]
+        crop: Option<String>,
+        /// Frames per second (default 30)
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Per-source quality (default: the session quality)
+        #[arg(long)]
+        quality: Option<u8>,
+    },
     /// Remove the source at an index from /state
     Remove {
         #[arg(long)]
@@ -156,6 +177,35 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
                 body["quality"] = json!(quality);
             }
             client.post("/sources", body)?
+        }
+        Ctl::AddLive {
+            kind,
+            target,
+            monitor,
+            crop,
+            fps,
+            quality,
+        } => {
+            let mut body = json!({ "kind": kind });
+            if let Some(target) = target {
+                body["target"] = json!(target);
+            }
+            if let Some(monitor) = monitor {
+                body["monitor"] = json!(monitor);
+            }
+            if let Some(crop) = crop {
+                body["crop"] = crop_json(&crop)?;
+            }
+            if let Some(fps) = fps {
+                body["fps"] = json!(fps);
+            }
+            if let Some(quality) = quality {
+                body["quality"] = json!(quality);
+            }
+            // The answer carries `start` — where the new file begins on the
+            // take's timeline, in seconds — which is the number a caller needs
+            // to place it later.
+            client.post("/record/sources", body)?
         }
         Ctl::Remove { index } => client.delete(&format!("/sources/{index}"), Value::Null)?,
         Ctl::SetSources => {

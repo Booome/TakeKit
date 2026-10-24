@@ -162,6 +162,22 @@ fn tools_call(params: &Value) -> Result<Value, String> {
             }
             client.post("/record/start", body)
         }
+        "takekit_record_add_source" => {
+            // Same convenience shape as `takekit_add_source`, but it lands in
+            // the take that is running: the reply's `start` is where the new
+            // file begins on that take's timeline, in seconds.
+            let mut body = json!({});
+            for key in [
+                "kind", "target", "monitor", "crop", "fps", "quality", "sound",
+            ] {
+                if let Some(value) = args.get(key) {
+                    if !value.is_null() {
+                        body[key] = value.clone();
+                    }
+                }
+            }
+            client.post("/record/sources", body)
+        }
         "takekit_stop_recording" => client.post("/record/stop", json!({})),
         "takekit_history" => client.get("/history"),
         "takekit_log" => {
@@ -325,6 +341,27 @@ fn tool_list() -> Vec<Value> {
             "inputSchema": object(
                 json!({ "quality": prop("quality for this take, default 20", "number") }),
                 &[],
+            ),
+        }),
+        json!({
+            "name": "takekit_record_add_source",
+            "description": "Add one source to the take that is recording RIGHT NOW. Same \
+                            kind/target shape as takekit_add_source, but it starts capturing \
+                            immediately instead of waiting for the next take. The reply's \
+                            `start` is where the new file begins on the take's timeline, in \
+                            seconds — that number, not the file's own length, is what places \
+                            the clip; take.json records it for every source.",
+            "inputSchema": object(
+                json!({
+                    "kind": prop("window | desktop | camera | mic | system-audio | window-audio", "string"),
+                    "target": prop("window title, camera name or mic name substring (unused for system-audio)", "string"),
+                    "monitor": prop("monitor number for kind=desktop (see list_devices)", "number"),
+                    "crop": prop("edges to trim: {top, bottom, left, right} in pixels (pictures only)", "object"),
+                    "fps": prop("frames per second, default 30", "number"),
+                    "quality": prop("per-source quality override", "number"),
+                    "sound": prop("kind=window or desktop: also record its sound into the same file", "boolean"),
+                }),
+                &["kind"],
             ),
         }),
         json!({

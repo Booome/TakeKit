@@ -81,6 +81,15 @@ $("show").addEventListener("click", () => {
   invoke("show_main").catch((e) => console.error("show_main", e));
 });
 
+// Adding a source mid-take happens in the panel: this brings it back with the
+// picker already open, so the popover does not need a second copy of six kinds
+// and a window search in 220 pixels.
+$("add").addEventListener("click", () => {
+  invoke("add_source_from_tray").catch((e) =>
+    console.error("add_source_from_tray", e),
+  );
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") invoke("hide_tray").catch(() => {});
 });

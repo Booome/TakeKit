@@ -20,12 +20,29 @@ use crate::ffmpeg;
 use crate::marks::Marks;
 use crate::source::{Backend, Capture, Engine, Source, is_recordable};
 use crate::take::Take;
+use takekit_media::writer::Origin;
 use takekit_media::{
     CameraCapture, LoopbackCapture, LoopbackTarget, MediaFrame, MicCapture, MuxSink, ScreenCapture,
     ScreenTarget, TakeClock,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `Manifest::start_clock` values — what the offsets in a take were measured
+/// against. Two strings rather than an enum because a manifest is read by
+/// people and by other programs, and both benefit from a word they can match
+/// on without a schema.
+const START_BY_FRAMES: &str = "frames";
+const START_BY_SPAWN: &str = "spawn";
+
+/// How long a mid-take add waits for its first sample before reporting
+/// `start: null` and letting the file say so when it closes.
+///
+/// One frame is ~33ms; a camera can take the better part of a second to open.
+/// Waiting here is what lets `take.json` name the offset immediately, and it
+/// is bounded so a device that never delivers cannot hold the panel's
+/// recording lock for longer than this.
+const ADD_FIRST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum Error {
@@ -148,6 +165,9 @@ impl Prepared {
         // which this take never used.
         take.manifest.encoder = "mf-h264".into();
         take.manifest.hardware = false;
+        // Every `start` in this take comes from a file's own first sample, read
+        // off the one clock below — the most exact answer a manifest can hold.
+        take.manifest.start_clock = Some(START_BY_FRAMES.into());
         let dir = take.dir.clone();
 
         // One origin for every source, taken before the first capture opens:
@@ -164,165 +184,36 @@ impl Prepared {
             take,
             running: Vec::new(),
             media: Vec::new(),
-            media_clock: Some((clock, end_hint.clone())),
+            clock,
+            end_hint,
+            backend: Backend::Windows,
+            // Unused on this path: the OS captures and encodes, so there is no
+            // binary to spawn. `probe` is still worth having — it is what
+            // verifies every finished file's length against the manifest.
+            ffmpeg: PathBuf::new(),
+            probe: self.probe,
+            encoder: self.encoder,
+            quality: self.settings.quality,
+            engine: self.engine,
             spawn_ms: Vec::new(),
             marks,
-            probe: self.probe,
             started: Instant::now(),
         };
 
         for src in &self.settings.sources {
-            let out = recording.take.path_for(&src.id);
-            let fps = src.fps.max(1);
-            let bitrate = bitrate_for(effective_quality(src, self.settings.quality));
-
-            // Sound sources take a different road than the picture: the
-            // capture reports its format and the writer opens an AAC file
-            // behind it (see `start_audio_media`). Same failure rule — a
-            // source that cannot start ends the whole take and leaves no
-            // folder behind.
-            if src.capture.is_audio() {
-                let t_spawn = Instant::now();
-                let started = start_audio_media(
-                    src,
-                    out.clone(),
-                    clock,
-                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
-                );
-                let (handle_capture, sender, writer) = match started {
-                    Ok(triple) => triple,
-                    Err(e) => {
-                        drop(recording);
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(e);
-                    }
-                };
-                recording
-                    .spawn_ms
-                    .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
-                recording.media.push(MediaRunning {
-                    id: src.id.clone(),
-                    capture: src.capture.clone(),
-                    handle: Some(handle_capture),
-                    sender: Some(sender),
-                    sound: None,
-                    writer,
-                    out,
-                });
-                continue;
-            }
-
-            // A source that records sound with its picture writes one file
-            // with both tracks: the picture through WGC, the sound through
-            // WASAPI's loopback, one sink writer behind the pair. What the
-            // sound *is* depends on the picture — a window's own process tree,
-            // or everything the speakers play for the desktop (see `start_av`).
-            if src.audio {
-                let t_spawn = Instant::now();
-                let started = start_av(
-                    src,
-                    out.clone(),
-                    clock,
-                    end_hint.clone(),
-                    bitrate,
-                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
-                );
-                let (handle_capture, sender, sound, writer) = match started {
-                    Ok(quad) => quad,
-                    Err(e) => {
-                        drop(recording);
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(e);
-                    }
-                };
-                recording
-                    .spawn_ms
-                    .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
-                recording.media.push(MediaRunning {
-                    id: src.id.clone(),
-                    capture: src.capture.clone(),
-                    handle: Some(handle_capture),
-                    sender: Some(sender),
-                    sound: Some(sound),
-                    writer,
-                    out,
-                });
-                continue;
-            }
-
-            // Bounded, and fed through `offer` by the captures: the writer
-            // must never make the capture wait, and an unbounded queue would
-            // turn "the writer is behind" into unbounded memory growth (a 4K
-            // BGRA frame is about 33 MB). A full queue drops the frame — the
-            // encoder holds the previous picture across the gap.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
-
-            // One writer thread per source, holding the Media Foundation
-            // objects: they are not `Send`, and the capture must never block
-            // on an encoder. Frames are written as they arrive, each keeping
-            // its own capture time — the shared take clock is what puts them
-            // on one timeline (see `takekit_media::writer` for how that
-            // timeline reaches the file).
-            let writer_out = out.clone();
-            let writer_end = end_hint.clone();
-            let writer_crop = src.capture.crop();
-            let handle = std::thread::spawn(move || {
-                write_frames(rx, writer_out, fps, bitrate, clock, writer_end, writer_crop)
-            });
-
             let t_spawn = Instant::now();
-            // A source that cannot start ends the whole take, same as on the
-            // ffmpeg path: drop the sources that did start (their `Drop` stops
-            // the captures so the writers drain and finalise), then remove the
-            // folder — nothing usable was recorded.
-            let started = match &src.capture {
-                Capture::Desktop { rect, .. } => ScreenCapture::start(
-                    ScreenTarget::Monitor(monitor_index(*rect)),
-                    src.fps,
-                    tx.clone(),
-                    clock,
-                )
-                .map(MediaCapture::Screen),
-                Capture::Window { hwnd, .. } => {
-                    // No raise, and none needed: WGC keeps recording a window
-                    // that sits behind others. That is the whole point of this
-                    // backend for a window source.
-                    ScreenCapture::start(ScreenTarget::Window(*hwnd), src.fps, tx.clone(), clock)
-                        .map(MediaCapture::Screen)
-                }
-                Capture::Camera { device, .. } => match camera_link(device) {
-                    Ok(link) => CameraCapture::start(&link, src.fps, tx.clone(), clock)
-                        .map(MediaCapture::Camera),
-                    Err(e) => Err(e),
-                },
-                // Audio sources are started in-process above and `continue`
-                // past this point — ffmpeg has no WASAPI loopback, so there
-                // is nothing left for this video-only match to do.
-                Capture::Mic { .. } | Capture::SystemAudio { .. } | Capture::WindowAudio { .. } => {
-                    unreachable!("audio sources take the branch above")
-                }
-            };
-            let handle_capture = match started {
-                Ok(handle) => handle,
-                Err(e) => {
-                    drop(recording);
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(spawn_error(e));
-                }
-            };
-
+            // A source that cannot start ends the whole take and leaves no
+            // folder behind: nothing usable was recorded. `start_media_source`
+            // starts every channel of this source; a failure there is the same
+            // failure the spawn loop used to report inline.
+            if let Err(e) = recording.start_media_source(src, Origin::Take) {
+                drop(recording);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
             recording
                 .spawn_ms
                 .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
-            recording.media.push(MediaRunning {
-                id: src.id.clone(),
-                capture: src.capture.clone(),
-                handle: Some(handle_capture),
-                sender: Some(tx),
-                sound: None,
-                writer: handle,
-                out,
-            });
         }
 
         let _ = recording.take.save_manifest();
@@ -340,13 +231,23 @@ impl Prepared {
             None
         };
 
-        let take = Take::create(
+        let mut take = Take::create(
             &self.settings.out_root,
             "mkv",
             self.encoder,
             &self.settings.sources,
         )?;
+        // Each child files its own clock, so the best this backend can say
+        // about a source's place on the timeline is when the child was
+        // launched — see `Manifest::start_clock`.
+        take.manifest.start_clock = Some(START_BY_SPAWN.into());
         let dir = take.dir.clone();
+
+        // The take's clock. Sound sources are recorded in-process even here
+        // (ffmpeg has no WASAPI loopback), and this is what puts their
+        // timestamps on the same timeline as everything else.
+        let clock = TakeClock::start();
+        let end_hint = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
         // Assembled before the spawn loop: if a later source fails to spawn,
         // dropping it shuts down the encoders that did start.
@@ -354,97 +255,39 @@ impl Prepared {
             take,
             running: Vec::new(),
             media: Vec::new(),
-            media_clock: None,
+            clock,
+            end_hint,
+            backend: Backend::Ffmpeg,
+            ffmpeg: self.ffmpeg,
+            probe: self.probe,
+            encoder: self.encoder,
+            quality: self.settings.quality,
+            engine: self.engine,
             spawn_ms: Vec::new(),
             marks,
-            probe: self.probe,
             started: Instant::now(),
         };
 
-        // Sound sources are recorded in-process even on this backend — ffmpeg
-        // has no WASAPI loopback to offer, so there is nothing to spawn. Their
-        // timestamps come from one clock shared by the take's audio.
-        let audio_clock = TakeClock::start();
-
         for src in &self.settings.sources {
-            let out = recording.take.path_for(&src.id);
-            if src.capture.is_audio() {
-                let t = std::time::Instant::now();
-                let started = start_audio_media(
-                    src,
-                    out.clone(),
-                    audio_clock,
-                    audio_bitrate_for(effective_quality(src, self.settings.quality)),
-                );
-                let (handle_capture, sender, writer) = match started {
-                    Ok(triple) => triple,
-                    Err(e) => {
-                        drop(recording);
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(e);
-                    }
-                };
-                recording
-                    .spawn_ms
-                    .push((src.id.clone(), t.elapsed().as_millis() as u64));
-                recording.media.push(MediaRunning {
-                    id: src.id.clone(),
-                    capture: src.capture.clone(),
-                    handle: Some(handle_capture),
-                    sender: Some(sender),
-                    sound: None,
-                    writer,
-                    out,
-                });
-                continue;
-            }
-
-            // A source can stop resolving between prepare and start (a window
-            // closed during the countdown). Same cleanup as a failed spawn:
-            // nothing was recorded, so the folder must not survive.
-            let (input, extra_filter) = match src.input_args(self.engine) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    drop(recording);
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(Error::Source(e));
-                }
-            };
-            let log = recording.take.dir.join(format!("{}.log", src.id));
-
-            let mut args: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
-            args.extend(input);
-            if let Some(filter) = extra_filter {
-                args.extend(["-vf".into(), filter]);
-            }
-            args.extend(
-                self.encoder
-                    .args(effective_quality(src, self.settings.quality)),
-            );
-            args.push(out.to_string_lossy().into_owned());
-
             let t = std::time::Instant::now();
-            let child = match ffmpeg::spawn(&self.ffmpeg, &args, &log) {
-                Ok(child) => child,
-                Err(e) => {
-                    // Nothing usable was recorded: stop the encoders that did
-                    // start, then remove the folder so a failed start does not
-                    // leave a take with no manifest and no frames.
-                    drop(recording);
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(e.into());
-                }
+            // Sound is never a child process (ffmpeg has no WASAPI loopback);
+            // everything with a picture is.
+            let started = if src.capture.is_audio() {
+                recording.start_media_source(src, Origin::Take).map(|_| ())
+            } else {
+                recording.start_ffmpeg_source(src).map(|_| ())
             };
+            if let Err(e) = started {
+                // Nothing usable was recorded: stop the encoders that did
+                // start, then remove the folder so a failed start does not
+                // leave a take with no manifest and no frames.
+                drop(recording);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
             recording
                 .spawn_ms
                 .push((src.id.clone(), t.elapsed().as_millis() as u64));
-            recording.running.push(Running {
-                id: src.id.clone(),
-                capture: src.capture.clone(),
-                child,
-                log,
-                out,
-            });
         }
 
         // Best-effort so a crash mid-take still leaves a manifest on disk;
@@ -458,6 +301,290 @@ impl Prepared {
 /// A source's own quality when pinned, the session-wide default otherwise.
 fn effective_quality(src: &Source, global: u8) -> u8 {
     src.quality.unwrap_or(global)
+}
+
+/// Starting one source against a take that is already under way.
+///
+/// Both the take's first frame and a source added ten minutes in come through
+/// here, which is the point: the ordering rules (capture before writer, writer
+/// before capture, who reports the first sample) are stated once.
+impl Recording {
+    fn now_secs(&self) -> f64 {
+        self.clock.now_100ns() as f64 / 10_000_000.0
+    }
+
+    /// Start one source through the OS capture APIs.
+    ///
+    /// Sound takes a different road than the picture: the capture reports its
+    /// format and the writer opens an AAC file behind it. A source that records
+    /// sound with its picture gets one file with both tracks — the picture
+    /// through WGC, the sound through WASAPI's loopback, one sink writer behind
+    /// the pair (see `start_av`).
+    ///
+    /// Returns the channel a `FirstSample` origin announces its first take-time
+    /// on, and `None` for the `Take` origin, whose file begins at zero by
+    /// definition. Nothing here decides what a failure means — the take's start
+    /// throws the folder away, a mid-take add rolls back one row — so the caller
+    /// does.
+    fn start_media_source(
+        &mut self,
+        src: &Source,
+        origin: Origin,
+    ) -> Result<Option<std::sync::mpsc::Receiver<i64>>> {
+        let out = self.take.path_for(&src.id);
+        let fps = src.fps.max(1);
+        let quality = effective_quality(src, self.quality);
+        let bitrate = bitrate_for(quality);
+        let audio_kbps = audio_bitrate_for(quality);
+
+        // Only a source that joins a running take has a first sample worth
+        // announcing: one that starts with the take already knows it begins at
+        // zero. `sync_channel(1)` so the writer's `try_send` never queues.
+        let (first, watch) = match origin {
+            Origin::Take => (None, None),
+            Origin::FirstSample => {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<i64>(1);
+                (Some(tx), Some(rx))
+            }
+        };
+
+        if src.capture.is_audio() {
+            let (handle_capture, sender, writer) =
+                start_audio_media(src, out.clone(), self.clock, audio_kbps, first.clone())?;
+            self.remember(src, handle_capture, sender, None, writer, out, origin);
+            return Ok(watch);
+        }
+
+        if src.audio {
+            let (handle_capture, sender, sound, writer) = start_av(
+                src,
+                out.clone(),
+                self.clock,
+                self.end_hint.clone(),
+                bitrate,
+                audio_kbps,
+                origin,
+                first.clone(),
+            )?;
+            self.remember(
+                src,
+                handle_capture,
+                sender,
+                Some(sound),
+                writer,
+                out,
+                origin,
+            );
+            return Ok(watch);
+        }
+
+        // Bounded, and fed through `offer` by the captures: the writer
+        // must never make the capture wait, and an unbounded queue would
+        // turn "the writer is behind" into unbounded memory growth (a 4K
+        // BGRA frame is about 33 MB). A full queue drops the frame — the
+        // encoder holds the previous picture across the gap.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::VIDEO_QUEUE);
+
+        // One writer thread per source, holding the Media Foundation
+        // objects: they are not `Send`, and the capture must never block
+        // on an encoder. Frames are written as they arrive, each keeping
+        // its own capture time — the shared take clock is what puts them
+        // on one timeline (see `takekit_media::writer` for how that
+        // timeline reaches the file).
+        let job = FrameJob {
+            out: out.clone(),
+            fps,
+            bitrate,
+            clock: self.clock,
+            end_hint: self.end_hint.clone(),
+            crop: src.capture.crop(),
+            origin,
+            first,
+        };
+        let handle = std::thread::spawn(move || write_frames(rx, job));
+
+        let started = match &src.capture {
+            Capture::Desktop { rect, .. } => ScreenCapture::start(
+                ScreenTarget::Monitor(monitor_index(*rect)),
+                src.fps,
+                tx.clone(),
+                self.clock,
+            )
+            .map(MediaCapture::Screen),
+            Capture::Window { hwnd, .. } => {
+                // No raise, and none needed: WGC keeps recording a window
+                // that sits behind others. That is the whole point of this
+                // backend for a window source.
+                ScreenCapture::start(ScreenTarget::Window(*hwnd), src.fps, tx.clone(), self.clock)
+                    .map(MediaCapture::Screen)
+            }
+            Capture::Camera { device, .. } => match camera_link(device) {
+                Ok(link) => CameraCapture::start(&link, src.fps, tx.clone(), self.clock)
+                    .map(MediaCapture::Camera),
+                Err(e) => Err(e),
+            },
+            // Audio sources were started above and returned through
+            // `start_audio_media` — ffmpeg has no WASAPI loopback, so there
+            // is nothing left for this video-only match to do.
+            Capture::Mic { .. } | Capture::SystemAudio { .. } | Capture::WindowAudio { .. } => {
+                unreachable!("audio sources take the branch above")
+            }
+        };
+        let handle_capture = started.map_err(spawn_error)?;
+        self.remember(src, handle_capture, tx, None, handle, out, origin);
+        Ok(watch)
+    }
+
+    /// Start one source as its own ffmpeg child, and return the take-time the
+    /// child was launched at — this backend never sees a frame, so that is the
+    /// only evidence it has of where the file belongs.
+    fn start_ffmpeg_source(&mut self, src: &Source) -> Result<i64> {
+        // A source can stop resolving between prepare and start (a window
+        // closed during the countdown), or between two adds. Nothing was
+        // recorded, so the caller decides what to throw away.
+        let (input, extra_filter) = src.input_args(self.engine).map_err(Error::Source)?;
+        let log = self.take.dir.join(format!("{}.log", src.id));
+        let out = self.take.path_for(&src.id);
+
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-y".into()];
+        args.extend(input);
+        if let Some(filter) = extra_filter {
+            args.extend(["-vf".into(), filter]);
+        }
+        args.extend(self.encoder.args(effective_quality(src, self.quality)));
+        args.push(out.to_string_lossy().into_owned());
+
+        let started_at = self.clock.now_100ns();
+        let child = ffmpeg::spawn(&self.ffmpeg, &args, &log)?;
+        self.running.push(Running {
+            id: src.id.clone(),
+            capture: src.capture.clone(),
+            child,
+            log,
+            out,
+            fps: src.fps,
+            start: Some(started_at),
+        });
+        self.take
+            .set_start(&src.id, Some(started_at as f64 / 10_000_000.0));
+        Ok(started_at)
+    }
+
+    /// Put a started source in the running list, and write down where its file
+    /// begins.
+    ///
+    /// A `Take` origin is known to be zero before a single frame arrives, so
+    /// the manifest is complete from the moment the source starts — a take that
+    /// crashes keeps saying the right thing. A `FirstSample` origin is only
+    /// known once a frame lands: `add_source` waits for it and fills this in.
+    #[allow(clippy::too_many_arguments)]
+    fn remember(
+        &mut self,
+        src: &Source,
+        handle: MediaCapture,
+        sender: std::sync::mpsc::SyncSender<MediaFrame>,
+        sound: Option<SoundLane>,
+        writer: std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
+        out: PathBuf,
+        origin: Origin,
+    ) {
+        let start = match origin {
+            Origin::Take => {
+                self.take.set_start(&src.id, Some(0.0));
+                Some(0)
+            }
+            Origin::FirstSample => None,
+        };
+        self.media.push(MediaRunning {
+            id: src.id.clone(),
+            capture: src.capture.clone(),
+            handle: Some(handle),
+            sender: Some(sender),
+            sound,
+            writer,
+            out,
+            fps: src.fps,
+            start,
+        });
+    }
+
+    /// Record a source that joined the take after it began.
+    ///
+    /// Returns once the file knows where it starts — a couple of frames, or the
+    /// time the device took to wake up — so the manifest is correct while the
+    /// take is still running rather than only after it closes.
+    ///
+    /// A failure only rolls back this one source: the rest of the take is
+    /// running, and a camera that is busy is no reason to lose it. That is the
+    /// opposite of what a failure at start time means (nothing was recorded, so
+    /// the folder goes), and it is why the rollback lives here and not in the
+    /// shared start path.
+    pub fn add_source(&mut self, src: &Source) -> Result<Added> {
+        validate_sources(std::slice::from_ref(src))?;
+        if self.take.manifest.sources.iter().any(|s| s.id == src.id) {
+            return Err(Error::Source(format!("duplicate source id {:?}", src.id)));
+        }
+        // Sound inside a picture's file is a Media Foundation mux; ffmpeg has
+        // no WASAPI loopback to feed it. Refused by name rather than recording
+        // a silent file (see `Session::prepare`).
+        if self.backend != Backend::Windows && src.audio {
+            return Err(Error::Source(format!(
+                "{}: recording its sound into its own file needs the Windows backend (WGC + MF)",
+                src.capture.device_name().unwrap_or("the desktop")
+            )));
+        }
+
+        // On disk before the capture opens: a take that dies between the two
+        // must still say this source was asked for and never arrived.
+        self.take.add_source(src, self.now_secs());
+        let _ = self.take.save_manifest();
+
+        let t_spawn = Instant::now();
+        let started: Result<Option<i64>> = match self.backend {
+            Backend::Windows => self
+                .start_media_source(src, Origin::FirstSample)
+                .map(|watch| watch.and_then(|rx| rx.recv_timeout(ADD_FIRST_TIMEOUT).ok())),
+            Backend::Ffmpeg if src.capture.is_audio() => self
+                .start_media_source(src, Origin::FirstSample)
+                .map(|watch| watch.and_then(|rx| rx.recv_timeout(ADD_FIRST_TIMEOUT).ok())),
+            Backend::Ffmpeg => self.start_ffmpeg_source(src).map(Some),
+        };
+        let start = match started {
+            Ok(start) => start,
+            Err(e) => {
+                self.take.remove_source(&src.id);
+                let _ = self.take.save_manifest();
+                return Err(e);
+            }
+        };
+        self.spawn_ms
+            .push((src.id.clone(), t_spawn.elapsed().as_millis() as u64));
+
+        let seconds = start.map(|t| t as f64 / 10_000_000.0);
+        if let Some(secs) = seconds {
+            self.take.set_start(&src.id, Some(secs));
+            // Keep the running copy in step, so `snapshot` reports the same
+            // offset the manifest does.
+            if let Some(m) = self.media.iter_mut().find(|m| m.id == src.id) {
+                m.start = start;
+            }
+            let _ = self.take.save_manifest();
+        }
+        Ok(Added {
+            id: src.id.clone(),
+            start: seconds,
+        })
+    }
+}
+
+/// A source that joined a take already running, and where its file begins.
+#[derive(Debug, Clone)]
+pub struct Added {
+    pub id: String,
+    /// Take-time of the file's first sample, in seconds. `None` when nothing
+    /// arrived within `ADD_FIRST_TIMEOUT` — the manifest then fills it in when
+    /// the file closes, or leaves it null if the source never wrote a frame.
+    pub start: Option<f64>,
 }
 
 /// A running Windows-API source: the capture, the channel into its writer and
@@ -476,6 +603,13 @@ struct MediaRunning {
     sound: Option<SoundLane>,
     writer: std::thread::JoinHandle<std::result::Result<WriteReport, String>>,
     out: PathBuf,
+    /// The rate the file was asked for; `length_mismatch` judges ffprobe's
+    /// reading against it.
+    fps: u32,
+    /// Take-time its file begins at, once the first sample has said so. `Some(0)`
+    /// the moment a from-the-start source is registered; `None` for a source
+    /// added mid-take until a frame actually arrives.
+    start: Option<i64>,
 }
 
 /// One extra capture feeding an existing source's writer.
@@ -536,6 +670,7 @@ impl MediaRunning {
                     frames: 0,
                     width: 0,
                     height: 0,
+                    start: None,
                 })
             }),
         );
@@ -545,22 +680,35 @@ impl MediaRunning {
         let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);
         // A source counts as recorded only if it produced bytes, exactly like
         // an ffmpeg one that exited without writing a frame.
-        let (seconds, frames, size, error) = match outcome {
+        let (start, seconds, frames, size, error) = match outcome {
             Ok(report) if bytes > 0 => (
+                // The writer's own measurement wins over the optimistic value
+                // a from-the-start source was registered with: it is the one
+                // that came from a sample.
+                report.start.or(self.start),
                 Some(report.seconds),
                 Some(report.frames),
                 Some((report.width, report.height)),
                 None,
             ),
-            Ok(_) => (None, Some(0), None, Some(diagnose::FFMPEG_DIED.to_string())),
-            Err(e) => (None, None, None, Some(e)),
+            Ok(_) => (
+                None,
+                None,
+                Some(0),
+                None,
+                Some(diagnose::FFMPEG_DIED.to_string()),
+            ),
+            Err(e) => (None, None, None, None, Some(e)),
         };
         Collected {
             id: self.id.clone(),
             bytes,
+            start,
             seconds,
             frames,
             size,
+            probed: None,
+            fps: self.fps,
             error,
         }
     }
@@ -592,32 +740,43 @@ impl MediaCapture {
 /// variable frame rate, which is why a still picture costs almost nothing. The
 /// returned number is the seconds the file covers, taken from the stop time
 /// the caller infers rather than from a frame that never arrived.
-fn write_frames(
-    rx: std::sync::mpsc::Receiver<MediaFrame>,
+/// Everything one picture file is written with — the frame channel stays a
+/// separate argument, because it is the only one that is not a setting.
+struct FrameJob {
     out: PathBuf,
     fps: u32,
     bitrate: u32,
     clock: TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
     crop: crate::source::Crop,
+    origin: Origin,
+    /// Told the file's first take-time, for a source added mid-take.
+    first: Option<std::sync::mpsc::SyncSender<i64>>,
+}
+
+fn write_frames(
+    rx: std::sync::mpsc::Receiver<MediaFrame>,
+    job: FrameJob,
 ) -> std::result::Result<WriteReport, String> {
     // One writer loop for every caller (`write_stream` is where a frame
     // channel becomes a file); this path writes every frame the capture
     // delivered. The CLI's --cfr sampler is the same loop with `KeepLatest`.
     let report = takekit_media::writer::write_stream(
         rx,
-        &out,
+        &job.out,
         takekit_media::writer::Encode {
-            fps,
-            bitrate,
+            fps: job.fps,
+            bitrate: job.bitrate,
             // WGC hands over the whole window or monitor; the edges the editor
             // picked are cut here, so a cropped source records the same picture
             // on this backend as it does through ffmpeg's region grab.
-            crop: crop_box(crop),
+            crop: crop_box(job.crop),
             sampling: takekit_media::writer::Sampling::EveryFrame,
+            origin: job.origin,
+            first: job.first,
         },
-        clock,
-        end_hint,
+        job.clock,
+        job.end_hint,
     )
     .map_err(|e| e.to_string())?;
     Ok(WriteReport {
@@ -625,6 +784,7 @@ fn write_frames(
         frames: report.frames,
         width: report.width,
         height: report.height,
+        start: report.start,
     })
 }
 
@@ -676,6 +836,7 @@ fn monitor_index(rect: Option<crate::source::ScreenRect>) -> usize {
 ///   per-monitor sound on Windows, so "this screen's sound" and "this
 ///   computer's sound" are the same thing — the option lives on the desktop
 ///   source instead of on a monitor.
+#[allow(clippy::too_many_arguments)]
 fn start_av(
     src: &Source,
     out: PathBuf,
@@ -683,6 +844,8 @@ fn start_av(
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
     bitrate: u32,
     audio_bitrate_kbps: u32,
+    origin: Origin,
+    first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> Result<StartedAv> {
     // What to capture, and what to listen to while capturing it. Both are
     // settled before anything opens: an unreachable target must fail before a
@@ -736,6 +899,8 @@ fn start_av(
             clock,
             end_hint,
             crop,
+            origin,
+            first,
         )
     });
 
@@ -783,6 +948,8 @@ fn write_av(
     clock: TakeClock,
     end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
     crop: takekit_media::writer::CropBox,
+    origin: Origin,
+    first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> std::result::Result<WriteReport, String> {
     use std::sync::atomic::Ordering;
     use takekit_media::writer::{crop_frame, even_frame};
@@ -791,14 +958,24 @@ fn write_av(
         .recv()
         .map_err(|_| "the sound capture never reported a format".to_string())?;
 
-    let first = loop {
+    let first_frame = loop {
         match vrx.recv() {
             Ok(MediaFrame::Video(frame)) => break frame,
             Ok(_) => {}
             Err(_) => return Err("the window never delivered a frame".into()),
         }
     };
-    let first = even_frame(crop_frame(first, crop));
+    // The file's timeline, latched off the first picture: zero is the take's
+    // origin for a source that was there from the start, and this frame's own
+    // instant for one that joined mid-take (see `Origin`).
+    let base = match origin {
+        Origin::Take => 0,
+        Origin::FirstSample => first_frame.time,
+    };
+    if let Some(tx) = first.as_ref() {
+        let _ = tx.try_send(base);
+    }
+    let first = even_frame(crop_frame(first_frame, crop));
     let size = (first.width, first.height);
 
     let sink = MuxSink::create(&out).map_err(|e| e.to_string())?;
@@ -808,8 +985,13 @@ fn write_av(
     let mut audio = sink
         .add_audio(rate, channels, audio_bitrate_kbps)
         .map_err(|e| e.to_string())?;
+    // Sound that was buffered before this picture arrived belongs to this
+    // file, shifted onto its timeline like everything else.
+    audio.set_origin(base);
     sink.begin().map_err(|e| e.to_string())?;
-    video.write(&first).map_err(|e| e.to_string())?;
+    video
+        .write_at(&first, first.time - base)
+        .map_err(|e| e.to_string())?;
 
     let mut frames = 1u64;
     loop {
@@ -822,8 +1004,11 @@ fn write_av(
         }
         match vrx.recv_timeout(std::time::Duration::from_millis(2)) {
             Ok(MediaFrame::Video(frame)) => {
+                let at = frame.time;
                 let frame = even_frame(crop_frame(frame, crop));
-                video.write(&frame).map_err(|e| e.to_string())?;
+                video
+                    .write_at(&frame, at - base)
+                    .map_err(|e| e.to_string())?;
                 frames += 1;
             }
             Ok(_) => {}
@@ -842,14 +1027,16 @@ fn write_av(
         0 => clock.now_100ns(),
         t => t,
     };
-    video.flush(Some(end)).map_err(|e| e.to_string())?;
+    let span = (end - base).max(0);
+    video.flush(Some(span)).map_err(|e| e.to_string())?;
     let audio_end = audio.end();
     sink.finalize().map_err(|e| e.to_string())?;
     Ok(WriteReport {
-        seconds: end.max(audio_end) as f64 / 10_000_000.0,
+        seconds: span.max(audio_end) as f64 / 10_000_000.0,
         frames,
         width: size.0,
         height: size.1,
+        start: Some(base),
     })
 }
 
@@ -864,6 +1051,9 @@ struct WriteReport {
     /// The size the file was written at; `0 x 0` when nothing was written.
     width: u32,
     height: u32,
+    /// Take-time the file begins at, in 100 ns units. `None` when nothing was
+    /// written at all.
+    start: Option<i64>,
 }
 
 /// The camera's Media Foundation symbolic link, matched from the name the
@@ -913,13 +1103,14 @@ fn start_audio_media(
     out: PathBuf,
     clock: TakeClock,
     bitrate_kbps: u32,
+    first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> Result<StartedAudio> {
     // Bounded like the video one, but much deeper: chunks are tiny, and a
     // dropped chunk pulls the rest of the file earlier (audio is written back
     // to back) — only a writer stuck for whole seconds should ever fill it.
     let (tx, rx) = std::sync::mpsc::sync_channel::<MediaFrame>(takekit_media::AUDIO_QUEUE);
     let (format_tx, format_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || write_audio(rx, format_rx, out, bitrate_kbps));
+    let handle = std::thread::spawn(move || write_audio(rx, format_rx, out, bitrate_kbps, first));
 
     let (capture, format) = match &src.capture {
         Capture::Mic { device } => {
@@ -971,11 +1162,16 @@ fn start_audio_media(
 /// arrived: chunks are written back to back, so there is no end hint to latch
 /// (unlike the video writer's held frame), but the lead-in silence that pads a
 /// late-waking device does belong to the take and does count.
+///
+/// The first chunk sets the file's origin, which is what a source added
+/// mid-take needs: its file opens where its sound begins instead of with
+/// however many minutes of silence it missed.
 fn write_audio(
     rx: std::sync::mpsc::Receiver<MediaFrame>,
     format_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     out: PathBuf,
     bitrate_kbps: u32,
+    first: Option<std::sync::mpsc::SyncSender<i64>>,
 ) -> std::result::Result<WriteReport, String> {
     use takekit_media::AudioWriter;
 
@@ -985,18 +1181,28 @@ fn write_audio(
     let mut writer =
         AudioWriter::create(&out, rate, channels, bitrate_kbps).map_err(|e| e.to_string())?;
     let mut chunks = 0u64;
+    let mut origin: Option<i64> = None;
     while let Ok(frame) = rx.recv() {
         if let MediaFrame::Audio(chunk) = frame {
+            if origin.is_none() {
+                origin = Some(chunk.time);
+                writer.set_origin(chunk.time);
+                if let Some(tx) = first.as_ref() {
+                    let _ = tx.try_send(chunk.time);
+                }
+            }
             chunks += 1;
             writer.write(&chunk).map_err(|e| e.to_string())?;
         }
     }
     let end = writer.finish().map_err(|e| e.to_string())?;
+    let at = origin.unwrap_or(end);
     Ok(WriteReport {
-        seconds: end as f64 / 10_000_000.0,
+        seconds: (end - at).max(0) as f64 / 10_000_000.0,
         frames: chunks,
         width: 0,
         height: 0,
+        start: origin,
     })
 }
 
@@ -1040,6 +1246,10 @@ struct Running {
     child: Child,
     log: PathBuf,
     out: PathBuf,
+    fps: u32,
+    /// Take-time the child was launched at. The only offset an ffmpeg child can
+    /// offer: it files its own clock, and nothing here sees its frames.
+    start: Option<i64>,
 }
 
 /// A live recording. Dropping it always shuts the encoders down gracefully, so
@@ -1052,15 +1262,27 @@ pub struct Recording {
     /// Sources captured in-process through the OS APIs. Empty unless the take
     /// runs on `Backend::Windows`.
     media: Vec<MediaRunning>,
-    /// The take's own timeline. Kept so `stop` can latch one end instant for
-    /// every channel; `None` on the ffmpeg path, where each child files its
-    /// own clock.
-    media_clock: Option<(TakeClock, std::sync::Arc<std::sync::atomic::AtomicI64>)>,
+    /// The take's own timeline: one origin, taken before the first capture
+    /// opened, that every source's `start` is measured against — including a
+    /// source that joins ten minutes in. A clock per source would make each
+    /// one's offset true only to itself.
+    clock: TakeClock,
+    /// The instant the take ended, latched when `stop` begins so every file
+    /// covers exactly the same stretch of the timeline.
+    end_hint: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// What a source added later has to be started with. Kept on the recording
+    /// because a take that can still grow has to remember how it was started.
+    backend: Backend,
+    ffmpeg: PathBuf,
+    probe: PathBuf,
+    encoder: Encoder,
+    /// Session-wide quality; a source may override it.
+    quality: u8,
+    engine: Engine,
     /// Milliseconds each encoder took to be spawned, in source order. This is
     /// the skew the capture starts with before any frame is written.
     spawn_ms: Vec<(String, u64)>,
     marks: Option<Marks>,
-    probe: PathBuf,
     started: Instant,
 }
 
@@ -1074,6 +1296,9 @@ pub struct LiveSource {
     /// what it is recording is no longer what the user picked.
     pub usable: bool,
     pub bytes: u64,
+    /// Where its file begins on the take's timeline, in seconds. `None` until
+    /// the first sample (a source added mid-take) or when it never wrote one.
+    pub start: Option<f64>,
 }
 
 impl Recording {
@@ -1099,8 +1324,23 @@ impl Recording {
         self.take.path_for(id)
     }
 
+    /// What this take is recording, in the order it started.
+    ///
+    /// A caller that wants to add a source mid-take needs it: ids name the
+    /// output files, so a new one has to be checked against what is already
+    /// there rather than against whatever list the request came from.
+    pub fn sources(&self) -> Vec<Source> {
+        self.take
+            .manifest
+            .sources
+            .iter()
+            .map(|s| s.source.clone())
+            .collect()
+    }
+
     /// Poll every source. Cheap enough for a 4 Hz UI tick.
     pub fn snapshot(&mut self) -> Vec<LiveSource> {
+        let secs = |t: Option<i64>| t.map(|t| t as f64 / 10_000_000.0);
         let mut out: Vec<LiveSource> = self
             .running
             .iter_mut()
@@ -1109,6 +1349,7 @@ impl Recording {
                 alive: matches!(r.child.try_wait(), Ok(None)),
                 usable: is_recordable(&r.capture),
                 bytes: std::fs::metadata(&r.out).map(|m| m.len()).unwrap_or(0),
+                start: secs(r.start),
             })
             .collect();
         out.extend(self.media.iter_mut().map(|m| {
@@ -1122,6 +1363,7 @@ impl Recording {
                 bytes: std::fs::metadata(&m.out)
                     .map(|meta| meta.len())
                     .unwrap_or(0),
+                start: secs(m.start),
             }
         }));
         out
@@ -1170,63 +1412,39 @@ impl Recording {
         // channel alike. Latched before anything is torn down; writers hold
         // their last frame to this instant so the files end together instead
         // of by however long each drain happened to take.
-        if let Some((clock, end)) = &self.media_clock {
-            end.store(clock.now_100ns(), std::sync::atomic::Ordering::SeqCst);
-        }
-        // Sources are independent processes and files: stop them and probe
-        // their durations in parallel. Serial ffmpeg shutdown plus one ffprobe
-        // per source was the bulk of stop latency.
+        self.end_hint
+            .store(self.clock.now_100ns(), std::sync::atomic::Ordering::SeqCst);
+        // Where each source's file is, resolved once: the workers below
+        // finalise and verify in parallel and must not borrow the take to ask.
+        let files: Vec<(String, PathBuf)> = self
+            .take
+            .manifest
+            .sources
+            .iter()
+            .map(|s| (s.id.clone(), self.take.dir.join(&s.file)))
+            .collect();
         let probe = self.probe.clone();
-        let collected: Vec<Outcome> = std::thread::scope(|scope| {
+
+        // Sources are independent processes and files: stop them, finalise them
+        // and verify them in parallel. Serial ffmpeg shutdown plus one ffprobe
+        // per source was the bulk of stop latency — and the per-source checklist
+        // a stop screen shows is this same event stream, which is why every
+        // worker reports its own outcome the moment its file lands instead of
+        // queueing results for the caller to walk through.
+        let collected: Vec<Collected> = std::thread::scope(|scope| {
             let mut jobs: Vec<_> = self
                 .running
                 .iter_mut()
                 .map(|r| {
                     let probe = &probe;
+                    let files = &files;
                     let on_source = &on_source;
                     scope.spawn(move || {
                         ffmpeg::stop(&mut r.child);
-
-                        let bytes = std::fs::metadata(&r.out).map(|m| m.len()).unwrap_or(0);
-                        let outcome = if bytes == 0 {
-                            // The signature that names the failure (e.g.
-                            // "Could not find output pin") need not be in the
-                            // last lines, so classification reads a wide
-                            // window; only the verbatim fallback quotes the
-                            // tail.
-                            let wide = ffmpeg::tail(&r.log, 20);
-                            let device = r.capture.device_name();
-                            Collected {
-                                id: r.id.clone(),
-                                bytes: 0,
-                                seconds: None,
-                                frames: None,
-                                size: None,
-                                error: Some(match diagnose::classify(&wide, device) {
-                                    Some(code) => code,
-                                    None => {
-                                        let tail = ffmpeg::tail(&r.log, 3);
-                                        if tail.is_empty() {
-                                            diagnose::FFMPEG_DIED.to_string()
-                                        } else {
-                                            tail
-                                        }
-                                    }
-                                }),
-                            }
-                        } else {
-                            Collected {
-                                id: r.id.clone(),
-                                bytes,
-                                seconds: ffmpeg::duration(probe, &r.out),
-                                frames: None,
-                                size: None,
-                                error: None,
-                            }
-                        }
-                        .into_outcome();
-                        on_source(&outcome);
-                        outcome
+                        let mut c = collect_ffmpeg(r);
+                        c.verify(probe, files);
+                        on_source(&c.outcome());
+                        c
                     })
                 })
                 .collect();
@@ -1234,11 +1452,14 @@ impl Recording {
             // ones: stopping a capture waits for its frames to stop arriving,
             // and doing that serially would be stop latency the user feels.
             for m in self.media.iter_mut() {
+                let probe = &probe;
+                let files = &files;
                 let on_source = &on_source;
                 jobs.push(scope.spawn(move || {
-                    let outcome = m.finish().into_outcome();
-                    on_source(&outcome);
-                    outcome
+                    let mut c = m.finish();
+                    c.verify(probe, files);
+                    on_source(&c.outcome());
+                    c
                 }));
             }
             jobs.into_iter()
@@ -1247,12 +1468,15 @@ impl Recording {
         });
 
         let mut sources = Vec::with_capacity(collected.len());
-        for o in collected {
-            if o.bytes > 0 {
-                self.take.set_duration(&o.id, o.seconds);
-                self.take.set_frames(&o.id, o.frames);
+        for c in collected {
+            if c.bytes > 0 {
+                self.take.set_duration(&c.id, c.seconds);
+                self.take.set_frames(&c.id, c.frames);
+                self.take
+                    .set_start(&c.id, c.start.map(|t| t as f64 / 10_000_000.0));
+                self.take.set_probed(&c.id, c.probed);
             }
-            sources.push(o);
+            sources.push(c.outcome());
         }
 
         self.take.manifest.duration = self
@@ -1276,9 +1500,58 @@ impl Recording {
     }
 }
 
+/// Read one finished ffmpeg child: its size on disk and, when it wrote
+/// nothing, why not. The duration needs ffprobe and comes in `verify`.
+fn collect_ffmpeg(r: &Running) -> Collected {
+    let bytes = std::fs::metadata(&r.out).map(|m| m.len()).unwrap_or(0);
+    if bytes == 0 {
+        // The signature that names the failure (e.g. "Could not find output
+        // pin") need not be in the last lines, so classification reads a wide
+        // window; only the verbatim fallback quotes the tail.
+        let wide = ffmpeg::tail(&r.log, 20);
+        let device = r.capture.device_name();
+        return Collected {
+            id: r.id.clone(),
+            bytes: 0,
+            // Nothing was written, so its file has no place on the timeline to
+            // claim.
+            start: None,
+            seconds: None,
+            frames: None,
+            size: None,
+            probed: None,
+            fps: r.fps,
+            error: Some(match diagnose::classify(&wide, device) {
+                Some(code) => code,
+                None => {
+                    let tail = ffmpeg::tail(&r.log, 3);
+                    if tail.is_empty() {
+                        diagnose::FFMPEG_DIED.to_string()
+                    } else {
+                        tail
+                    }
+                }
+            }),
+        };
+    }
+    Collected {
+        id: r.id.clone(),
+        bytes,
+        start: r.start,
+        seconds: None,
+        frames: None,
+        size: None,
+        probed: None,
+        fps: r.fps,
+        error: None,
+    }
+}
+
 struct Collected {
     id: String,
     bytes: u64,
+    /// Take-time its file begins at, in 100 ns units.
+    start: Option<i64>,
     seconds: Option<f64>,
     /// Frames the capture actually delivered. `None` when the source failed
     /// before counting could start; the output's slot count is
@@ -1288,18 +1561,54 @@ struct Collected {
     /// the backend cannot say (the ffmpeg path reports through ffprobe's
     /// duration only).
     size: Option<(u32, u32)>,
+    /// ffprobe's own reading of the finished file. `None` when no binary is
+    /// installed or ffprobe could not read the container.
+    probed: Option<f64>,
+    fps: u32,
     error: Option<String>,
 }
 
 impl Collected {
-    fn into_outcome(self) -> Outcome {
+    /// Read the finished file with ffprobe — the second authority.
+    ///
+    /// The writer's own length comes from the clock it wrote with, so it cannot
+    /// disagree with itself. The container is a different authority, and the
+    /// only one that can say the file really is as long as the manifest claims.
+    /// Skipped when ffmpeg is not installed (the Windows backend needs no
+    /// binary), and then `probed` stays null: saying nothing is honest,
+    /// guessing is not.
+    fn verify(&mut self, probe: &Path, files: &[(String, PathBuf)]) {
+        if self.bytes == 0 {
+            return;
+        }
+        let Some(file) = files.iter().find(|(id, _)| *id == self.id).map(|(_, p)| p) else {
+            return;
+        };
+        let probed = if probe.as_os_str().is_empty() {
+            None
+        } else {
+            ffmpeg::duration(probe, file)
+        };
+        // The ffmpeg path has no in-process writer to ask, so ffprobe's reading
+        // is the only length it will ever have.
+        if self.seconds.is_none() {
+            self.seconds = probed;
+        }
+        self.probed = probed;
+    }
+
+    fn outcome(&self) -> Outcome {
         Outcome {
-            id: self.id,
+            id: self.id.clone(),
+            start: self.start.map(|t| t as f64 / 10_000_000.0),
             seconds: self.seconds,
             bytes: self.bytes,
             frames: self.frames,
             size: self.size,
-            error: self.error,
+            probed: self.probed,
+            error: self.error.clone(),
+            warning: crate::take::length_mismatch(self.seconds, self.probed, self.fps)
+                .then(|| "len.mismatch".to_string()),
         }
     }
 }
@@ -1326,6 +1635,9 @@ impl Drop for Recording {
 #[derive(Debug)]
 pub struct Outcome {
     pub id: String,
+    /// Where its file begins on the take's timeline, in seconds. `None` when
+    /// nothing was written.
+    pub start: Option<f64>,
     pub seconds: Option<f64>,
     pub bytes: u64,
     /// Frames the capture delivered (`takekit-media` sources; `None` on the
@@ -1335,9 +1647,16 @@ pub struct Outcome {
     /// The size the file was written at (`takekit-media` sources; `None` on
     /// the ffmpeg path). What a progress checklist shows as the resolution.
     pub size: Option<(u32, u32)>,
+    /// What ffprobe measured in the finished file. Beside `seconds` rather
+    /// than instead of it, so a reader can see the two authorities agree.
+    pub probed: Option<f64>,
     /// Why nothing was written: the source's log tail, or a stand-in line when
     /// even the log came back empty.
     pub error: Option<String>,
+    /// Recorded, but not quite what the manifest says — a code like
+    /// `len.mismatch`, which the panel puts into words. Separate from `error`
+    /// because the file is usable: it is the bookkeeping that is off.
+    pub warning: Option<String>,
 }
 
 impl Outcome {
@@ -1550,7 +1869,13 @@ impl Session {
         Ok(Prepared {
             backend: Backend::Windows,
             ffmpeg: PathBuf::new(),
-            probe: PathBuf::new(),
+            // Not needed to record, but worth finding: it is what checks every
+            // finished file's length against the manifest afterwards. Without
+            // it `probed` stays null and the take says so, which is better
+            // than a number nobody verified.
+            probe: ffmpeg::locate()
+                .map(|f| ffmpeg::ffprobe(&f))
+                .unwrap_or_default(),
             // Both unused on this path: the engine only steers ffmpeg input
             // flags, and the manifest names the encoder `mf-h264`.
             engine: Engine::Gdi,
@@ -1615,11 +1940,14 @@ mod tests {
     fn outcome(id: &str, seconds: Option<f64>, bytes: u64) -> Outcome {
         Outcome {
             id: id.into(),
+            start: None,
             seconds,
             bytes,
             frames: None,
             size: None,
+            probed: None,
             error: None,
+            warning: None,
         }
     }
 
@@ -1631,25 +1959,54 @@ mod tests {
         let sized = Collected {
             id: "a".into(),
             bytes: 10,
+            start: Some(0),
             seconds: Some(1.0),
             frames: Some(30),
             size: Some((1920, 1080)),
+            probed: Some(1.02),
+            fps: 30,
             error: None,
         }
-        .into_outcome();
+        .outcome();
         assert_eq!(sized.size, Some((1920, 1080)));
+        assert_eq!(sized.start, Some(0.0));
+        assert_eq!(sized.probed, Some(1.02));
+        // 20 ms apart at 30 fps is the same number said twice.
+        assert_eq!(sized.warning, None);
 
         let blank = Collected {
             id: "b".into(),
             bytes: 0,
+            start: None,
             seconds: None,
             frames: None,
             size: None,
+            probed: None,
+            fps: 30,
             error: Some("boom".into()),
         }
-        .into_outcome();
+        .outcome();
         assert_eq!(blank.size, None);
         assert_eq!(blank.error.as_deref(), Some("boom"));
+    }
+
+    /// A file that really is a different length from the manifest is flagged,
+    /// not rounded away — the panel turns the code into a sentence and the
+    /// manifest keeps both numbers.
+    #[test]
+    fn a_container_that_disagrees_is_flagged() {
+        let c = Collected {
+            id: "a".into(),
+            bytes: 10,
+            start: Some(0),
+            seconds: Some(10.0),
+            frames: Some(300),
+            size: Some((1920, 1080)),
+            probed: Some(10.6),
+            fps: 30,
+            error: None,
+        };
+        assert_eq!(c.outcome().warning.as_deref(), Some("len.mismatch"));
     }
 
     #[test]

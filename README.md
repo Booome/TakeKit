@@ -29,7 +29,12 @@ frame rate. Separate encoders keep every source at its own rate.
   title), the **whole desktop**, and **DirectShow capture devices** (webcams,
   phones acting as webcams).
 - One timestamped directory per take, with a `take.json` manifest recording the
-  encoder, the sources and each file's duration.
+  encoder, and for every source **where its file starts on the take's timeline
+  and how long it is** — so a source added halfway through is placed by the
+  manifest, not by guesswork.
+- **A take can grow while it records**: add a window, screen, camera or sound
+  source mid-take and it joins immediately. Its own file begins at its first
+  frame, and that instant goes into the manifest.
 - **Hardware encoding when it works**: NVENC, then QSV, then AMF, falling back to
   libx264. Each candidate is probed with a one-frame encode, so a machine that
   reports an encoder but cannot actually use it still gets a working run.
@@ -86,7 +91,10 @@ MIT. See [LICENSE](LICENSE).
 
 - 源：**窗口**（按窗口句柄 `--window "#12345"`，或按唯一标题）、**整个桌面**、**DirectShow 采集设备**（摄像头、当摄像头用的手机）
 - 桌面面板（Tauri，`crates/takekit-gui`）：列可录的源、记住上次的设置、保存录制历史（点一条直接进目录）
-- 每次录制一个时间戳目录，带 `take.json`（编码器、各源、各自时长）
+- 每次录制一个时间戳目录，带 `take.json`：编码器，以及**每个源的文件在时间轴上的起点和长度**
+  ——所以录到一半加进来的源也是清单说了算，不靠猜
+- **录到一半还能加源**：窗口、桌面、摄像头、声音都可以中途加入，立刻开录；新文件从它自己的
+  第一帧起算，那个时刻写进清单
 - **有硬件就用**：NVENC → QSV → AMF → libx264，每个都用一帧试编来验证，避免「驱动说有、实际用不了」
 - 录完报告各源之间的时长差
 

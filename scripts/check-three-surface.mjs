@@ -132,6 +132,17 @@ try {
   const desk = (snapshot.sources || [])[2];
   record("desktop-source-keeps-its-capture", Boolean(desk && desk.capture && desk.capture.Desktop),
     JSON.stringify(desk?.capture));
+
+  // `takekit_record_add_source` is the door to the take that is running. No
+  // take is running here (and starting one would film the user's screen), so
+  // what is proved is the wiring: schema → stdio → HTTP → the handler that
+  // knows this is not the saved list. A 409 naming the state is exactly right;
+  // a 404 or an unknown tool would mean the three surfaces drifted.
+  const liveTool = tools.find((t) => t.name === "takekit_record_add_source");
+  record("mcp-live-add-schema", Boolean(liveTool) && /start/.test(liveTool?.description || ""),
+    (liveTool?.description || "").slice(0, 60));
+  const live = await call("takekit_record_add_source", { kind: "desktop" });
+  record("mcp-live-add-without-a-take", Boolean(live.error), live.text.slice(0, 120));
 } finally {
   mcp.stdin.end();
   mcp.kill();

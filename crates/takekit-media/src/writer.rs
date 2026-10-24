@@ -236,6 +236,10 @@ pub struct AudioWriter {
     /// Whether any chunk has been written yet, so the lead-in silence the
     /// video writer's black sample plays against is written exactly once.
     started: bool,
+    /// The take-time this file treats as zero. `0` for a source that was there
+    /// from the start; a source added mid-take sets its own first sample, so
+    /// its file opens where its sound begins (see `Origin`).
+    origin: i64,
 }
 
 impl AudioWriter {
@@ -257,7 +261,18 @@ impl AudioWriter {
             bytes_per_second: sample_rate * channels * 2,
             next: None,
             started: false,
+            origin: 0,
         }
+    }
+
+    /// Start this file's timeline at `origin` instead of at zero.
+    ///
+    /// Called before the first chunk is written. A source added mid-take sets
+    /// its own first sample here, which is what keeps its file from opening
+    /// with minutes of silence: the manifest's `start` records where it belongs
+    /// on the take's timeline instead.
+    pub fn set_origin(&mut self, origin: i64) {
+        self.origin = origin;
     }
 
     /// How far the file's timeline reaches, in 100 ns units from the take's
@@ -277,7 +292,11 @@ impl AudioWriter {
             return Ok(());
         }
         let duration = duration_of(chunk.data.len(), self.bytes_per_second);
-        let start = self.next.unwrap_or(chunk.time);
+        // Measured from this file's own origin. A chunk that arrived before
+        // that origin (sound can arrive before the picture it belongs to) is
+        // pinned to zero rather than written at a negative time, which MP4
+        // cannot express.
+        let start = self.next.unwrap_or((chunk.time - self.origin).max(0));
         if !self.started && start > 0 {
             // The microphone woke up after the take did: fill the gap with
             // silence so the file's timeline keeps the shared origin, exactly
@@ -701,6 +720,7 @@ pub enum Sampling {
 /// much of the take is a held picture rather than a fresh one, which is the
 /// only visible form a dropped capture update can take.
 pub struct StreamReport {
+    /// How long the file is, in seconds.
     pub seconds: f64,
     pub frames: u64,
     /// The size the file was written at (crop applied, even-aligned) — the
@@ -708,17 +728,65 @@ pub struct StreamReport {
     /// `0 x 0` when no frame ever arrived.
     pub width: u32,
     pub height: u32,
+    /// Take-time of the sample the file begins with, in 100 ns units. `None`
+    /// when nothing was ever written. This is the number a manifest's `start`
+    /// is made of: it says where the file belongs on the take's timeline, and
+    /// `seconds` says how much of it the file covers.
+    pub start: Option<i64>,
+}
+
+/// Where a file's own timeline begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Zero is the take's origin. A source whose device wakes up late is
+    /// padded with black to keep its content where the take clock put it, so
+    /// the file really does start with the take (see `VideoWriter::write_timed`).
+    Take,
+    /// Zero is this file's own first sample.
+    ///
+    /// For a source that joined a take already running: padding it back to the
+    /// take's origin would mean encoding every second it missed as black
+    /// frames — a minute into a take that is eighteen hundred frames of encode
+    /// before the first real one, and the live frames arriving meanwhile queue
+    /// behind it. The manifest's `start` says where the file belongs instead.
+    FirstSample,
 }
 
 /// What one file is supposed to look like: the four numbers that used to be
 /// four more positional arguments to `write_stream`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Encode {
     pub fps: u32,
     pub bitrate: u32,
     /// The rectangle to keep, in the frames' own pixels.
     pub crop: CropBox,
     pub sampling: Sampling,
+    pub origin: Origin,
+    /// Told the take-time of the file's first sample the moment it is known.
+    ///
+    /// A source added mid-take has to write that number into the manifest
+    /// straight away — waiting for the file to close would mean a take on disk
+    /// that cannot say where its newest file belongs. `try_send` on the writer
+    /// side, so a caller that has already given up never stalls the encoder.
+    pub first: Option<std::sync::mpsc::SyncSender<i64>>,
+}
+
+/// Latch a file's origin against the first sample seen, and report it once.
+fn latch_origin(
+    base: &mut Option<i64>,
+    reported: &mut bool,
+    first: Option<&std::sync::mpsc::SyncSender<i64>>,
+    t: i64,
+) -> i64 {
+    let origin = *base.get_or_insert(t);
+    if !*reported {
+        *reported = true;
+        if let Some(tx) = first {
+            // Never blocks: the receiver may have timed out and gone away.
+            let _ = tx.try_send(origin);
+        }
+    }
+    origin
 }
 
 /// Drain one source's frame channel into its own MP4. The writer opens on the
@@ -743,6 +811,8 @@ pub fn write_stream(
         bitrate,
         crop,
         sampling,
+        origin,
+        first,
     } = encode;
     let fps = fps.max(1);
     let interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
@@ -752,6 +822,13 @@ pub fn write_stream(
     let mut frames = 0u64;
     let mut latest: Option<VideoFrame> = None;
     let mut due_slot = 0u64;
+    // Where this file's timeline begins: zero for a source that was there from
+    // the start, the first sample's take-time for one added mid-take.
+    let mut base = match origin {
+        Origin::Take => Some(0),
+        Origin::FirstSample => None,
+    };
+    let mut reported = false;
 
     loop {
         match sampling {
@@ -759,11 +836,15 @@ pub fn write_stream(
                 Ok(MediaFrame::Video(frame)) => {
                     frames += 1;
                     let frame = even_frame(crop_frame(frame, crop));
+                    let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
                     if video.is_none() {
                         size = (frame.width, frame.height);
                         video = Some(open_for(&frame, out, fps, bitrate)?);
                     }
-                    video.as_mut().expect("opened above").write(&frame)?;
+                    video
+                        .as_mut()
+                        .expect("opened above")
+                        .write_at(&frame, frame.time - at)?;
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -789,6 +870,7 @@ pub fn write_stream(
                 let end_slot = (clock.now_100ns() as u64 * fps as u64) / 10_000_000;
                 while due_slot < end_slot {
                     if let Some(frame) = latest.as_ref() {
+                        let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
                         if video.is_none() {
                             size = (frame.width, frame.height);
                             video = Some(open_for(frame, out, fps, bitrate)?);
@@ -797,7 +879,7 @@ pub fn write_stream(
                         video
                             .as_mut()
                             .expect("opened above")
-                            .write_at(frame, slot_time)?;
+                            .write_at(frame, slot_time - at)?;
                     }
                     due_slot += 1;
                 }
@@ -811,6 +893,7 @@ pub fn write_stream(
             frames,
             width: 0,
             height: 0,
+            start: None,
         });
     };
     // How long the last frame was on screen is something only the caller
@@ -821,12 +904,18 @@ pub fn write_stream(
         0 => clock.now_100ns(),
         t => t,
     };
-    w.finish_at(Some(end))?;
+    // Measured from this file's own origin: for a source that started with the
+    // take that is the take's length, for one added mid-take it is the stretch
+    // it actually covered.
+    let at = base.unwrap_or(end);
+    let span = (end - at).max(0);
+    w.finish_at(Some(span))?;
     Ok(StreamReport {
-        seconds: end as f64 / 10_000_000.0,
+        seconds: span as f64 / 10_000_000.0,
         frames,
         width: size.0,
         height: size.1,
+        start: Some(at),
     })
 }
 
@@ -1059,6 +1148,8 @@ mod tests {
                     right: 4,
                 },
                 sampling: Sampling::EveryFrame,
+                origin: Origin::Take,
+                first: None,
             },
             crate::clock::TakeClock::start(),
             std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -1066,6 +1157,50 @@ mod tests {
         .unwrap();
         assert_eq!((report.width, report.height), (96, 50), "crop right=4 kept");
         assert_eq!(report.frames, 2);
+    }
+
+    /// A file that starts with its own first sample says so, and reports the
+    /// instant once — this is what a manifest writes down as `start`.
+    #[test]
+    fn a_first_sample_origin_is_reported_once() {
+        let dir = std::env::temp_dir().join("takekit-writer-origin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.mp4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        // 12 s into the take, the way a source added mid-recording arrives.
+        for t in [120_000_000i64, 120_333_333] {
+            tx.send(crate::frame::MediaFrame::Video(VideoFrame {
+                width: 128,
+                height: 64,
+                format: PixelFormat::Bgra,
+                data: vec![0; 128 * 64 * 4],
+                time: t,
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let (watch_tx, watch_rx) = std::sync::mpsc::sync_channel(4);
+        let report = write_stream(
+            rx,
+            &path,
+            Encode {
+                fps: 30,
+                bitrate: 2_000,
+                crop: CropBox::default(),
+                sampling: Sampling::EveryFrame,
+                origin: Origin::FirstSample,
+                first: Some(watch_tx),
+            },
+            crate::clock::TakeClock::start(),
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        )
+        .unwrap();
+        assert_eq!(report.start, Some(120_000_000));
+        assert_eq!(watch_rx.try_recv().ok(), Some(120_000_000));
+        assert!(watch_rx.try_recv().is_err(), "reported once, not per frame");
+        // The file covers what it recorded, not the twelve seconds it missed.
+        assert!(report.seconds < 1.0, "got {}", report.seconds);
     }
 
     #[test]

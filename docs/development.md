@@ -108,6 +108,27 @@ crates/
   → main.js showSaved()：failed>0 才弹浮窗；随后 refreshJournal()
 ```
 
+**录制中动态加源（2026-10-24）**
+
+```
+面板「添加源」/ 托盘「添加源」/ `ctl add-live` / MCP `takekit_record_add_source`
+  → POST /record/sources（或 tauri 命令 add_live_source）
+  → Recording::add_source(Source)
+       ├─ take.json 先落一行（start=null，added_at=现在）：中途崩了也看得出这条源存在过
+       ├─ 复用 take 的同一个 TakeClock 起采集/编码器；writer 用 Origin::FirstSample
+       │   （文件从自己的第一帧起算，不补黑：一小时处加的源补黑要白编 10 万帧，
+       │    而且那段时间实时帧只会在有界队列里排队被丢掉）
+       ├─ 第一帧的 take 时间经通道回传 → 写进 start、立刻重写 take.json → 返回给界面
+       └─ 失败只回滚这一条源（清掉刚写的行），整条 take 照旧录
+  → 停止时每份文件 ffprobe 复核：probed 与 duration 差 > 一帧半 → 打 `len.mismatch`
+```
+
+**take.json 的每条源都有起点**：`start`（该文件在本条 take 时间轴上的秒数）+ `duration`（文件
+长度）。`start + duration ≈ manifest.duration`，这是可以机械核对的恒等式；`start_clock` 说明
+`start` 怎么来的——`frames` = 首帧自己的时间戳（Windows 后端，准），`spawn` = ffmpeg 子进程
+启动时刻（该后端看不到帧，误差 = 启动延迟）。`added_at` 只在录制中加入的源上出现，它和 `start`
+的差就是设备唤醒花了多久。
+
 ffmpeg 后端的数据流差异：`begin` 里每个窗口源 `bring_to_front` → `Session::prepare`
 带最长 2 秒的编码器/引擎探测 → 每源 spawn 一个 ffmpeg 子进程（详见 `source.rs` 的
 `input_args`）。
@@ -115,6 +136,10 @@ ffmpeg 后端的数据流差异：`begin` 里每个窗口源 `bring_to_front` �
 ---
 
 ## 4. 实现契约（改前必读，踩过坑才定下的）
+
+0. **一条 take 只有一条时间轴**。`TakeClock` 在第一个采集打开之前建立，之后**所有**源（包括
+   录制中途加的）都用它，每份文件的 `start` 必须来自它自己的**第一帧**而不是用户点击的时刻。
+   一个源一个钟，每个偏移就只对它自己成立，`take.json` 也就不再是可核对的东西。
 
 1. **窗口的身份是 hwnd，不是标题**。`Capture::Window{hwnd,title,crop}`，`title` 只用于显示和兜底。重名窗口曾导致"按 F9 只闪一下"。
 2. **位置记忆**：物理像素、建窗时定位（不是先摆默认位再移）、拖动 400ms 限流；`-32000` 最小化哨兵**两轴都是才判否**，写入侧拦、读取侧也过滤（详见 DESIGN §4.10）。

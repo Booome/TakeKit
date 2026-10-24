@@ -13,13 +13,72 @@ use crate::source::Source;
 pub struct SourceRecord {
     pub id: String,
     pub file: String,
+    /// Where this file belongs on the take's timeline, in seconds from the
+    /// take's origin — and how many seconds of media it holds. The pair is the
+    /// contract every reader of a take works from: a clip sits at `start` and
+    /// is `duration` long. `None` until the file has a first sample.
+    ///
+    /// A source that was there from the start says `0` even when its device
+    /// woke up late: its file pays for the wait with black frames, so the file
+    /// really does begin at the take's origin (see `takekit_media::writer`).
+    /// A source added mid-take begins at its own first sample, and `start` is
+    /// that instant — nothing was recorded before it, and nothing in the file
+    /// pretends otherwise.
+    #[serde(default)]
+    pub start: Option<f64>,
     pub duration: Option<f64>,
     /// Frames the capture delivered (Windows-API sources). The file itself has
     /// `duration x fps` slots — a pause is held frames — so this number says
     /// how much of the take was a fresh picture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<u64>,
+    /// Take-time at which this source was asked for mid-take. `None` for a
+    /// source that was in the list before the take began.
+    ///
+    /// Kept separate from `start` on purpose: the difference between the two is
+    /// the time the device took to wake up, which is the only evidence of how
+    /// honest `start` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<f64>,
+    /// What ffprobe measured in the finished file, when it could be run.
+    ///
+    /// Carried beside `duration` rather than folded into it: a disagreement is
+    /// a fact about the take, and rounding it away is how a manifest stops
+    /// being worth reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed: Option<f64>,
     pub source: Source,
+}
+
+impl SourceRecord {
+    /// How far `probed` sits from `duration`. `None` when nothing measured it.
+    pub fn length_error(&self) -> Option<f64> {
+        match (self.duration, self.probed) {
+            (Some(d), Some(p)) => Some(p - d),
+            _ => None,
+        }
+    }
+
+    /// Whether the container disagrees with the manifest about how long this
+    /// file is, by enough to matter.
+    pub fn length_mismatch(&self) -> bool {
+        length_mismatch(self.duration, self.probed, self.source.fps)
+    }
+}
+
+/// Whether a container's reading of a file's length disagrees with what the
+/// take wrote down, by enough to matter.
+///
+/// A frame and a half is the tolerance: MP4 rounds a track's duration to its
+/// own timescale, and a clip placed by these numbers is only wrong once the
+/// error reaches a visible fraction of a second. Under that, the two readings
+/// are the same number said twice.
+pub fn length_mismatch(duration: Option<f64>, probed: Option<f64>, fps: u32) -> bool {
+    let (Some(duration), Some(probed)) = (duration, probed) else {
+        return false;
+    };
+    let frame = 1.0 / fps.max(1) as f64;
+    (probed - duration).abs() > (1.5 * frame).max(0.15)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +87,15 @@ pub struct Manifest {
     pub hardware: bool,
     pub started_at: String,
     pub duration: Option<f64>,
+    /// What every `start` was measured against.
+    ///
+    /// `"frames"`: the file's own first sample, read off the take's shared
+    /// clock — exact, and what the Windows backend produces. `"spawn"`: when
+    /// the encoder was launched, which is all the ffmpeg backend can see (each
+    /// child files its own clock) — its offsets carry that backend's startup
+    /// latency, up to a couple of hundred milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_clock: Option<String>,
     pub sources: Vec<SourceRecord>,
 }
 
@@ -78,6 +146,7 @@ impl Take {
             hardware: encoder.is_hardware(),
             started_at: stamp,
             duration: None,
+            start_clock: None,
             sources: sources
                 .iter()
                 .map(|s| SourceRecord {
@@ -87,14 +156,57 @@ impl Take {
                     // extension and does not know Matroska (see
                     // `Capture::output_ext`).
                     file: format!("{}.{}", s.id, s.capture.output_ext(ext)),
+                    start: None,
                     duration: None,
                     frames: None,
+                    added_at: None,
+                    probed: None,
                     source: s.clone(),
                 })
                 .collect(),
         };
 
         Ok(Self { dir, ext, manifest })
+    }
+
+    /// Record a source that joined the take after it began.
+    ///
+    /// `added_at` is the take-time of the request. The file's own `start` is
+    /// filled in later, from the first sample that actually arrived — the
+    /// request is what the user asked for, the sample is what happened, and a
+    /// manifest that only kept the first would be a wish rather than a record.
+    pub fn add_source(&mut self, src: &Source, added_at: f64) {
+        self.manifest.sources.push(SourceRecord {
+            id: src.id.clone(),
+            file: format!("{}.{}", src.id, src.capture.output_ext(self.ext)),
+            start: None,
+            duration: None,
+            frames: None,
+            added_at: Some(added_at),
+            probed: None,
+            source: src.clone(),
+        });
+    }
+
+    /// Take a source back out — a mid-take add whose capture refused to open
+    /// leaves no file and nothing to report, so it must not leave a row that
+    /// claims otherwise.
+    pub fn remove_source(&mut self, id: &str) {
+        self.manifest.sources.retain(|s| s.id != id);
+    }
+
+    /// Where a source's file sits on the take's timeline.
+    pub fn set_start(&mut self, id: &str, seconds: Option<f64>) {
+        if let Some(s) = self.manifest.sources.iter_mut().find(|s| s.id == id) {
+            s.start = seconds;
+        }
+    }
+
+    /// What ffprobe measured for a finished file.
+    pub fn set_probed(&mut self, id: &str, seconds: Option<f64>) {
+        if let Some(s) = self.manifest.sources.iter_mut().find(|s| s.id == id) {
+            s.probed = seconds;
+        }
     }
 
     /// Where a source's file lives. Reads the manifest rather than recomputing
@@ -248,6 +360,69 @@ mod tests {
         assert_eq!(back.sources[0].duration, Some(2.5));
         assert!(back.duration.is_none());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A source added mid-take records the request and the arrival separately:
+    /// the gap between them is the device's wake-up, and it is the only
+    /// evidence of how honest `start` is.
+    #[test]
+    fn a_source_added_mid_take_keeps_request_and_arrival_apart() {
+        let root = scratch("added");
+        let mut take = Take::create(&root, "mp4", Encoder::X264, &[source("screen")]).unwrap();
+        take.add_source(&source("cam"), 12.5);
+        // Nothing has arrived yet, so the file has no place on the timeline.
+        assert_eq!(take.manifest.sources[1].start, None);
+        assert_eq!(take.manifest.sources[1].added_at, Some(12.5));
+        assert_eq!(take.path_for("cam"), take.dir.join("cam.mp4"));
+
+        take.set_start("cam", Some(12.83));
+        take.set_duration("cam", Some(47.17));
+        take.set_probed("cam", Some(47.2));
+        let rec = &take.manifest.sources[1];
+        assert_eq!(rec.start, Some(12.83));
+        // The two lengths disagree by 30 ms — on record, not rounded away.
+        let err = rec.length_error().unwrap();
+        assert!((err - 0.03).abs() < 1e-9, "got {err}");
+
+        // The take's own length is where the longest source reaches.
+        take.manifest.duration = Some(60.0);
+        take.save_manifest().unwrap();
+        let body = fs::read_to_string(take.dir.join("take.json")).unwrap();
+        let back: Manifest = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.sources[1].start, Some(12.83));
+        assert_eq!(back.sources[1].added_at, Some(12.5));
+        assert_eq!(back.sources[1].probed, Some(47.2));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A failed mid-take add must not leave a row claiming a file that was
+    /// never written.
+    #[test]
+    fn removing_a_source_takes_its_row_with_it() {
+        let root = scratch("removed");
+        let mut take = Take::create(&root, "mp4", Encoder::X264, &[source("screen")]).unwrap();
+        take.add_source(&source("cam"), 1.0);
+        assert_eq!(take.manifest.sources.len(), 2);
+        take.remove_source("cam");
+        assert_eq!(take.manifest.sources.len(), 1);
+        assert_eq!(take.manifest.sources[0].id, "screen");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A container reading and the take's own number only disagree once the
+    /// gap is worth seeing: MP4 rounds a track duration to its timescale, so
+    /// a few tens of milliseconds is the same number said twice.
+    #[test]
+    fn a_length_only_mismatches_once_it_is_visible() {
+        // 30 fps: a frame is 33 ms, so the floor of 150 ms is what decides.
+        assert!(!length_mismatch(Some(10.0), Some(10.12), 30));
+        assert!(length_mismatch(Some(10.0), Some(10.16), 30));
+        // 5 fps: a frame and a half is 300 ms, and that wins over the floor.
+        assert!(!length_mismatch(Some(10.0), Some(10.2), 5));
+        assert!(length_mismatch(Some(10.0), Some(10.4), 5));
+        // Nothing to compare is not a mismatch: silence is not a verdict.
+        assert!(!length_mismatch(Some(10.0), None, 30));
+        assert!(!length_mismatch(None, Some(10.0), 30));
     }
 
     #[test]

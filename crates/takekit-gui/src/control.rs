@@ -271,6 +271,7 @@ fn route(
             remove_source(app, index)
         }
         (Method::Patch, "/config") => patch_config(app, body),
+        (Method::Post, "/record/sources") => add_live_source(app, body),
         (Method::Post, "/record/start") => record_start(app, body),
         (Method::Post, "/record/stop") => record_stop(app),
         (Method::Delete, "/log") => clear_log(app, body),
@@ -1100,6 +1101,38 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
 
 fn recording_now(app: &tauri::AppHandle) -> bool {
     take::status(app).recording
+}
+
+/// `POST /record/sources` — give the take that is recording one more source.
+///
+/// A different resource from `/sources` on purpose: that one edits the saved
+/// list for the *next* take and refuses while a take runs, this one changes
+/// what is being written right now. One route for both would make "added" mean
+/// two things and leave an agent guessing which.
+///
+/// Takes the same two shapes `/sources` takes — a raw `capture`, or a
+/// `kind`/`target` spec resolved here against the windows and devices that
+/// exist at this moment.
+fn add_live_source(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
+    // The ids this take already owns: a new source must not reuse one, and
+    // the saved list is not the authority on that while a take is running.
+    let Some(existing) = take::live_sources(app) else {
+        return Err(conflict(
+            "nothing is recording; POST /record/start first, or POST /sources to build the list",
+        ));
+    };
+    let source = if body.get("capture").is_some() {
+        let source: Source = serde_json::from_value(body).map_err(|e| bad(e.to_string()))?;
+        check_new_source(&source, &existing)?;
+        source
+    } else {
+        resolve_spec(&body, &existing)?
+    };
+    let added = take::add_live_source(app, source).map_err(|e| ui_fail(&e))?;
+    // The panel redraws its list from this: a source joined the take, and the
+    // saved list grew with it.
+    mirror(app, "sources");
+    Ok(json!({ "id": added.id, "start": added.start }))
 }
 
 /// `POST /record/start`. The take runs on the current setup (what `/state`

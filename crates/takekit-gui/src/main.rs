@@ -895,6 +895,22 @@ async fn stop_recording(
         .map_err(|e| UiError::with_detail("err.internal", e))?
 }
 
+/// Add one source to the take that is recording right now.
+///
+/// The other half of `stop_source`: a take can grow while it runs, and what it
+/// grew by is written into `take.json` with the instant its file begins. Off
+/// the main thread because opening a camera takes the better part of a second
+/// and the panel keeps ticking while it waits.
+#[tauri::command]
+async fn add_live_source(
+    app: tauri::AppHandle,
+    source: takekit_core::source::Source,
+) -> Result<crate::proto::AddSourceResult, UiError> {
+    tauri::async_runtime::spawn_blocking(move || take::add_live_source(&app, source))
+        .await
+        .map_err(|e| UiError::with_detail("err.internal", e))?
+}
+
 /// Cut one source out of a running take, leaving the others alone. The panel
 /// calls this once a status tick shows a source that is no longer usable.
 #[tauri::command]
@@ -921,6 +937,22 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
 #[tauri::command]
 fn show_main(app: tauri::AppHandle) {
     show_main_window(&app);
+}
+
+/// The popover's way to add a source to a take that is already running: bring
+/// the panel back with its picker open.
+///
+/// The picker itself is not duplicated into the popover — six kinds, a window
+/// search and a device list do not fit in 220px, and a second copy of that
+/// logic would be the one that drifts. The panel is where sources are chosen;
+/// the popover only decides to go there.
+#[tauri::command]
+fn add_source_from_tray(app: tauri::AppHandle) {
+    show_main_window(&app);
+    // After the window is back, so the panel is not asked to open a picker in
+    // a document that is still hidden (a hidden window paints nothing and the
+    // popover would close over an empty panel).
+    let _ = app.emit_to("main", "picker:open", ());
 }
 
 /// Take the popover down. It closes itself when it loses focus, which a click
@@ -1198,8 +1230,10 @@ fn main() {
             overlay_cancel,
             status,
             stop_recording,
+            add_live_source,
             stop_source,
             show_main,
+            add_source_from_tray,
             hide_tray,
             set_hotkey,
             set_countdown,

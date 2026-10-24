@@ -582,6 +582,9 @@ fn media(args: MediaArgs) -> Result<(), String> {
                     // The device harness records the device, not a crop of it.
                     crop: writer::CropBox::default(),
                     sampling,
+                    // One device, one take: zero is the take's origin.
+                    origin: writer::Origin::Take,
+                    first: None,
                 },
                 clock,
                 writer_end,

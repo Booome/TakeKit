@@ -19,9 +19,11 @@ use takekit_core::source::{Backend, Capture};
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
+use takekit_core::source::Source;
+
 use crate::proto::{
-    BeepInfo, CountdownInfo, FinalizeInfo, LiveSourceInfo, OutcomeInfo, StartRequest, StartResult,
-    StatusInfo, StopResult, UiError,
+    AddSourceResult, BeepInfo, CountdownInfo, FinalizeInfo, LiveSourceInfo, OutcomeInfo,
+    StartRequest, StartResult, StatusInfo, StopResult, UiError,
 };
 use crate::shortcut;
 
@@ -444,6 +446,7 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
                     alive: s.alive,
                     usable: s.usable,
                     bytes: s.bytes,
+                    start: s.start,
                 })
                 .collect(),
             error: last_error,
@@ -454,6 +457,63 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
             sources: Vec::new(),
             error: last_error,
         },
+    }
+}
+
+/// What the take that is running now is recording — `None` when nothing is.
+///
+/// A caller that wants to add to it needs this list rather than the saved one:
+/// ids name the output files, so a new one has to be unique against what is
+/// actually being written.
+pub fn live_sources(app: &tauri::AppHandle) -> Option<Vec<Source>> {
+    let state = app.state::<AppState>();
+    let guard = state.recording.lock().unwrap();
+    guard.as_ref().map(|r| r.sources())
+}
+
+/// Give the running take one more source.
+///
+/// The mirror image of `stop_source`, and the same rule about scope: only this
+/// source is affected. A capture that refuses to open comes back as an error
+/// and leaves no row, no file and no folder damage — the take that is already
+/// recording carries on.
+///
+/// The take's own clock is what makes the source's `start` true: it is the
+/// same origin every other file was placed against, so a source added at 0:32
+/// lands at 0:32 in the manifest without anything having to trust a wall
+/// clock. Returns once the file knows where it begins.
+pub fn add_live_source(app: &tauri::AppHandle, source: Source) -> Result<AddSourceResult, UiError> {
+    let state = app.state::<AppState>();
+    let mut guard = state.recording.lock().unwrap();
+    let Some(recording) = guard.as_mut() else {
+        return Err(UiError::new("err.not-recording"));
+    };
+    let id = source.id.clone();
+    match recording.add_source(&source) {
+        Ok(added) => {
+            // The saved list keeps it too: a source the user added is a
+            // source, and "what the next take will record" drifting away from
+            // "what this one is recording" is how a panel starts lying. The
+            // list was frozen at GO, but a *growth* is not an edit of what was
+            // already read — every existing source keeps the settings it
+            // started with.
+            let _ = crate::config::Config::update(|c| c.sources.push(source.clone()));
+            crate::probe(&format!(
+                "source:added {id} start={:?}",
+                added.start.map(|s| (s * 1000.0).round() / 1000.0)
+            ));
+            Ok(AddSourceResult {
+                id: added.id,
+                start: added.start,
+            })
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let err = UiError::from_code_string(&text)
+                .unwrap_or_else(|| UiError::with_detail("err.add-source-failed", text));
+            crate::probe(&format!("source:add-failed {id} {err}"));
+            Err(err)
+        }
     }
 }
 
@@ -715,17 +775,21 @@ mod tests {
             sources: vec![
                 OutcomeInfo {
                     id: "a".to_string(),
+                    start: Some(0.0),
                     seconds: Some(5.5),
                     bytes: 1000,
                     error: None,
+                    warning: None,
                     width: 1920,
                     height: 1080,
                 },
                 OutcomeInfo {
                     id: "b".to_string(),
+                    start: None,
                     seconds: None,
                     bytes: 0,
                     error: Some("boom".to_string()),
+                    warning: None,
                     width: 0,
                     height: 0,
                 },

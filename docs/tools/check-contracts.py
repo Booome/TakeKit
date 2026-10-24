@@ -201,6 +201,7 @@ CONTROL: list[tuple[str, str, str, str]] = [
     ("remove source", "/sources/", "takekit_remove_source", "Remove"),
     ("replace sources", "/sources", "takekit_set_sources", "SetSources"),
     ("settings", "/config", "takekit_set_settings", "Config"),
+    ("record add source", "/record/sources", "takekit_record_add_source", "AddLive"),
     ("start", "/record/start", "takekit_start_recording", "Start"),
     ("stop", "/record/stop", "takekit_stop_recording", "Stop"),
     ("history", "/history", "takekit_history", "History"),

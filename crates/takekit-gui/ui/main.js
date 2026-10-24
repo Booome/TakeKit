@@ -11,6 +11,11 @@
 
 const state = {
   sources: [],
+  // Where each source's file begins on the running take's timeline, in
+  // seconds, by id. Filled from `add_live_source`'s reply and from every
+  // status tick — one number, kept in one place, so the row chip and
+  // take.json cannot drift apart.
+  starts: new Map(),
   windows: [],
   devices: [],
   // Microphones for the picker's sound groups (`list_mics`), kept apart from
@@ -284,12 +289,67 @@ function persist() {
 
 // No display text is stored: the row derives its label from the capture spec
 // on every render (see `labelFor`), so a language switch relabels as it goes.
+//
+// Mid-take the same picker feeds the take that is already running instead of
+// the saved list — same six kinds, same window search, one branch. Before GO
+// the list is only a plan; after GO a source has a file of its own with a
+// place on the timeline.
 function addSource(id, capture) {
-  state.sources.push({ id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY, audio: false });
+  const source = { id, capture, fps: DEFAULT_FPS, quality: DEFAULT_QUALITY, audio: false };
+  if (state.recording) {
+    closePicker();
+    addLive(source);
+    return;
+  }
+  state.sources.push(source);
   preheatFor(capture);
   persist();
   render();
   closePicker();
+}
+
+// Which source is being opened right now. Shown on the add button, not on a
+// row: the row does not exist yet.
+let addingId = null;
+
+// Hand one source to the take that is running.
+//
+// The reply's `start` is where its file begins on the take's timeline — a
+// measurement (the first sample's own capture time), not the moment the button
+// was clicked. That is the number the row shows and the number take.json
+// records, so a camera that took half a second to wake up is 0.5 s late in both
+// places rather than in one of them.
+//
+// No toast on success: the row appearing with its offset is the feedback, the
+// same way a finished take speaks through its history row. A failure gets one,
+// because a click that did nothing needs to say why.
+async function addLive(source) {
+  addingId = source.id;
+  render();
+  try {
+    const added = await invoke("add_live_source", { source });
+    // The Rust side grew the saved list too, so this is the panel catching up,
+    // not a second write.
+    state.sources.push({ ...source, id: added.id });
+    state.starts.set(added.id, added.start);
+    PROBE(`source-live:${added.id}@${added.start ?? "-"}`);
+  } catch (e) {
+    notify("warn", uiErrorText(e));
+  } finally {
+    addingId = null;
+    render();
+  }
+}
+
+// The row chip's own form: mm:ss while the take is that short, h:mm:ss once it
+// is not. The bar's clock always shows hours; a chip inside a row has no room
+// for a leading 00: that never changes.
+function offsetClock(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
 // Warm the DDA probe for this source's geometry so start_recording does not
@@ -529,7 +589,21 @@ function soundSlot() {
   return slot;
 }
 
+// The transport, repainted from state like everything else.
+//
+// The panel can come back in the middle of a take — the popover's "添加源" does
+// exactly that — and a button reading "开始录制" over a running take is a lie
+// that also *stops* it when pressed. Skipped while a take is finalising: that
+// label belongs to the stop in progress ("正在写入…", DESIGN §4.3).
+function paintTransport() {
+  if (state.finalizing) return;
+  const btn = $("rec-btn");
+  btn.textContent = state.recording ? t("bar.stop") : t("bar.rec");
+  btn.classList.toggle("live", state.recording && !state.countdown);
+}
+
 function render() {
+  paintTransport();
   // While a take is running the transport bar stays on every tab: a timer and
   // a stop button you cannot see are how a recording gets forgotten.
   document.body.classList.toggle("recording", state.recording);
@@ -558,6 +632,21 @@ function render() {
     const label = labelFor(s.capture);
     const main = document.createElement("div");
     main.className = "row-main";
+    // Where this file sits on the running take. Shown for every row, not just
+    // the ones added mid-take: "0:00" is the fact that makes a later "0:32"
+    // mean something, and the column has to read the same for both.
+    if (state.recording) {
+      const start = state.starts.get(s.id);
+      const chip = document.createElement("span");
+      chip.className = start == null ? "row-start pending" : "row-start";
+      chip.textContent = start == null ? "—" : offsetClock(start);
+      chip.title =
+        start == null
+          ? `${t("row.startTitle")} · ${t("row.startPending")}`
+          : t("row.startTitle");
+      chip.dataset.start = start == null ? "" : String(start);
+      main.append(chip);
+    }
     const name = document.createElement("div");
     name.className = "row-name";
     name.textContent = truncate(label.name, 48);
@@ -640,6 +729,9 @@ function render() {
   // A take outlives its last source: one can be dropped mid-recording, and the
   // button has to stay live so the take can still be stopped.
   $("rec-btn").disabled = n === 0 && !state.recording;
+  // One live add at a time: opening a camera takes the better part of a
+  // second, and a second pick would become a second source with a duplicate id.
+  $("add-btn").disabled = addingId != null;
   // Failed overrides the hint and swaps in the diamond + log button (§4.5);
   // every repaint has to agree, or a render() would wipe the reason away.
   paintStatus();
@@ -1225,6 +1317,8 @@ function notify(level, text, detail = null, dir = null) {
 }
 
 function resetToIdle() {
+  // The next take has its own timeline; these offsets belong to the last one.
+  state.starts.clear();
   state.recording = false;
   state.countdown = false;
   state.finalizing = false;
@@ -1247,17 +1341,22 @@ function resetToIdle() {
 function showSaved(result) {
   const mb = (result.sources.reduce((a, s) => a + s.bytes, 0) / (1024 * 1024)).toFixed(1);
   const secs = result.duration ? `${result.duration.toFixed(1)}s` : t("take.unknown");
-  if (result.failed > 0) {
-    const detail = result.sources
-      .filter((s) => s.error)
-      .map((s) => `${s.id}: ${codeText(s.error)}`)
-      .join("\n");
-    notify(
-      "warn",
-      t("notice.takePartial", { n: result.failed, secs, mb }),
-      detail || null,
-      result.dir,
-    );
+  // Two different kinds of "not quite": a source that recorded nothing, and a
+  // file whose length in the container disagrees with what take.json claims.
+  // The second is not a failure — the footage is fine — but it is exactly the
+  // thing the manifest exists to get right, so it is said out loud and kept in
+  // the log beside the folder it belongs to.
+  const lost = result.sources.filter((s) => s.error);
+  const off = result.sources.filter((s) => s.warning);
+  const lines = [];
+  if (result.failed > 0) lines.push(t("notice.takePartial", { n: result.failed, secs, mb }));
+  if (off.length > 0) lines.push(t("notice.lenMismatch", { n: off.length }));
+  if (lines.length > 0) {
+    const detail = [
+      ...lost.map((s) => `${s.id}: ${codeText(s.error)}`),
+      ...off.map((s) => `${s.id}: ${codeText(s.warning)}`),
+    ].join("\n");
+    notify("warn", lines.join(" · "), detail || null, result.dir);
   }
   refreshJournal();
 }
@@ -1406,6 +1505,11 @@ async function tick() {
   try {
     const s = await invoke("status");
     state.elapsed = s.elapsed;
+    // A source added mid-take reports its start a moment after it appears (the
+    // first sample has to arrive first); this is where that late number lands.
+    for (const live of s.sources) {
+      if (live.start != null) state.starts.set(live.id, live.start);
+    }
     $("clock").textContent = clock(s.elapsed);
     await dropUnusable(s.sources);
     $("hint").textContent = s.sources
@@ -1425,6 +1529,11 @@ async function tick() {
 }
 
 $("add-btn").addEventListener("click", openPicker);
+
+// The popover's "添加源": it brought the panel back and asks for the picker.
+// Mid-take that is the only way to grow a take from the tray, so the picker has
+// to come up without a second click.
+window.__TAURI__.event.listen("picker:open", () => openPicker());
 $("backend").addEventListener("change", (e) => {
   state.backend = e.target.value;
   persist();

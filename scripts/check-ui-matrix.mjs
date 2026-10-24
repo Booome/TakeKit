@@ -471,6 +471,12 @@ const READ_ROWS = `(() => {
       summarySlack: sumBox ? Math.round((sumBox.width - sumTextW) * 10) / 10 : 0,
       // Distance from whatever precedes it to the first glyph.
       summaryGap: sumBox && prevBox ? Math.round((sumBox.right - sumTextW - prevBox.right) * 10) / 10 : 0,
+      // The mid-take offset chip: where the file begins on the take's timeline.
+      // Measured with the name it shares a cell with, because the chip is only
+      // allowed to sit inside the flexible column — never between two numbers.
+      startText: (row.querySelector(".row-start")?.textContent || "").trim(),
+      startLeft: row.querySelector(".row-start")?.getBoundingClientRect().left ?? null,
+      nameLeft: row.querySelector(".row-name")?.getBoundingClientRect().left ?? null,
     };
   }));
 })()`;
@@ -553,6 +559,70 @@ for (const lang of LANGS) {
     record(`${tag}/row-trailing-columns-line-up`,
       spread("sumRight") <= 1 && spread("removeLeft") <= 1,
       rows.map((r) => `${r.kind}: fps→${r.sumRight} ×→${r.removeLeft}`).join(" | "));
+
+    // ── the offset chip, while a take is running ──────────────────────────
+    // Recording is entered directly instead of started: a real take would film
+    // the user's screen. What is being tested is the layout — a fourth thing on
+    // the row is exactly how three number columns stop lining up — plus the one
+    // number that matters: 32 s must read "0:32", not "0:00" and not "32".
+    // `state.recording` is the switch that decides whether a row grows a chip;
+    // the body class only styles it. Setting just the class would test a screen
+    // the app never produces — and pass, because nothing would have moved.
+    await evalJs(`(() => {
+      state.recording = true;
+      for (const s of state.sources) state.starts.set(s.id, 32);
+      render();
+    })()`);
+    await sleep(300);
+    const chipped = JSON.parse(await evalJs(READ_ROWS));
+    const noChip = chipped.filter((r) => !r.startText);
+    record(`${tag}/row-start-chip-present`, noChip.length === 0,
+      noChip.length ? `missing on ${noChip.map((r) => r.name).join(", ")}` : `${chipped.length} rows chipped`);
+    const wrongText = chipped.filter((r) => r.startText !== "0:32");
+    record(`${tag}/row-start-chip-reads-mm-ss`, wrongText.length === 0,
+      wrongText.length ? wrongText.map((r) => `${r.name}: "${r.startText}"`).join(" | ") : "all read 0:32");
+    // Inside the name cell, to the left of the name: that is what keeps the
+    // three number columns where they were.
+    const misplacedChip = chipped.filter((r) => !(r.startLeft !== null && r.nameLeft !== null && r.startLeft < r.nameLeft));
+    record(`${tag}/row-start-chip-leads-the-name`, misplacedChip.length === 0,
+      misplacedChip.length ? misplacedChip.map((r) => `${r.name}: chip ${r.startLeft} name ${r.nameLeft}`).join(" | ")
+        : `chip right edge before name on ${chipped.length} rows`);
+    const spreadWhile = (key) => {
+      const xs = chipped.map((r) => r[key]).filter((x) => x > 0);
+      return xs.length ? Math.round((Math.max(...xs) - Math.min(...xs)) * 10) / 10 : 0;
+    };
+    record(`${tag}/row-start-chip-keeps-columns`, spreadWhile("sumRight") <= 1 && spreadWhile("removeLeft") <= 1,
+      chipped.map((r) => `${r.kind}: fps→${r.sumRight} ×→${r.removeLeft}`).join(" | "));
+    // Kept for the eyeball pass: this screen only exists mid-take, so no other
+    // screenshot in the set shows the chip.
+    {
+      const shot = await send("Page.captureScreenshot", { format: "png" });
+      writeFileSync(path.join(OUT, `${tag}-row-start-chip.png`), Buffer.from(shot.result.data, "base64"));
+    }
+    // The panel comes back mid-take now (the popover's 添加源), so the record
+    // button has to say what pressing it will do. "开始录制" over a running
+    // take would be both a lie and a stop button in disguise.
+    const transport = await evalJs(`document.getElementById("rec-btn").textContent`);
+    record(`${tag}/bar-says-stop-while-recording`,
+      transport === (lang === "zh" ? "停止" : "Stop"), `"${transport}"`);
+    const overflow = await evalJs(`document.documentElement.scrollWidth > document.documentElement.clientWidth`);
+    record(`${tag}/row-start-chip-no-overflow`, overflow === false, `scrollWidth ${await evalJs("document.documentElement.scrollWidth")}`);
+    // A source whose first sample has not arrived says so instead of guessing
+    // zero — the number does not exist yet and "0:00" would be a lie.
+    await evalJs(`(() => {
+      for (const s of state.sources) state.starts.delete(s.id);
+      render();
+    })()`);
+    await sleep(200);
+    const pending = JSON.parse(await evalJs(READ_ROWS));
+    record(`${tag}/row-start-chip-pending`, pending.every((r) => r.startText === "—"),
+      pending.map((r) => r.startText).join(","));
+    await evalJs(`(() => {
+      state.recording = false;
+      state.starts.clear();
+      render();
+    })()`);
+    await sleep(200);
 
     // Sound is an option on any picture that can carry it — a window's own
     // process tree, and the desktop's system sound. Two rows here carry it, so

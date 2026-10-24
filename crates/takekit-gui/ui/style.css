@@ -448,6 +448,39 @@ select {
   text-overflow: ellipsis;
 }
 
+/* While a take runs, each row leads with where its file begins on the take's
+   timeline (take.json's `start`). It sits inside the name cell on purpose: the
+   identity column is the only flexible one, so a chip there cannot push the
+   three number columns out of line — the rule that killed the two-row layout
+   in 2026-10-21 still holds. */
+body.recording .row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+body.recording .row-name {
+  min-width: 0;
+}
+
+.row-start {
+  flex: none;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--tk-sunken);
+  color: var(--tk-text-2);
+  font-family: var(--tk-font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+/* A source whose first sample has not arrived yet: the offset is not known, and
+   an empty cell would read as "0". */
+.row-start.pending {
+  color: var(--tk-text-3);
+}
+
 /* The size column (2026-10-21 方案 A): source size, `→ cropped size` when a
    crop is set. Right-aligned tabular figures in a fixed-width column, so the
    sizes of every row line up and the column compares at a glance. The prose

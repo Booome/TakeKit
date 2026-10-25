@@ -116,9 +116,9 @@ to `takes/<timestamp>/` by default (`-o` changes the root).
 | `--mic <DEVICE>` | Also record a microphone (see `takekit media --list`) |
 | `--system-audio` | Also record what the speakers play, as its own file |
 | `--window-sound` | The window's own sound, written into the same file as its picture (needs `--window`) |
-| `--desktop-sound` | The desktop's sound, into the desktop's file (the whole machine — Windows has no per-monitor audio) |
+| `--desktop-sound` | The desktop's sound, into the desktop's file (the whole machine — Windows has no per-monitor audio; **not with `--window`**) |
 | `--encoder auto\|x264\|nvenc\|qsv\|amf` | `auto` probes and picks the best that actually works |
-| `--quality 0..=51` | Roughly CRF for x264, CQ/QP for hardware encoders; 0 = lossless |
+| `--quality 0..=51` | Roughly CRF for x264, CQ/QP for hardware encoders; 0 = lossless (default 20, out of range refused before the take folder exists) |
 | `--fps <N>` | Capture rate, default 30 |
 | `-d, --duration <SECS>` | Stop after N seconds, otherwise press Enter |
 | `-o, --out <DIR>` | Output root, default `takes` |
@@ -151,7 +151,7 @@ takekit ctl start
 takekit ctl stop
 ```
 
-`mcp` speaks MCP over stdio so an agent can do the same thirteen things with typed tools
+`mcp` speaks MCP over stdio so an agent can do the same sixteen things with typed tools
 (`takekit_state`, `takekit_list_devices`, `takekit_add_source`, `takekit_start_recording`, …).
 Point an MCP client at `takekit mcp` and it works; the panel must be running. The control service
 listens on `127.0.0.1` only, on a random port, and requires a per-run bearer token that the panel
@@ -170,21 +170,26 @@ takes/2026-10-18-11-31-33/
 {
   "encoder": "h264_nvenc",
   "hardware": true,
-  "fps": 30,
   "started_at": "2026-10-18-11-31-33",
   "duration": 60.0,
+  "start_clock": "frames",
   "sources": [
-    { "id": "win", "file": "win.mkv", "duration": 60.0,
-      "source": { "id": "win", "fps": 30,
-                  "capture": { "Window": { "hwnd": 133890, "pid": 4321, "title": "VirtualBox",
-                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } } } },
-    { "id": "cam", "file": "cam.mkv", "duration": 60.0,
-      "source": { "id": "cam", "fps": 30,
-                  "capture": { "Camera": { "device": "My Camera",
-                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } } } }
+    { "id": "win", "file": "win.mkv", "start": 0.0, "duration": 60.0,
+      "source": { "id": "win", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
+                                           "title": "VirtualBox",
+                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
+                  "fps": 30, "quality": null, "audio": false } },
+    { "id": "cam", "file": "cam.mkv", "start": 0.0, "duration": 60.0,
+      "source": { "id": "cam", "capture": { "Camera": { "device": "My Camera",
+                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
+                  "fps": 30, "quality": null, "audio": false } }
   ]
 }
 ```
+
+`start_clock` says what the offsets were measured against (`frames` = the file's own first sample,
+exact; `spawn` = encoder launch, the ffmpeg backend's best look); `paused` appears only for a take
+that was paused, `frames` on a source only on the Windows backend.
 
 The manifest records which encoder ran and each file's own duration, so a mismatch is visible instead
 of being discovered in the editor. The container follows the backend — `.mp4` on the Windows APIs,

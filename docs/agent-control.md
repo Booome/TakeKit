@@ -162,7 +162,7 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
 }
 ```
 
-### 5.3 MCP 工具（v1，13 个）
+### 5.3 MCP 工具（v1 起 13 个，暂停/分段与录制中加源补 3 个 → 现 **16 个**）
 
 `takekit mcp` 作为 `takekit` 二进制的一个子命令，stdio 上讲 MCP（newline-delimited JSON-RPC，
 手写最小子集：`initialize` / `tools/list` / `tools/call`，不引 SDK；如后续 `rmcp` 成熟可换）。
@@ -176,6 +176,9 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
 | `takekit_set_sources` | `sources[]` | 整表替换 |
 | `takekit_set_settings` | `{ hotkey?, countdown_secs?, out_root?, ffmpeg_path?, encoder?, backend?, marks?, raise_sources?, language?, theme?, finalize_panel? }` | 改设置；`ffmpeg_path` 传 `null` = 回到 PATH 查找 |
 | `takekit_start_recording` | `quality?`（0..=51，默认 20；其余取当前设置，倒计时走 `countdown_secs` 设置） | 开始（含倒计时） |
+| `takekit_record_add_source` | `kind`, `target?`, `monitor?`, `crop?`, `fps?`, `quality?`, `sound?` | **加进正在录的这一条 take**，立刻开录；返回的 `start` = 新文件在该 take 时间轴上的起点（秒），`take.json` 逐源记这个数 |
+| `takekit_pause_recording` | — | 暂停：停钟 + 每个源收尾当前文件，新段从这里切开；**仅 Windows 后端** |
+| `takekit_resume_recording` | — | 恢复：每个源在下一个样本上开新段，采集从未停过 → 无设备预热损失 |
 | `takekit_stop_recording` | — | 停止，返回落盘目录 |
 | `takekit_history` | — | 历史 + 日志（全景） |
 | `takekit_log` | `level?`（warn/error） | **只有日志**——「出了什么事」的第一站，含控制面自己失败操作的留痕 |

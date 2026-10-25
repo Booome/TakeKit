@@ -86,9 +86,9 @@ takekit record --desktop --desktop-sound --crop 33,0,0,0
 | `--mic <设备>` | 同时录一个麦克风（`takekit media --list` 查看名字） |
 | `--system-audio` | 同时录扬声器正在播放的声音，单独成文件 |
 | `--window-sound` | 窗口自己的声音，写进它的画面同一个文件（需 `--window`） |
-| `--desktop-sound` | 桌面的声音写进桌面那个文件（整台机器 —— Windows 没有分显示器的音频） |
+| `--desktop-sound` | 桌面的声音写进桌面那个文件（整台机器 —— Windows 没有分显示器的音频；**不能与 `--window` 同用**） |
 | `--encoder auto\|x264\|nvenc\|qsv\|amf` | `auto` 逐个试编，挑实际能用的最好的一个 |
-| `--quality 0..=51` | 对 x264 近似 CRF，对硬件编码是 CQ/QP；0 = 无损 |
+| `--quality 0..=51` | 对 x264 近似 CRF，对硬件编码是 CQ/QP；0 = 无损（默认 20，越界在创建 take 目录前就拒） |
 | `--fps <N>` | 采集帧率，默认 30 |
 | `-d, --duration <秒>` | 录 N 秒后停，否则按回车停 |
 | `-o, --out <目录>` | 输出根目录，默认 `takes` |
@@ -118,7 +118,7 @@ takekit ctl start
 takekit ctl stop
 ```
 
-`mcp` 用 stdio 讲 MCP，agent 可以用带 schema 的工具做同样这十三件事（`takekit_state`、`takekit_list_devices`、`takekit_add_source`、`takekit_start_recording` …）。把 MCP 客户端指向 `takekit mcp` 即可，面板需在运行。控制服务只监听 `127.0.0.1` 的随机端口，并要求一个每次启动重生成的 Bearer token —— 面板把它写在 `%APPDATA%\TakeKit\control.json`。
+`mcp` 用 stdio 讲 MCP，agent 可以用带 schema 的工具做同样这十六件事（`takekit_state`、`takekit_list_devices`、`takekit_add_source`、`takekit_start_recording` …）。把 MCP 客户端指向 `takekit mcp` 即可，面板需在运行。控制服务只监听 `127.0.0.1` 的随机端口，并要求一个每次启动重生成的 Bearer token —— 面板把它写在 `%APPDATA%\TakeKit\control.json`。
 
 ## 一次录制长什么样
 
@@ -133,21 +133,25 @@ takes/2026-10-18-11-31-33/
 {
   "encoder": "h264_nvenc",
   "hardware": true,
-  "fps": 30,
   "started_at": "2026-10-18-11-31-33",
   "duration": 60.0,
+  "start_clock": "frames",
   "sources": [
-    { "id": "win", "file": "win.mkv", "duration": 60.0,
-      "source": { "id": "win", "fps": 30,
-                  "capture": { "Window": { "hwnd": 133890, "pid": 4321, "title": "VirtualBox",
-                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } } } },
-    { "id": "cam", "file": "cam.mkv", "duration": 60.0,
-      "source": { "id": "cam", "fps": 30,
-                  "capture": { "Camera": { "device": "My Camera",
-                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } } } }
+    { "id": "win", "file": "win.mkv", "start": 0.0, "duration": 60.0,
+      "source": { "id": "win", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
+                                           "title": "VirtualBox",
+                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
+                  "fps": 30, "quality": null, "audio": false } },
+    { "id": "cam", "file": "cam.mkv", "start": 0.0, "duration": 60.0,
+      "source": { "id": "cam", "capture": { "Camera": { "device": "My Camera",
+                                           "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
+                  "fps": 30, "quality": null, "audio": false } }
   ]
 }
 ```
+
+`start_clock` 说明这些偏移是拿什么当原点的（`frames` = 文件自己第一帧，精确；`spawn` = 编码器启动时刻，
+ffmpeg 后端能看到的最好水平）；`paused` 只在暂停过的 take 里出现，源上的 `frames` 只有 Windows 后端才有。
 
 清单记下用了哪个编码器、每个文件各自的时长 —— 对不上是看得见的，不用等进了剪辑软件才发现。
 容器跟后端走：Windows API 后端是 `.mp4`，ffmpeg 后端是 `.mkv`；纯音频源一律是 `.mp4`，即使所在的 take 是 `.mkv`。

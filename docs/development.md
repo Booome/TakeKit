@@ -37,7 +37,9 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
 - `takekit-core` 有 7 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
-- 基线（2026-10-24 实测）：core 59（+7 ignored）/ cli 9 / gui 84 / media 28。以 `cargo test` 实际输出为准。
+- `mouseshow` 的 `tests/gdi_leak.rs` 同样是 `#[ignore = "needs an interactive desktop"]`：**改过 overlay 创建/销毁就手动跑一次** `cargo test --test gdi_leak -- --ignored`（在 `mouseshow/` 里）。
+  这条测试确实抓到过「同进程第二次录制报 `Class already exists`」（2026-10-26）——ignore 的测试没有固定运行场合，等于没有。
+- 基线（2026-10-27 实测）：cli 9 / core 63（+7 ignored）/ gui 84 / media 32。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **功能级三端一致性**：`node scripts/check-three-surface.mjs`——真跑 MCP（schema → stdio 调用 → 面板 → 配置）和 CLI 参数。名字对了不等于字段通了：`sound` 曾在 schema 里声明、在 HTTP 转发前被白名单丢掉，`check-contracts.py` 看不见这种漂移。
 - **界面语言×主题**：`node scripts/check-ui-matrix.mjs`——zh/en × light/dark × 9 屏（源列表、卡片、最小化窗口的卡片、裁剪源卡片、裁剪工作区、裁剪被丢弃的卡片与工作区、添加源、设置），量横向滚动、文本溢出、WCAG AA 对比度，截图落 `target/checks/ui-matrix/`。它就是抓出「`.field button.browse` 选择器从未匹配、深色下 `…` 对比度 1.02」的那一个。
@@ -54,9 +56,10 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 ### 2.1 界面矩阵钉住的规则（2026-10-23，从 README 搬来）
 
 `check-ui-matrix.mjs` 与 `check-three-surface.mjs` 的断言数**跟着「屏幕 × 语言 × 主题」增长**，
-别把某一次的数字抄进文档当常量（2026-10-25 有 123 这个数，同一批断言在加屏幕后就变了）。
-判据是脚本自己那行汇总全绿（`N/N`）+ `low=0 spill=0 hScroll=0`；`check-three-surface.mjs`
-2026-10-25 实测 `14/14`。输出里 `trunc` 是省略号截断（设计意图，不算失败），`low` 是实测对比度
+别把某一次的数字抄进文档当常量（2026-10-25 有 123 这个数，同一批断言在加屏幕后就变了；
+`check-three-surface.mjs` 也从 14 条涨到 17 条 —— 2026-10-27 数 `record()` 调用，包含本轮新增的
+`cli-addlive-sound-flag`）。判据是脚本自己那行汇总全绿（`N/N`）+ `low=0 spill=0 hScroll=0`。
+输出里 `trunc` 是省略号截断（设计意图，不算失败），`low` 是实测对比度
 （背景沿 DOM 向上找到第一个不透明容器再算），`spill` 是没有滚动条却超出容器的文本。
 
 | 断言 | 它保证什么 |
@@ -137,7 +140,11 @@ crates/
   → 停止（按钮 / F9 / 托盘面板）→ take::stop(announce)
        recording.stop()（采集停 → writer 收尾 → StopResult）
        → record(&result) 写 journal.json（历史在 Rust 落库，不靠前端）
-       → show_main_window()（热键停止时被录窗口在前台，面板必须回来）
+       → 遮罩停留到 ≥2 s（`finalize_panel` 开时；纯音频几十毫秒就收完，不留就等于没显示）
+       → 收遮罩 → show_main_window()（热键停止时被录窗口在前台，面板必须回来）
+       → 880 Hz 完成音（**在面板回来之后发**：隐藏窗口的音频上下文唤醒太晚，等于没响）
+       ⇒ 这 2 s 里 `begin` 一律拒绝（`err.finalizing`）：否则新 take 会在即将被收掉的遮罩上倒数，
+         永远到不了 GO，`pending` 卡住，之后每次开始都报「倒计时进行中」
   → main.js showSaved()：failed>0 才弹浮窗；随后 refreshJournal()
 ```
 
@@ -274,7 +281,8 @@ js-error:<msg>
 
 ### 5.3 本地 scratch 脚本（默认不入库）
 
-`docs/tools/` 整目录在 `.gitignore` 里（Win32/UIA 驱动脚本，随环境漂移）：
+`docs/tools/` 下**除 `check-contracts.py` 外**整目录在 `.gitignore` 里（Win32/UIA 驱动脚本，随环境漂移；
+`check-contracts.py` 是纯静态分析、跨平台且 CI 要跑，`.gitignore` 里为它开了 `!` 例外）：
 `ui-probe.ps1`（探针/截图/点击/F9）、`tk-verify-b3.ps1`（B3 端到端：清场+启动+F9/Esc/开关）、
 `tk-veil-*.ps1`（遮罩动画/透明度验证）、`tk-shot-debug.ps1`、`tk-verify-settings.ps1`、
 `make-editor-harness.py`（无头 DOM + 截图：源行 → 编辑源 → 裁剪工作区 → 保存）。

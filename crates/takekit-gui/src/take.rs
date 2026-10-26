@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use takekit_core::session::{Prepared, Recording, Session, Settings};
 use takekit_core::source::{Backend, Capture};
@@ -90,6 +90,14 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         .is_some()
     {
         return Err(UiError::new("err.countdown"));
+    }
+    // The stop screen holds the veil for at least 2 s after the files are
+    // closed. Without this check a second press during that hold starts a new
+    // take *behind* the veil and the stop path then hides the veil the new
+    // countdown is being drawn on — the countdown never reaches GO, `pending`
+    // stays taken, and every later start answers "counting down".
+    if state.finalizing.load(Ordering::SeqCst) {
+        return Err(UiError::new("err.finalizing"));
     }
     if req.sources.is_empty() {
         return Err(UiError::new("err.no-sources"));
@@ -636,6 +644,9 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     // The full-screen stop screen is a choice (`finalize_panel`); either way
     // the panel's status bar follows the same events.
     let panel = crate::config::Config::load().finalize_panel;
+    // When the stop tone went out, so the done tone below can wait for it to
+    // finish instead of playing on top of it.
+    let stop_tone_at = Instant::now();
     if panel {
         // Cover first, then the event that paints STOP on it: the veil must
         // not come up empty and fill in a frame later.
@@ -703,14 +714,29 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     // history row is the success feedback, and a checklist that finished
     // needs no second ending.
     let _ = app.emit("take:done", &result);
-    // The done beep belongs to the panel: it is the window coming back, and
-    // the veil's own audio is going away with the veil.
-    let _ = app.emit_to("main", "take:beep", &BeepInfo { hz: 880, ms: 150 });
+    // A stop screen that lives 50 ms shows nothing, which defeats the point of
+    // `finalize_panel`: a mic-only take finalises in tens of milliseconds, so
+    // the veil is held to a floor. A slow finalise already exceeds the floor
+    // and pays nothing. The hold is also what spaces the two tones — 660 Hz at
+    // the press, 880 Hz when the panel comes back — so they can never sound on
+    // top of each other.
+    //
+    // Sleeping is safe here: `stop_recording` runs this on the blocking pool
+    // (`spawn_blocking`), not on the UI thread.
+    if panel {
+        if let Some(rest) = Duration::from_secs(2).checked_sub(stop_tone_at.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
     crate::overlay::hide(app);
     // Same reason as the failure path: the hotkey stops the take while another
     // window is in front, and "it stopped" has to be something the user sees.
     // Stopping from the panel itself is a no-op here — it is already front.
     crate::show_main_window(app);
+    // After the window is back, not before it: the panel is the window that
+    // plays this tone, and a hidden document's audio context resumes too late
+    // to be heard — which is how the 2 s hold above turned into silence.
+    let _ = app.emit_to("main", "take:beep", &BeepInfo { hz: 880, ms: 150 });
     // `take:done` above is the one completion event: the panel's status bar,
     // the history refresh and the stop screen all read it. A second
     // `take:stopped` used to exist and now has no listener — the event

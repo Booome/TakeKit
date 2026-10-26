@@ -154,6 +154,11 @@ try {
 const help = execFileSync(TK, ["record", "--help"], { encoding: "utf8" });
 record("cli-window-sound-flag", /--window-sound/.test(help), "record --help");
 record("cli-desktop-sound-flag", /--desktop-sound/.test(help), "record --help");
+// `ctl add-live` posts the same spec as `ctl add`, so it has to carry the same
+// sound switch — it shipped without it once (2026-10-27), which made "add a
+// window with its sound" work before a take and not during one.
+const liveHelp = execFileSync(TK, ["ctl", "add-live", "--help"], { encoding: "utf8" });
+record("cli-addlive-sound-flag", /--sound/.test(liveHelp), "ctl add-live --help");
 
 const fails = results.filter((r) => !r.ok);
 say(`\n=== ${results.length - fails.length}/${results.length} passed ===`);

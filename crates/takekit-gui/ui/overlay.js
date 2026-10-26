@@ -11,6 +11,11 @@
 // `invoke` and `PROBE` come from shared.js, which loads first.
 
 const big = document.getElementById("big");
+// The stop screen's own fields. Declared here, not next to the listeners that
+// fill them, because startCountdown has to wipe them: a new take beginning
+// behind the veil must not show the previous take's duration and file sizes.
+const sub = document.getElementById("sub");
+const list = document.getElementById("list");
 
 // The veil is shown before `overlay:countdown` arrives, so it must start
 // empty: a digit left in the DOM flashes for a frame every time it comes up.
@@ -57,6 +62,12 @@ window.__TAURI__.event.listen("overlay:stop", () => {
 function startCountdown(secs) {
   stopLoop();
   big.classList.remove("go");
+  // The stop screen's leftovers belong to the previous take. `big` was reset
+  // here but `sub` and `list` were not, so a new countdown could run on top of
+  // the old duration and per-file rows — last take's "00:00:13" and "0.3 MB"
+  // stayed on screen under the freshly painted "1".
+  sub.textContent = "";
+  list.replaceChildren();
   // Whatever the veil last showed is still in the DOM — the demo's GO, or a
   // digit left by a cancelled countdown — and the veil becomes visible before
   // its first frame arrives. Paint the first digit NOW so a stale one never
@@ -139,12 +150,9 @@ function step() {
 // `take:done` ends it — Rust takes the veil down and brings the panel back.
 // There is deliberately no "saved" banner at the end (README B4 note): the
 // fresh history row is the success feedback, and a checklist that completed
-// needs no second ending. The veil is up exactly as long as the finalise
-// takes — no early dismiss, since (focusable(false) + click-through) nothing
-// can reach this window to dismiss it, and the wait is short.
-
-const sub = document.getElementById("sub");
-const list = document.getElementById("list");
+// needs no second ending. The veil is up for the finalise, with a 2 s floor
+// (Rust holds it, `take::stop`) — no early dismiss, since (focusable(false) +
+// click-through) nothing can reach this window to dismiss it.
 
 // `clock` comes from shared.js (loaded before this file): the panel, the
 // veil and the popover all print a duration, and a second copy of the

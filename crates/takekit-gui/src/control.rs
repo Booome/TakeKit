@@ -1227,7 +1227,9 @@ fn record_start(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
 }
 
 /// `POST /record/stop`. Blocks until the files are closed — the answer is the
-/// take that landed, directory included.
+/// take that landed, directory included. With the stop screen on, the answer
+/// also waits out its 2 s floor (`take::stop`), so an agent sees up to a couple
+/// of seconds of latency on this one route; every other route is immediate.
 fn record_stop(app: &tauri::AppHandle) -> Result<Value, Fail> {
     // `announce`: nobody in the panel pressed stop, so the panel needs the
     // event to learn the take is over — the same reason the tray asks for

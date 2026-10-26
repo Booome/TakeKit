@@ -18,20 +18,23 @@
 
 ## 2. 现状：能力全都有，缺的只是门
 
-面板已有 40 个 Tauri 命令（`main.rs` 的 `invoke_handler`），恰好覆盖 Agent 需要的全部动作：
+面板已有 44 个 Tauri 命令（`main.rs` 的 `invoke_handler`，2026-10-27 数），恰好覆盖 Agent 需要的全部动作：
 
 | 领域 | 现有命令 |
 |---|---|
 | 枚举 | `list_windows` / `list_mics` / `list_devices` / `env_info` / `source_preview` / `source_titles` |
-| Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` / `restore_window` |
-| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `stop_source` / `overlay_finish` / `overlay_cancel` / `preheat_engine` |
-| 状态 | `status`（`StatusInfo`：recording/elapsed/逐源 alive/error）/ `config_get` / `journal_get` |
+| Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` / `restore_window` / `add_live_source`（录制中加源）/ `add_source_from_tray`（托盘唤回面板并开选择器） |
+| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `pause_recording` / `resume_recording` / `stop_source` / `overlay_finish` / `overlay_cancel` / `preheat_engine` |
+| 状态 | `status`（`StatusInfo`：recording/elapsed/paused/live/error）/ `config_get` / `journal_get` |
 | 设置 | `set_hotkey` / `set_countdown` / `set_finalize_panel` / `set_ffmpeg_path` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `set_active_tab` / `pick_folder` / `pick_file` |
 | 历史 | `journal_seen` / `journal_clear` / `log_delete`（单条删日志）/ `log_push` / `take_delete` / `open_take` |
 | 面板自身 | `show_main` / `hide_tray` / `ui_ping` / `ui_settings` |
 
-CLI（`takekit`）是**一次性录制器**（`takekit list` / `takekit record …`），录完就退，
-**不能指挥正在运行的面板**。
+> 本节写的是 **v1 之前的现状**（为什么需要那道门）。当时 CLI 只是一次性录制器；v1 之后
+> `takekit ctl` 已经能指挥运行中的面板（§7.2），这句话只作历史保留，别当成现在的约束。
+
+CLI（`takekit`）原本是**一次性录制器**（`takekit list` / `takekit record …`），录完就退，
+不能指挥正在运行的面板（v1 之后 `takekit ctl` 补上了这一面，见 §7.2）。
 
 Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就是那道缺的门。
 
@@ -120,8 +123,10 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 
 ### 5.2 `/state` 快照 schema
 
-**形状 = 磁盘上的形状**（`config.json` / `journal.json` 的 serde 序列化），外加每个
-source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON 就是面板自己存的 JSON。
+**形状 = 磁盘上的形状**（`journal.json` 的 serde 序列化、`Source` 的 serde 序列化），
+外加每个 source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON 就是面板自己存的 JSON。
+唯一的例外是 `config`：它只列 Agent 能改的那 12 个键，UI 自己的本地状态（`active_tab`、
+`window_pos`、`sources`）不出现在快照里（`sources` 单独成顶层数组，带 `index`）。
 `capture` 是 serde 的外部标记枚举（`{"Window": {…}}`），`encoder` 用 `PATCH` 也认的
 小写短名、`null` = 自动，`history.takes` 是 `TakeRecord`（`dir` 全路径、`at` 是 Unix 毫秒）：
 
@@ -153,7 +158,8 @@ source 一个 `index`——不发明第二套 schema，Agent 写回去的 JSON �
       "audio": false
     }
   ],
-  "status": { "recording": false, "elapsed": 0.0, "error": null, "live": [] },
+  "status": { "recording": false, "elapsed": 0.0, "paused": false, "pause_len": 0.0,
+              "error": null, "live": [] },
   "history": {
     "takes": [ { "dir": "D:\\takes\\2026-10-21-22-30-00", "at": 1761057000000,
                  "seconds": 12.4, "bytes": 1048576, "failed": 0 } ],
@@ -265,12 +271,16 @@ takekit ctl remove --index 1
 takekit ctl config --out-root D:\takes --countdown 5
 takekit ctl config --ffmpeg-path ""    # 清掉 ffmpeg 路径覆盖，回到 PATH 查找
 takekit ctl start
+takekit ctl pause                      # 停钟 + 每个源收尾当前文件（仅 Windows 后端）
+takekit ctl resume                     # 每个源在下一个样本上开新段
+takekit ctl add-live --kind window --target 微信   # 加进正在录的这一条 take
 takekit ctl stop                       # 打印落盘目录
 takekit ctl history
 takekit ctl delete --id 2026-10-21-22-30-00 --confirm
 ```
 
-`ctl add` 的 spec flag：`--kind`（必填，window|desktop|camera|mic|system-audio|window-audio）、
+`ctl add` 与 `ctl add-live`（同一套 spec flag，前者进列表、后者加进正在录的这一条 take）：
+`--kind`（必填，window|desktop|camera|mic|system-audio|window-audio）、
 `--target`（标题/设备名子串）、`--monitor`、`--crop T,B,L,R`、`--fps`、`--quality`、
 `--sound on|off`（window/desktop 才认，其余 400）。
 `ctl config` 的设置 flag（与 MCP `takekit_set_settings` 同键）：`--hotkey`、

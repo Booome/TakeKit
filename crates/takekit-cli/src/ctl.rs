@@ -69,6 +69,10 @@ pub enum Ctl {
         /// Per-source quality (default: the session quality)
         #[arg(long)]
         quality: Option<u8>,
+        /// Record this source's sound into its own file (window or desktop
+        /// kinds) — the same switch `add` and MCP take
+        #[arg(long)]
+        sound: Option<String>,
     },
     /// Remove the source at an index from /state
     Remove {
@@ -209,6 +213,7 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             crop,
             fps,
             quality,
+            sound,
         } => {
             let mut body = json!({ "kind": kind });
             if let Some(target) = target {
@@ -225,6 +230,13 @@ pub fn run(cmd: Ctl) -> Result<(), String> {
             }
             if let Some(quality) = quality {
                 body["quality"] = json!(quality);
+            }
+            // `/record/sources` parses the same spec as `/sources`, so a source
+            // added mid-take must be able to carry its sound too — otherwise
+            // "add a window with its sound" works before a take and not during
+            // one, on the one surface that is a shell script.
+            if let Some(sound) = sound {
+                body["sound"] = on_off("sound", &sound)?;
             }
             // The answer carries `start` — where the new file begins on the
             // take's timeline, in seconds — which is the number a caller needs

@@ -27,3 +27,17 @@ function clock(seconds) {
   const s = String(total % 60).padStart(2, "0");
   return `${h}:${m}:${s}`;
 }
+
+// The same duration where a leading `00:` only takes up room: `1:24`, and
+// `1:02:00` once it is past an hour (`62:03` is not a duration anyone reads).
+// The bar's clock always shows hours because it sits in a fixed column; these
+// are the places where the number is prose — a source's start chip, a row on
+// the stop checklist, the popover's paused note. All three had their own copy
+// before 2026-10-27, and one of them disagreed about the hour case.
+function shortClock(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+}

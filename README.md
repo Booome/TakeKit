@@ -31,8 +31,10 @@ source at its own rate.
   manifest, so nothing downstream has to guess where it belongs.
 - **A take can be paused, and the pause is cut out.** The clock stops, every source closes the file
   it is writing, and the resume opens the next one on the exact frame the last ended. What comes out
-  is clips that already sit next to each other on a timeline — nothing to find and trim. Windows
-  backend only.
+  is clips that already sit next to each other on a timeline — nothing to find and trim. A source
+  that was cut this way gets every part numbered (`clip-part1.mp4`, `clip-part2.mp4` …); one that was
+  not keeps its plain name (`clip.mp4`), so a number in a file name always means "part of a set".
+  Windows backend only.
 - **Two capture backends.**
   - *Windows APIs* (WGC + Media Foundation), fully in-process: keeps recording a window even while
     it sits behind other windows. The panel uses this by default.
@@ -174,8 +176,8 @@ takes/2026-10-18-11-31-33/
   "duration": 60.0,
   "start_clock": "frames",
   "sources": [
-    { "id": "win", "file": "win.mkv", "start": 0.0, "duration": 60.0,
-      "source": { "id": "win", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
+    { "id": "virtualbox", "file": "virtualbox.mkv", "start": 0.0, "duration": 60.0,
+      "source": { "id": "virtualbox", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
                                            "title": "VirtualBox",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } },

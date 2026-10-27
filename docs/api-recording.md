@@ -412,18 +412,30 @@ ffprobe 实测：`screen.mp4 60.533` / `mic.mp4 60.544`，**只差 11ms**，文�
 那 4.9 秒是真写进文件的：`84624 × 1024 / 48000 = 1805.312s`，而真实流逝 1800.5s——
 30 分钟里采集 pump 多交了约 23 万个样本（0.27%）。
 
-### 11.2 遗留：音频时间线会被一次性事故拉长（未修）
+### 11.2 音频时间线会被一次性事故拉长（已修，2026-10-27）
 
-`AudioWriter::write` 目前**忽略 `chunk.time`**（除首个 chunk），按 `next = start + duration` 连续写：
+原来的 `AudioWriter::write` **忽略 `chunk.time`**（除首个 chunk），按 `next = start + duration` 连续写：
 
 - 设备真断档 → 洞里补不出声音，但既不补静音也不报错，后续整体前移（同步保住，丢内容）
 - 设备重投/回退 → 字节重复累加，**后续整体后移，永久失去同步** ← 30 分钟那次属于这类
 
-修法：`write` 拿 `chunk.time` 与 `next` 比，容差取 40ms（约一个缓冲）：
+修法：`write` 拿 `chunk.time` 与 `next` 比，容差 40ms（约一个缓冲，`SKEW_TOLERANCE`）：
 
 - `skew > 容差` → 当真实空洞，写静音补到 `chunk.time`
 - `skew < -容差` → 当重投/回退，**跳过该 chunk**（宁可丢内容，保住同步）
 - 其余 → 仍按 `next` 首尾相接，吸收抖动
+
+🔴 **上表漏了一个前提，补上之后才敢上线**：WASAPI 的时间戳与字节数**不一定在同一绝对基准上**。
+如果设备时钟整体偏 200ms，上面两条会把**每一个 chunk** 都判成空洞并补静音——文件被静音撑爆，
+比原来的 bug 更糟。所以判定用的是**变化量**：`AudioWriter::skew_base` 记住第一次可测量的
+偏差，之后只看 `skew - base`。偏移被学掉，事件才被修。
+
+判定逻辑抽成了纯函数 `place(arrival, next, &mut base) -> Placement{Chain, AfterHole, Skip}`，
+两条单测钉住：`a_redelivered_chunk_is_dropped_and_a_real_hole_is_filled`、
+`a_standing_clock_offset_is_learned_not_repaired`（50 个连续偏移 chunk 必须全部 `Chain`）。
+
+**未做的验证**：30 分钟那次事故是偶发，没有可复现的注入手段；单测覆盖的是判定，不是真实设备。
+下次长录制的 `probed` 与 `duration` 差值仍是唯一实测证据。
 
 ### 11.3 窗口声音改为窗口源的选项
 

@@ -398,8 +398,11 @@ fn record(args: RecordArgs) -> Result<(), String> {
     }
     if let Some(target) = &args.window {
         let win = window_target(target)?;
+        // Called after its app, like the panel does (2026-10-27): the file in
+        // the take folder should say which app was recorded. No collision check
+        // is needed because `--window` takes one window.
         let mut source = Source::new(
-            "win",
+            win.app.clone(),
             Capture::Window {
                 hwnd: win.hwnd,
                 // The handle alone can be recycled onto another app's window;

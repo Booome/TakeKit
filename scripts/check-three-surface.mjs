@@ -8,16 +8,20 @@
 // docs/api-recording.md).
 //
 // Usage:  cargo build --workspace && node scripts/check-three-surface.mjs
-// Close any running panel first: a second instance exits on sight, and the
-// isolated APPDATA below would then point at a control port that never opens.
+// A panel already running blocks this (and every GUI check): the isolated
+// APPDATA below gives a fresh control port but the single-instance mutex is
+// machine-wide, so the launch exits on sight. `lib/panel-guard.mjs` refuses up
+// front and names the pid, instead of failing at the port nine steps later.
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
+import { assertNoPanel, startPanel } from "./lib/panel-guard.mjs";
+import { pickBinary } from "./lib/build.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const GUI = path.join(ROOT, "target", "debug", "takekit-gui.exe");
-const TK = path.join(ROOT, "target", "debug", "takekit.exe");
+const GUI = pickBinary(ROOT, "takekit-gui.exe", "TK_GUI");
+const TK = pickBinary(ROOT, "takekit.exe", "TK_CLI");
 const OUT = path.join(ROOT, "target", "checks", "three-surface");
 const APPDATA = path.join(OUT, "appdata");
 const appDir = path.join(APPDATA, "TakeKit");
@@ -37,28 +41,46 @@ function record(name, ok, detail) {
   say(`${ok ? "PASS" : "FAIL"}  ${name}  ${detail || ""}`);
 }
 
-try { rmSync(OUT, { recursive: true, force: true }); } catch {}
+// `control.json` is the only file here that can poison a run, and it is the only
+// one deleted: the port it names belongs to a process from an earlier run, so
+// every request below would go there and report on a panel this script never
+// started. A whole-tree delete is not available — the host's bulk-delete guard
+// refuses more than 50 files at once (`SAFE_DELETE_BULK_CONFIRM_REQUIRED`), and
+// swallowing that failure is how the stale port survived in the first place.
+try {
+  rmSync(path.join(appDir, "control.json"), { force: true });
+} catch (e) {
+  console.error(`could not remove the stale control.json: ${e.message}`);
+  process.exit(2);
+}
 mkdirSync(appDir, { recursive: true });
 writeFileSync(path.join(appDir, "config.json"), JSON.stringify({ sources: [], backend: "windows", marks: false }));
 
-const gui = spawn(GUI, [], {
-  env: { ...process.env, APPDATA, TAKEKIT_WEBVIEW_NO_SANDBOX: "1", WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2") },
-  detached: true,
-  stdio: "ignore",
-});
-gui.unref();
+await assertNoPanel();
 
-const controlFile = path.join(appDir, "control.json");
-let control = null;
-for (let i = 0; i < 60; i++) {
-  await sleep(500);
-  if (existsSync(controlFile)) {
-    try { control = JSON.parse(readFileSync(controlFile, "utf8")); if (control.port) break; } catch {}
-  }
-}
-record("panel-start", Boolean(control?.port), `port ${control?.port}`);
-if (!control?.port) {
-  say("the panel did not come up — is another instance already running?");
+let guiPid = 0;
+const guiLaunch = () => {
+  const child = spawn(GUI, [], {
+    env: { ...process.env, APPDATA, TAKEKIT_WEBVIEW_NO_SANDBOX: "1", WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2") },
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  guiPid = child.pid;
+  return child;
+};
+
+// Retried: this runs after other checks that kill their panel, and a panel that
+// cannot start says nothing about the three surfaces (see `startPanel`).
+const boot = await startPanel(guiLaunch, appDir);
+const control = boot.control;
+// The pid is half of it: a control.json left behind points at a port this
+// process never opened, and every call below would then be somebody else's
+// panel answering. Same guard as check-ui-matrix / check-midtake.
+record("panel-start", Boolean(control?.port) && control.pid === guiPid,
+  `port ${control?.port} pid ${control?.pid} (ours ${guiPid})`);
+if (!control?.port || control.pid !== guiPid) {
+  say("the panel did not come up under this pid — is another instance running, or a stale control.json?");
   process.exit(1);
 }
 
@@ -74,7 +96,7 @@ const winTitle = windows[0]?.title || "";
 record("window-available", Boolean(winTitle), JSON.stringify(winTitle));
 if (!winTitle) {
   say("no recordable window on screen — open any app and rerun");
-  try { execFileSync("taskkill", ["/PID", String(gui.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+  try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
   process.exit(2);
 }
 const fragment = winTitle.split(/[-—|·]/)[0].trim().slice(0, 24);
@@ -146,7 +168,7 @@ try {
 } finally {
   mcp.stdin.end();
   mcp.kill();
-  try { execFileSync("taskkill", ["/PID", String(gui.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+  try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
 }
 
 // The CLI half: the flag has to exist and be documented, or the three

@@ -46,14 +46,6 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-#list {
-  font: 400 16px/1.6 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui,
-    sans-serif;
-  color: #fff;
-  opacity: 0.85;
-  text-align: center;
-}
-
 .go {
   color: var(--tk-ok);
 }
@@ -66,47 +58,104 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* The stop checklist: one row per file as it lands (DESIGN §4.6). Numbers
-   share one tabular column width so the rows line up; the failure row swaps
-   them for a cross and the reason. */
+/* The stop checklist: one row per file as it lands (DESIGN §4.6).
+ *
+ * Laid out as a table, not as a row of flex boxes. Every row carries the same
+ * track list, so the duration / resolution / size columns sit on the same three
+ * vertical lines however long a source's name is. The flex version let each row
+ * decide where its own columns started: a 14-character id shoved that row's
+ * numbers 30px right, and a missing resolution pulled them back left again —
+ * three rows, three different rhythms, which reads as noise exactly when the
+ * user is checking whether the take came out whole (reported 2026-10-27).
+ *
+ * The widths are fixed rather than `max-content` for the same reason: a column
+ * that grows with its widest cell lines up but jumps between takes. The track
+ * list is one custom property because it has to be written twice — on the list
+ * and on every row — and two copies of it drift (the first attempt used
+ * `subgrid` to share the tracks; this WebView2 drops the keyword and the rows
+ * silently fall back to auto columns, which is worse than not trying). */
 #list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 420px;
-}
-
-#list .row {
-  display: flex;
-  align-items: baseline;
-  gap: 22px;
-  font: 400 16px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --tk-cols: minmax(0, 1fr) 76px 116px 92px;
+  display: grid;
+  grid-template-columns: var(--tk-cols);
+  column-gap: 20px;
+  row-gap: 4px;
+  width: 560px;
+  font: 400 16px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
   color: #fff;
-  opacity: 0.85;
   font-variant-numeric: tabular-nums;
-  text-align: left;
 }
 
+/* A row can be an empty reserved slot (see overlay.js: take:finalize reserves
+   one per file so the centred stack does not walk upwards as they land). An
+   empty grid row has nothing to size it, so it is told it is one line high
+   before it has any text: `lh` is the line box, `1.5em` the same number for
+   engines that do not know it (16px × 1.5 = 24px in either case). */
+#list .row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: var(--tk-cols);
+  align-items: baseline;
+  min-height: 1.5em;
+  min-height: 1lh;
+}
+
+/* The file's name — the one column that is prose. It gets whatever is left
+   over, and gives up characters before it gives up alignment. */
 #list .row-id {
-  flex: none;
-  min-width: 64px;
-}
-
-#list .row-num {
-  flex: none;
-  min-width: 84px;
-  text-align: right;
-}
-
-#list .row-bad {
-  flex: none;
-  color: var(--tk-bad);
-}
-
-#list .row-why {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  text-align: left;
+}
+
+/* Three levels of emphasis in one row, because a table of equal-weight cells is
+   a wall: the file name is what the row is about (full white), the numbers are
+   what you check against it, and the resolution is the footnote. */
+#list .row-num {
+  opacity: 0.8;
+  text-align: right;
+}
+
+/* The resolution is the least urgent thing on the row: it explains a file size,
+   but nobody reads it first. */
+#list .row-res {
+  opacity: 0.45;
+}
+
+/* A failed source has no numbers worth printing, so the reason takes the rest
+   of the row — from the duration column to the right edge, which is where the
+   eye already is after reading the name. `✗` rides inside so it cannot drift
+   away from the sentence it belongs to. */
+#list .row-why {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+#list .row-bad {
+  color: var(--tk-bad);
+}
+
+/* The stop screen's way out: pinned to the bottom of the screen so the summary
+   does not shift when it appears, and quiet enough that it does not compete
+   with the numbers it is under. */
+#foot {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 48px;
+  text-align: center;
+  font: 400 14px/1.5 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui,
+    sans-serif;
+  color: #fff;
+  opacity: 0.55;
+}
+
+#foot[hidden] {
+  display: none;
 }

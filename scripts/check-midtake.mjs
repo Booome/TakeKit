@@ -16,10 +16,12 @@
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import path from "node:path";
+import { assertNoPanel, startPanel } from "./lib/panel-guard.mjs";
+import { pickBinary } from "./lib/build.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const GUI = path.join(ROOT, "target", "debug", "takekit-gui.exe");
-const TK = path.join(ROOT, "target", "debug", "takekit.exe");
+const GUI = pickBinary(ROOT, "takekit-gui.exe", "TK_GUI");
+const TK = pickBinary(ROOT, "takekit.exe", "TK_CLI");
 const OUT = path.join(ROOT, "target", "checks", "midtake");
 const APPDATA = path.join(OUT, "appdata");
 const appDir = path.join(APPDATA, "TakeKit");
@@ -39,14 +41,65 @@ for (const bin of [GUI, TK]) {
     process.exit(2);
   }
 }
-try { rmSync(OUT, { recursive: true, force: true }); } catch {}
+// A stale tree here is not cosmetic: control.json from a previous instance
+// points at a port nobody is listening on, and this script then spends a
+// minute reporting on a window it never started (2026-10-27 — the failures read
+// like a broken `take::begin` and were neither).
+//
+// Only the two files that cause it are deleted, because the whole tree cannot
+// be: the host's bulk-delete guard refuses anything over 50 files
+// (`SAFE_DELETE_BULK_CONFIRM_REQUIRED`, measured at 194 here), so a full wipe
+// fails on every run after the first — and a fatal error on a *cleanup* step is
+// a check that can never pass twice. `probe-handle.txt` is fatal for its own
+// reason: an old HWND is not a window, so the seeded source renders dead and
+// the mid-take assertions describe the wrong screen. Recordings from earlier
+// runs and `wv2/` are left to be overwritten and reused.
+for (const stale of [path.join(appDir, "control.json")]) {
+  try {
+    rmSync(stale, { force: true });
+  } catch (e) {
+    console.error(`could not remove the stale ${stale}: ${e.message}`);
+    process.exit(2);
+  }
+  if (existsSync(stale)) {
+    console.error(`a stale ${stale} survived — is a previous run still up?`);
+    process.exit(2);
+  }
+}
 mkdirSync(appDir, { recursive: true });
+
+// The probe log appends across runs, so a line from an earlier run would pass
+// this run's assertion for it. Everything read from it is taken after
+// `probeFrom`, the length it had before this panel started.
+const probeLog = path.join(OUT, "probe.log");
+const probeFrom = (() => {
+  try {
+    return readFileSync(probeLog).length;
+  } catch {
+    return 0;
+  }
+})();
+const probeSinceStart = () => {
+  try {
+    return readFileSync(probeLog, "utf8").slice(probeFrom);
+  } catch {
+    return "";
+  }
+};
 
 // ── the fixture window ─────────────────────────────────────────────────────
 // Visible, not minimized: frames have to flow for the take to have content,
 // and a minimized window records a still (the matrix's case, not this one).
 const PROBE_PS1 = path.join(OUT, "probe.ps1");
-const PROBE_HANDLE = path.join(OUT, "probe-handle.txt");
+// The handle file cannot have a fixed name. The read loop below polls every
+// 200 ms while the fixture takes about a second to start, so a leftover from an
+// earlier run gets read *first*, long before the new window writes its own —
+// and the script then seeds a source pointing at a dead handle. What that looks
+// like is `check_sources` silently dropping it, `/record/start` answering
+// `no-sources`, and a run that reads like the mid-take door is broken. Measured
+// on 2026-10-27: the log printed hwnd 131668896 while the file ended up holding
+// 12191704 — the value it read was two runs old. A nonce cannot be stale.
+const PROBE_HANDLE = path.join(OUT, `probe-handle-${process.pid}-${Date.now()}.txt`);
 writeFileSync(PROBE_PS1, [
   "param([string]$HandleFile, [string]$Caption)",
   "Add-Type -AssemblyName System.Windows.Forms",
@@ -100,39 +153,68 @@ writeFileSync(path.join(appDir, "config.json"), JSON.stringify({
   countdown_secs: 0,
 }));
 
-const gui = spawn(GUI, [], {
-  env: {
-    ...process.env,
-    APPDATA,
-    TAKEKIT_WEBVIEW_NO_SANDBOX: "1",
-    WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2"),
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
-  },
-  detached: true,
-  stdio: "ignore",
-});
-gui.unref();
+await assertNoPanel();
 
-let control = null;
-const controlFile = path.join(appDir, "control.json");
-for (let i = 0; i < 60; i++) {
-  await sleep(500);
-  if (existsSync(controlFile)) {
-    try { control = JSON.parse(readFileSync(controlFile, "utf8")); if (control.port) break; } catch {}
-  }
-}
-record("panel-start", Boolean(control?.port), `control port ${control?.port}`);
-if (!control?.port) process.exit(1);
+let guiPid = 0;
+const guiLaunch = () => {
+  const child = spawn(GUI, [], {
+    env: {
+      ...process.env,
+      APPDATA,
+      TAKEKIT_WEBVIEW_NO_SANDBOX: "1",
+      // The probe log is what tells "the Rust watch stopped it" apart from
+      // "the capture gave up on its own" — `alive: false` is the same either
+      // way, and only one of them is the behaviour this check is about.
+      TAKEKIT_PROBE_LOG: probeLog,
+      WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2"),
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
+    },
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  guiPid = child.pid;
+  return child;
+};
+// Killed on the way out, like the other checks: a panel left behind keeps its
+// control.json, and the next run then posts its requests into the old port.
+process.on("exit", () => {
+  try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+});
+
+// Retried: this runs right after other checks that kill their panel, and a
+// panel that cannot start says nothing about adding a source (see `startPanel`).
+const boot = await startPanel(guiLaunch, appDir);
+const control = boot.control;
+// The pid is half the check: a control port that is not this process's means
+// every request below lands somewhere else, and every assertion then reports on
+// a window that was never opened.
+record(
+  "panel-start",
+  Boolean(control?.port) && control.pid === guiPid,
+  `control port ${control?.port} pid ${control?.pid} (ours ${guiPid})`,
+);
+if (!control?.port || control.pid !== guiPid) process.exit(1);
 const CTL = `http://127.0.0.1:${control.port}`;
 const AUTH = { Authorization: `Bearer ${control.token}` };
 
+// Wait for the panel's own document, by name — not for the port, and not for
+// "any page target". The veil window is created before the panel, so during
+// start-up its target still reads about:blank, and a fallback that takes the
+// first page in the list drives the wrong window and reports a panel that
+// answers null to everything (2026-10-27).
 let list = null;
-for (let i = 0; i < 50 && !list; i += 1) {
-  try { list = JSON.parse(await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).text()); } catch { await sleep(200); }
+let target = null;
+for (let i = 0; i < 60 && !target; i += 1) {
+  try {
+    list = JSON.parse(await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).text());
+    target = list.find((t) => t.type === "page" && /tauri\.localhost\/(index\.html)?$/.test(t.url || ""));
+  } catch {
+    list = null;
+  }
+  if (!target) await sleep(250);
 }
-const target = list?.find((t) => t.type === "page" && /tauri\.localhost\/$/.test(t.url || "")) ||
-  list?.find((t) => t.type === "page");
-record("cdp-target", Boolean(target), target?.url);
+record("cdp-target", Boolean(target), target?.url ?? list?.map((t) => t.url).join(", "));
 if (!target) process.exit(1);
 
 const ws = new WebSocket(target.webSocketDebuggerUrl);
@@ -223,6 +305,53 @@ const secondChip = await js(`(() => {
 const after = JSON.parse(secondChip || "{}");
 record("the-new-row-gets-an-offset", after.n === 2 && Boolean(after.start), JSON.stringify(after));
 
+// ── a source that goes away is stopped by Rust, not by the panel ───────────
+//
+// The panel hides itself for the whole take (it would otherwise be in the
+// recording) and Chromium throttles — then freezes — a hidden window's timers,
+// which is why the health check cannot live there: a window closed at 0:05
+// would keep having the desktop behind it recorded until 1:05, and nothing
+// about the resulting clip would say it was wrong.
+//
+// Reproducing that needs the panel genuinely out of the loop, which takes two
+// things, and skipping either one makes this assertion pass with the Rust watch
+// deleted:
+//
+//   * the page is **frozen** (`Page.setWebLifecycleState`), because attaching
+//     DevTools is itself what keeps a hidden page's timers running — the panel's
+//     own 250 ms tick would otherwise win the race every time;
+//   * the polling below goes through the **control port**, because the page is
+//     now frozen.
+//
+// `alive: false` on its own proves nothing (a capture whose window vanished can
+// also give up by itself); the `source:vanished` probe line is the one only the
+// watch writes.
+const liveBefore =
+  (await fetch(`${CTL}/state`, { headers: AUTH }).then((r) => r.json()).catch(() => null))?.status
+    ?.live?.map((x) => x.id) ?? [];
+await send("Page.setWebLifecycleState", { state: "frozen" });
+try {
+  fixtures[1].proc.kill();
+} catch {}
+let died = null;
+for (let i = 0; i < 16 && !died; i += 1) {
+  await sleep(250);
+  const live =
+    (await fetch(`${CTL}/state`, { headers: AUTH }).then((r) => r.json()).catch(() => null))?.status
+      ?.live ?? [];
+  const gone = live.find((x) => !x.alive);
+  if (gone) died = gone.id;
+}
+let saidSo = false;
+try {
+  saidSo = /source:vanished/.test(probeSinceStart());
+} catch {}
+record(
+  "a-window-that-closes-is-stopped-without-the-panel",
+  Boolean(died) && saidSo,
+  `live ${JSON.stringify(liveBefore)} → stopped ${died || "none within 4s"}, probe-source:vanished=${saidSo}`,
+);
+
 const shot = await send("Page.captureScreenshot", { format: "png" }, 25000);
 if (shot.result?.data) writeFileSync(path.join(OUT, "mid-take.png"), Buffer.from(shot.result.data, "base64"));
 
@@ -241,6 +370,12 @@ if (stopped?.dir) {
     (manifest?.sources || []).map((s) => `${s.id}@${s.start}`).join(" | "));
   const late = (manifest?.sources || []).find((s) => s.start > 0);
   record("the-added-source-starts-later", Boolean(late), late ? `${late.id} at ${late.start}s` : "none has start > 0");
+  // A take that was never paused has one file per source and no `-part` in any
+  // name: the number is only there to line up a split, so it must not appear
+  // where there is nothing to line up (2026-10-27).
+  const names = (manifest?.sources || []).flatMap((s) => [s.file, ...(s.segments || []).map((g) => g.file)]);
+  record("an-uncut-source-keeps-its-plain-name", names.length > 0 && names.every((n) => !/-part\d/.test(n)),
+    names.join(" ") || "no names");
 }
 
 const failed = results.filter((r) => !r.ok);

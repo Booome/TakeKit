@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use takekit_core::encoder::Encoder;
-use takekit_core::source::{Backend, Source};
+use takekit_core::source::{Backend, Capture, Source};
 
 /// Every writer takes this, so a drag and a source edit cannot lose each
 /// other's field to a read-modify-write race on the shared file.
@@ -29,6 +29,10 @@ pub struct WindowPos {
 pub struct Config {
     /// Global shortcut that starts/stops a take, e.g. `"F9"`.
     pub hotkey: String,
+    /// Global shortcut that pauses/resumes the running take, e.g. `"F10"`.
+    /// Empty switches it off; the panel's button and the tray popover still
+    /// work, the key is only a shortcut.
+    pub pause_hotkey: String,
     /// Full-screen countdown before the take starts; `0` turns it off.
     pub countdown_secs: u8,
     /// Show the full-screen summary while a take is being finalised.
@@ -72,6 +76,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "F9".to_string(),
+            pause_hotkey: "F10".to_string(),
             countdown_secs: 3,
             finalize_panel: true,
             sources: Vec::new(),
@@ -100,30 +105,101 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        Self::load_from(&Self::path())
+        let path = Self::path();
+        let (cfg, renamed) = Self::read(&path);
+        // The rename has to survive a restart even when nothing else is saved:
+        // a source that goes back to being called `win` on the next launch is
+        // the same bug with a longer delay.
+        if renamed {
+            let _ = cfg.save_to(&path);
+        }
+        cfg
     }
 
     pub fn load_from(path: &Path) -> Config {
+        Self::read(path).0
+    }
+
+    /// The config on disk, and whether any window source had to be renamed on
+    /// the way in (`load` writes the file back when it did).
+    fn read(path: &Path) -> (Config, bool) {
         // Read as bytes: a file written as UTF-16 fails `read_to_string`,
         // and returning defaults there would skip the backup below and let
         // the next save erase what was there.
         let Ok(bytes) = std::fs::read(path) else {
-            return Config::default();
+            return (Config::default(), false);
         };
         // A hand-edited file can carry a UTF-8 BOM — PS `Set-Content -Encoding
         // UTF8` writes one — and it is not JSON.
         let text = String::from_utf8_lossy(&bytes);
         let body = text.trim_start_matches('\u{feff}');
-        match serde_json::from_str(body) {
-            Ok(cfg) => cfg,
+        match serde_json::from_str::<Config>(body) {
+            Ok(mut cfg) => {
+                let renamed = cfg.name_window_sources();
+                (cfg, renamed)
+            }
             Err(_) => {
                 // Keep the unparseable file before the next save replaces it
                 // with defaults: the alternative is losing the hotkey and the
                 // source list because one byte was wrong.
                 takekit_core::fsx::backup_corrupt(path);
-                Config::default()
+                (Config::default(), false)
             }
         }
+    }
+
+    /// A window source's id is the file it becomes, and configs written before
+    /// 2026-10-27 hold `win`, `win-2`: names that say nothing about the window.
+    /// Adding a source now derives its name from the app, so the rename reaches
+    /// every *new* source and none of the ones a user already has — which is to
+    /// say it never reaches the person who has been using the panel. So the
+    /// names are re-derived on load.
+    ///
+    /// Only the legacy shapes are touched (`win`, `win-N`, and the same with
+    /// `-audio`). A name that already came from an app is left exactly as it
+    /// is: it may be the only record of a window that has since closed.
+    ///
+    /// Returns whether anything changed, so `load` can write the file back.
+    fn name_window_sources(&mut self) -> bool {
+        self.name_window_sources_with(takekit_core::source::app_of_pid)
+    }
+
+    fn name_window_sources_with(&mut self, name: impl Fn(u32) -> Option<String>) -> bool {
+        let mut renamed = false;
+        let mut taken: Vec<String> = self
+            .sources
+            .iter()
+            .filter(|s| !is_legacy_window_id(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        for s in &mut self.sources {
+            if !is_legacy_window_id(&s.id) {
+                continue;
+            }
+            let pid = match s.capture {
+                Capture::Window { pid, .. } => pid,
+                _ => continue,
+            };
+            // A closed window's process is gone, and `win` is still a better
+            // name than the empty one a failed lookup would give.
+            let Some(app) = name(pid) else { continue };
+            let base = if s.id.ends_with("-audio") {
+                format!("{app}-audio")
+            } else {
+                app
+            };
+            let mut id = base.clone();
+            for n in 2.. {
+                if !taken.contains(&id) {
+                    break;
+                }
+                id = format!("{base}-{n}");
+            }
+            taken.push(id.clone());
+            s.id = id;
+            renamed = true;
+        }
+        renamed
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
@@ -162,6 +238,15 @@ impl Config {
     /// plain JSON, editable by hand.
     pub fn effective_hotkey(&self) -> String {
         crate::shortcut::normalize(&self.hotkey).unwrap_or_else(|| Config::default().hotkey)
+    }
+
+    /// The pause key in the form the registrar accepts, `None` when it is off.
+    ///
+    /// No forced fallback here, unlike `hotkey`: a pause key the user did not
+    /// ask for takes that shortcut away from whatever else owns it, and "no
+    /// pause key" is a legitimate setting (the button and the tray still work).
+    pub fn effective_pause_hotkey(&self) -> Option<String> {
+        crate::shortcut::normalize(&self.pause_hotkey)
     }
 
     /// A language this build can actually draw in.
@@ -206,10 +291,113 @@ pub fn valid_tab(tab: &str) -> &'static str {
     }
 }
 
+/// Whether a source id is one of the names window sources had before they were
+/// named after their app: `win`, `win-2`, `win-audio`, `win-2-audio`. Everything
+/// else is left alone — in particular an app really called `win` stays `win`,
+/// because re-deriving it gives the same answer.
+fn is_legacy_window_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("win") else {
+        return false;
+    };
+    let rest = rest.strip_suffix("-audio").unwrap_or(rest);
+    rest.is_empty()
+        || (rest.len() > 1
+            && rest.starts_with('-')
+            && rest[1..].chars().all(|c| c.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use takekit_core::source::{Capture, Crop};
+    use takekit_core::source::Crop;
+
+    fn window_source(id: &str, pid: u32) -> Source {
+        Source::new(
+            id,
+            Capture::Window {
+                hwnd: 1,
+                pid,
+                title: String::new(),
+                crop: Crop::default(),
+            },
+            30,
+        )
+    }
+
+    #[test]
+    fn a_window_source_drops_its_win_name() {
+        // The state a config is actually in on this machine: two window sources
+        // called `win` and `win-2`, and a mic that must keep its own name.
+        let mut cfg = Config {
+            sources: vec![
+                Source::new(
+                    "mic",
+                    Capture::Mic {
+                        device: "x".to_string(),
+                    },
+                    30,
+                ),
+                window_source("win", 7),
+                window_source("win-2", 7),
+                window_source("win-audio", 8),
+            ],
+            ..Config::default()
+        };
+        assert!(cfg.name_window_sources_with(|pid| match pid {
+            7 => Some("chrome".to_string()),
+            8 => Some("code".to_string()),
+            _ => None,
+        }));
+        let ids: Vec<&str> = cfg.sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["mic", "chrome", "chrome-2", "code-audio"]);
+        // Idempotent: a second pass has nothing left to rename, so `load` does
+        // not rewrite the file on every launch.
+        assert!(!cfg.name_window_sources_with(|_| Some("chrome".to_string())));
+    }
+
+    #[test]
+    fn a_name_that_already_came_from_the_app_is_left_alone() {
+        // The migration must not rename a source it did not create: a window
+        // that has since closed keeps the only name it will ever have.
+        let mut cfg = Config {
+            sources: vec![window_source("chrome", 9)],
+            ..Config::default()
+        };
+        assert!(!cfg.name_window_sources_with(|_| None));
+        assert_eq!(cfg.sources[0].id, "chrome");
+        assert!(!cfg.name_window_sources_with(|_| Some("firefox".to_string())));
+        assert_eq!(cfg.sources[0].id, "chrome");
+    }
+
+    #[test]
+    fn loading_a_config_renames_the_win_sources_it_holds() {
+        // End to end through the file, with a pid that is guaranteed to answer:
+        // this test's own process. Whatever the test binary is called, `win` is
+        // not it.
+        let path = scratch("legacy-on-load");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"sources":[{{"id":"win","capture":{{"Window":{{"hwnd":1,"pid":{},"title":"","crop":{{"top":0,"bottom":0,"left":0,"right":0}}}}}},"fps":30}}]}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path);
+        assert_ne!(cfg.sources[0].id, "win");
+        assert!(!cfg.sources[0].id.is_empty());
+    }
+
+    #[test]
+    fn only_the_legacy_shapes_count_as_legacy() {
+        for id in ["win", "win-2", "win-11", "win-audio", "win-2-audio"] {
+            assert!(is_legacy_window_id(id), "{id}");
+        }
+        for id in ["winamp", "window", "chrome", "win-", "win--2", "win-x"] {
+            assert!(!is_legacy_window_id(id), "{id}");
+        }
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("takekit-cfg-{name}"));

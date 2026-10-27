@@ -36,21 +36,55 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 ```
 
 - 单独格式化某个文件：`rustfmt --edition 2024 <file>`。
-- `takekit-core` 有 7 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
+- `takekit-core` 有 8 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
 - `mouseshow` 的 `tests/gdi_leak.rs` 同样是 `#[ignore = "needs an interactive desktop"]`：**改过 overlay 创建/销毁就手动跑一次** `cargo test --test gdi_leak -- --ignored`（在 `mouseshow/` 里）。
   这条测试确实抓到过「同进程第二次录制报 `Class already exists`」（2026-10-26）——ignore 的测试没有固定运行场合，等于没有。
-- 基线（2026-10-27 实测）：cli 9 / core 63（+7 ignored）/ gui 84 / media 32。以 `cargo test` 实际输出为准。
+- 基线（2026-10-28 实测）：cli 9 / core 66（+8 ignored）/ gui 94 / media 37。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **功能级三端一致性**：`node scripts/check-three-surface.mjs`——真跑 MCP（schema → stdio 调用 → 面板 → 配置）和 CLI 参数。名字对了不等于字段通了：`sound` 曾在 schema 里声明、在 HTTP 转发前被白名单丢掉，`check-contracts.py` 看不见这种漂移。
+- 🔴 **每个 GUI 检查跑的是哪个二进制，开局就印出来**（`scripts/lib/build.mjs`，2026-10-28）：
+  `TK_GUI` / `TK_CLI` 显式指定优先，否则取 `target/{release,debug}` 里**较新的那个**，并打印
+  `using target/release/takekit-gui.exe (built …Z)`；比最新源码还旧就打 ⚠。这条不是装饰：
+  此前默认写死 `target/debug`，一个两天前的 debug 二进制让 `check-midtake` 报
+  `a-window-that-closes-is-stopped-without-the-panel` FAIL（`probe-source:vanished=false`），
+  换 `target/release` 同一棵树 15/15 —— **测错二进制时，结论长得跟代码有 bug 一模一样**。
 - **界面语言×主题**：`node scripts/check-ui-matrix.mjs`——zh/en × light/dark × 9 屏（源列表、卡片、最小化窗口的卡片、裁剪源卡片、裁剪工作区、裁剪被丢弃的卡片与工作区、添加源、设置），量横向滚动、文本溢出、WCAG AA 对比度，截图落 `target/checks/ui-matrix/`。它就是抓出「`.field button.browse` 选择器从未匹配、深色下 `…` 对比度 1.02」的那一个。
   - 它还钉住**尺寸列的口径**：裁剪放不下时，列表 / 卡片 / 工作区三处都必须报「整幅」。这条来自一次真事故——后端 `CropBox::rect_in` 会丢掉放不下的裁剪、整帧原样录，而列表当时照算式印 `1720×1392 → -2280×1392`，报的是一个永远不会存在的文件。**算术正确 ≠ 说得对**，凡是由算式得出的展示值，都要问一句「后端实际会给什么」。
   - 以及**行内空隙**（`row-summary-tight`）：帧率/画质格必须按文字自适应，且离尺寸列只隔 12px。定宽列装不满的那截空白不会溢出、不会截断、不会有滚动条，只有截图看得出来——用户先看到，测试才补上（2026-10-23）。
   - 以及**右侧三列是一条信息线**（`row-speaker-last` + `row-trailing-columns-line-up`）：喇叭必须在帧率之后、在最右；行从右往左排，所以任何宽度可变的格子落在数字左边都会让整列按行横移——不能出声的行因此保留一个同宽的**空槽**（`row-sound-slot`）而非少一格。这两条是同一个教训的两面：**右边的列只有在宽度不随行变化时才成列**。
   - 还会**自己造一个最小化的窗口**（WinForms 表单 + 最小化，脚本里 `probe` 那段）来测「没画面就不给裁」与「恢复窗口后能裁」；行标题则靠塞一个假标题（`STALE …`）来验证「显示的是窗口现在的名字」。这两条都是 2026-10-23 用户报的问题，靠读代码看不出来。
   - 以及**喇叭的作用域**（`row-speaker-scope`）：window 与 desktop 行必须有喇叭，mic 与 camera 行必须没有。判断种类用 `row.dataset.kind`（产品代码为测试加的语义钩子），不匹配图标 SVG——图标一改，断言就悄悄失效，那是最糟的一种绿。
-- **录制中加源的真路**：`node scripts/check-midtake.mjs`——13 条断言，唯一**真录一段**的检查。它走的路是：控制面 `POST /record/start`（面板没参与）→ 面板必须自己认出「正在录」→ `rec-btn` 显示停止、每行带起点 → 点 `#add-btn` 列表必须出来 → 点一个源必须**真加入这一条 take**（`status.sources` 1→2、多出一行带起点）→ 停下后 `take.json` 两个 `start` 都在、后加的那个 `> 0`。
+  - 以及**暂停态只有一个颜色**（`paused-look-is-one-colour` / `paused-badge-carries-the-mark` / `paused-hint-agrees-with-the-badge`，2026-10-27 加）：把 `state.paused` 摆成真、`render()` 之后，(徽章字色 == 计时字色 == 继续键底色) 三处必须相等，徽章必须带那个用 `::before` 画的 ▮▮（不用 U+23F8，字体一缺就是豆腐块），状态条 hint 必须与徽章说同一件事。
+  - 🔴 这组断言写了两遍才立住，**两次都是测太快**：`.pause` 有 160ms 的 background 过渡，`render()` 之后立刻读 computed style 拿到的是**过渡起点**（报 `rgb(255,255,255)`，截图却明明是琥珀）；改成 `sleep(260)` 又红，因为面板 tick 链每 ~1 秒 `invoke("status")` 再 `paintTransport()`，把脚本摆的 `state.paused` 用真实状态（false）覆盖回去，`body` 上根本没有 `paused` 类。**正解不是加长等待，是等到「条件成立」再采样**：12 次重断言 + 每次 190ms，`body.className` 里出现 `paused` 才 break 并当场截图。截图放在循环之后同样会拍到下一个 tick 之后的空闲态，必须移进循环内。
+- **录制中加源的真路**：`node scripts/check-midtake.mjs`——15 条断言，唯一**真录一段**的检查。它走的路是：控制面 `POST /record/start`（面板没参与）→ 面板必须自己认出「正在录」→ `rec-btn` 显示停止、每行带起点 → 点 `#add-btn` 列表必须出来 → 点一个源必须**真加入这一条 take**（`status.sources` 1→2、多出一行带起点）→ **关掉那个窗口必须在不靠面板的情况下被停掉**（见下）→ 停下后 `take.json` 两个 `start` 都在、后加的那个 `> 0`、没被切开的源不带 `-part`。
+  - 最后那条（2026-10-27）验的是 Rust 侧 `take::start_source_watch`，而它**不能靠「`alive:false` 出现」判**：采集自己在窗口消失时也可能放弃，两条路径的终态一模一样。所以先 `Page.setWebLifecycleState({state:"frozen"})` 把页面冻住（附着 DevTools 本身就在阻止隐藏页面被节流，不冻就永远是面板的 250ms tick 先赢），再用**控制面** `GET /state` 轮询，最后要求探针里有 `source:vanished`——那行只有 watch 会写。
   - 为什么另起一个检查：`check-ui-matrix` 里那条 `add-source-opens-while-recording` 是**把 `state.recording` 设成 `true` 再点按钮**，它证明渲染，不证明门。2026-10-24 就正因如此，一个「录制中点了添加源没列表」的面板通过了 151/151——`openPicker` 里留着 `if (state.recording) return`，而这条测试替它把状态摆好了。**凡是「状态由别处产生」的功能，测试都得从产生那一端开始。**
   - 同一次还查出一个真 bug：`state.recording` 只有 `toggleRecording` 会写，所以控制面 / CLI / MCP 起的那条 take 面板一直以为自己是空闲的（栏里写着「开始录制」，没有任何一行有起点，此时选中的源会进「下一次」而不是「这一次」）。修法是在 `ctl:changed` 里用 `status` 对账（`adoptStatus`）。
+- **暂停这条路**：`node scripts/check-pause.mjs`——13 条断言，真录一段带暂停的素材（`/record/start` → 1.2 秒 → `/record/pause` → 2 秒 → `/record/resume` → 1.2 秒 → `/record/stop`），源是一个每 30 ms 换一次颜色的窗口（`TopMost`，否则被面板盖住）。验的是：暂停被接受（`paused:true`）、`warning` 为 `null`、**一次暂停恰好两个文件**、每个文件的 `probed` 与记录相差 ≤ 0.15 秒、记录里的每个文件名都真在目录里、`paused` 入账 > 1.5 秒、**两个文件都带编号**（`-part1` / `-part2`）、源的顶层 `file` 指向第一段。对应的反面在 `check-midtake` 里：**没被切开的源一个编号都不带**——编号只用来对齐一组，没有组就不该出现。
+  - 后四条（2026-10-27 新增）走 CDP 连**托盘 popover**（`TAKEKIT_TRAY_DEMO=1`，端口 9251）：卡片要写「已暂停」、要报出**这段已经多久**并明说「不计入录制」、点一次/(dot、clock、state) 三处必须变同一个琥珀色、继续键必须在（能走回去）。它是**第二个窗口**，`check-ui-matrix` 同样看不到它。
+  - 🔴 两处「测太快」的代价（用户 2026-10-27 直接指出报了 `这段 NaN:NaN`）：① `status` 命令的载荷是 **snake_case**（`pause_len`），而面板里的 `state` 对象是 camelCase（`pauseLen`）——我按后者取了字段，`undefined` 一进 `shortClock` 就成 `NaN:NaN`。② 采样只等 700ms，读到的是 `0:00`——**一个永不递增的计数器也会通过同一条正则**，所以断言改成「解析出秒数 ≥ 1」并把等待放到 1.4 秒。正则匹到形状不等于数对。
+  - 🔴 它的诚实边界（2026-10-27 实测）：**这个 fixture 复现不了那个 bug**。把修复回退，它照样 7/7——WGC 在暂停期间对这块窗口不投递帧。它守住的是暂停链路的其余部分，**帧风暴的决定性测试是 `takekit-media` 的 `frames_that_arrive_during_a_pause_are_dropped`**（手工喂帧，去掉守卫就报 12 段）。别把「脚本全绿」当成「那个 bug 有覆盖」。
+  - 这个 bug 的形状值得记住：暂停期间采集不停，还在重绘的窗口每帧都把时间戳交在冻结时刻之后；writer 把它写下去、并且因为队列已被清空而为它开新文件，恢复时 `cut_at` 又是同一时刻——**一帧一个文件**。5 秒暂停留下 16 个 0 秒段，首段被反复重开只剩 1 帧（`probed 0.0333` vs `3.33`），面板于是报 `1 个文件的实测长度与 take.json 不符`。**静态窗口永远碰不到**，所以它躲过了所有截图检查。
+- **托盘 popover 的布局**：`node scripts/check-tray-layout.mjs`——13 条断言（4 个组合 × 两行两列 / 无裁切 / 底部内边距 / 窗口=卡片）。它是**第二个窗口**，面板在屏时不打开、只有点托盘图标才出现，所以 `check-ui-matrix` 一条都看不到它：2026-10-27 连着两个版本都在这上面翻车，第一个把第二排按键切掉一半，第二个（本意是分两行）让四个键挤成一行、标签在 50px 里折成两行。
+  - 手法：`TAKEKIT_TRAY_DEMO=1` 启动后 1.5 秒自己 `raise` 一次 popover（与 `TAKEKIT_OVERLAY_DEMO` 同批的 PROBE 脚手架——不能点就先给个入口），CDP 读 `getBoundingClientRect` 判断结构，`Page.captureScreenshot` 逐组合落 `target/checks/tray-layout/`。
+  - 它顺带钉住一条 Windows 坑：`set_size` 在 tao 里走 undecorated-with-shadow 分支，会把**调用前**测到的框偏移加进去。新建的无边框窗口偏移是 39px（30px 隐藏标题栏 + 真实 9px 边框），首次 resize 之后才缩到 9px，于是「请求 152」落地成 182——而页面报的高度没变，`fit` 又因为「没变化」跳过，那 30px 就一直留着。现在 `resize` 是 ask → measure → ask（同一个高度再请求一次），不再给框建模。
+  - **两行两列用 grid 写死，不用 flex 折行**：四个 `flex-basis: 0` 的键在任何宽度下都「放得下」，折行永远不会发生——折行是结果，不是约束。
+- **收尾面板（遮罩）本身**：`node scripts/check-stop-screen.mjs`——20 条断言。遮罩是**第三个文档**，`check-ui-matrix` 一条都看不到它（面板不在屏上时它才在），而它 2026-10-27 连着改过五件事：寿命 2 秒 → 1 分钟、可点击退出、删掉第二声提示音、**清单改成预留槽位**、**清单改成四列表格**（详见下两条）。验的是：页面完整（含新挂的 `i18n.js`，脚本一坏连倒计时一起垮）、提示文案跟随语言、提示条在窗口内且不与清单重叠、**点击真的到 Rust**（读探针 `overlay:dismiss-click`）、倒计时期间点击不算数、`take:done` 才是拉起它的那个事件、**逐条落行时 STOP 与计时一动不动**（`drift=[0,0,0,0]`，修复前是 `[-12.8,-28.6,-44.4,-60.2]`）、**四条行的三列数值落在同一条竖线上**（`names 0px apart, numbers 0px apart per column [0,0,0]`，旧 flex 布局是 `[114.1,179.7,179.8]`）、空格子有内容（`—` / `m:ss` / `GB`）、失败行从时长列一路占到行尾。
+  - 🔴 **右对齐的列，那条竖线是「右边界」**：第一版断言把三列的 `left` 混在一起比，得到 192px 的「不齐」——布局其实是对的，`1:24` 与 `01:02:00` 起点本来就该差 4 个字符。量右对齐的列只能比 `right`，按列分组比，别跨列混算。
+  - 🔴 **`subgrid` 在这台 WebView2 上不生效**：写 `grid-template-columns: subgrid` 不会报错，行内直接退化成 auto 列——比不做还歪（实测 232px）。所以 `#list` 与 `.row` 各写一次轨道，共用一个 `--tk-cols` 自定义属性。
+  - 手法：`TAKEKIT_OVERLAY_DEMO=1` 抬起遮罩（顺便拍照，`target/checks/stop-screen/`，含「四个槽只填了一个」的中间态与一张四列表格的成品），CDP 连 `overlay.html`。
+  - 🔴 **「Tauri 事件没有从页面注入的口子」这个判断是错的**（2026-10-27 推翻）：页面里调 `window.__TAURI__.event.emit(name, payload)` 会经 Rust **广播回来**，落在**同一个页面的 `listen` 回调**上——这正是真实停止走的同一条路，所以测的就是线上跑的那个 adapter，不是复制品。上一版只能手摆 DOM，等于测自己写的复制品；现在能真发 `take:finalize` / `take:source` / `take:done`。只有「谁拉起它」这类**调用点在 Rust** 的事实仍需静态断言，两半都要。
+  - 静态断言别用「距离」当判据：`armed-by-done-only` 原来写成「`take:finalize` 之后 600 字符内出现 `stopScreen = false`」，给那个 handler 补注释就把断言写红了（代码没坏）。现在按 handler 切块（`listen("x"` 到下一个 `\n});`）再查内容。
+- **`TK_GUI` 指向出货件**：六个脚本都认这个环境变量（`TK_GUI=target/release/takekit-gui.exe`）。debug 绿 ≠ 出货绿。
+  - 🔴 **2026-10-27 发现这条有过一半是假的**：`check-midtake.mjs` 与 `check-three-surface.mjs` 的 `GUI` 常量
+    **硬编码成 `target/debug`，不读 `TK_GUI`**。于是所有「`TK_GUI=... node scripts/check-midtake.mjs`」
+    其实一直在跑 debug 二进制——命令看着对、日志照样绿，被验证的东西根本不是准备出货的那个。
+    发现方式很典型：新加的断言（Rust 侧源失效监视）对 release 是绿的、对这轮跑出来是红的，
+    于是去追「为什么探针一条都没有」，最后发现**二进制里压根没这段代码**（`grep -c "source:watch-on" target/debug/...` = 0）。
+    **教训不是「记得改脚本」，是「说自己在测出货件之前，先证明跑的是出货件」**——一条
+    `grep -c <新加的探针字符串> <binary>` 就能证，比读脚本快。
+- **`control.json` 的 pid 要对得上**（2026-10-27 踩到的坑）：脚本里 `rmSync` 清测试目录失败时，上一轮留下的 `control.json` 会活下来，于是 `POST /record/start` 打到**上一个实例**的端口——本次进程一条 `begin:` 探针都没有。`check-ui-matrix` 与 `check-midtake` 现在都把 `control.pid === gui.pid` 写进 `panel-start`，清不掉目录就直接退出并说明原因。**「所有请求都成功但产品毫无反应」= 先确认对面是谁。**
+  - 而 `rmSync` 会失败的原因查清了：宿主的 safe-delete 守卫**也注进了 node 进程的 fs**（不只 PowerShell 的 `Remove-Item`），批量删超过 50 个文件一律 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` 拒绝，**重试无用**。所以「清目录」这个动作本身要改掉：只删真正会导致假阳性的那几个文件（`check-ui-matrix` 是 `appdata/TakeKit/control.json` + `probe-handle.txt`，其后的脚本是 `probe.log`），截图和 `wv2/` 交给覆盖与复用。别用「手动 `node -e` 能删」当反证——那次命令沙箱被绕过，守卫没生效。
 - **隔离运行**（不碰用户真实配置）与 WebView2 双缓解：见 `docs/webview2-agent-sandbox.md` §4（唯一出处，配方与两条铁律都在那里）。
 
 ### 2.1 界面矩阵钉住的规则（2026-10-23，从 README 搬来）
@@ -73,11 +107,35 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 | `desktop-sound-says-whole-machine` | 桌面行的提示必须说清「整台电脑的声音」；不写这句，用户会以为是这块屏的声音 |
 | `picker/window-list-carries-pid` | 选择器递上来的窗口带着 `pid`——pid 校验只在播种数据里存在等于没有 |
 | `row-crop-*` / `card-dropped-*` / `workspace-*` | 尺寸列的**三处口径**（列表行 / 卡片角标 + 输出行 / 裁剪工作区）：裁剪放不下时三处都报整幅，与 `CropBox::rect_in`（留不下 2px 就整帧原样录）一致。只改一处，另两处就会印出 `0 × 1392` 这种写不出来的尺寸 |
+| `tray/both-buttons-open-the-popover` | 托盘图标的左键与右键都接 `tray_panel::toggle`，且没有原生菜单插进来。图标在系统通知区、不在任何 webview 里，UIA 也点不到（§5.2），所以只能静态验：匹配 `MouseButton::Left \| MouseButton::Right` + `show_menu_on_left_click(false)` |
+| `settings/shortcuts-have-their-own-group` | 两颗 chip 在**同一个**「快捷键」组里（组名从 chip 上方最近的 `.set-label` 读，和页面自己的读法一致），且该组里没有 switch。分组错了截图看不出来——两颗 chip 照样都在页面上，只是挂在错的标签下面 |
+| `hotkey/a-refused-key-is-reported` | 用 pause 键去抢 toggle 键自己的组合，`RegisterHotKey` 必然拒绝；然后 `hotkey_status` 必须**记住**这次拒绝。这条防的不是注册失败（那由系统保证），是**失败被吞掉**——配置里照样写着 `F9`，界面照样画着 `F9`，用户在需要它的那一刻才发现没生效 |
+| `hotkey/the-card-shows-a-refused-key` | 上半段的失败要真的走到卡片上：chip 有 `.warn`、下面那行换成「`{key}` 没能注册」、`title` 带着注册器的原文（`HotKey already registered: …`）。构法是**把 chip 读的那个 state 改成被拒的组合**——这正是启动时 `applySaved()` 把配置值写进去、而注册早就失败了的真实状态。查完把两个键都恢复，否则检查本身就在制造「一个组合两条绑定」 |
+| `paused-look-is-one-colour` + `paused-badge-carries-the-mark` + `paused-hint-agrees-with-the-badge` | 暂停态只说一个颜色：徽章字色 == 计时字色 == 继续键底色，徽章带 `::before` 画的 ▮▮，状态条 hint 与徽章同一件事。2026-10-27 之前计时仍是灰色 `--tk-text-3`、暂停键是白描边，琥珀只落在徽章上——**三处各说各话**。⚠️ 采样必须等 `body` 上真出现 `paused` 类：160ms 过渡 + 每 ~1 秒的 `status` 轮询都会让你读到过渡起点或空闲态 |
+| `tray/icon-*`（Rust 单测，在 `tray.rs`） | 托盘图标三态靠**形状**分辨，不靠颜色：灰点=空闲、红点=录制、**琥珀双竖条**=暂停。任务栏只给 16px，琥珀点与红点在那个尺寸上无从区分。断言直接读像素（中心透明、两柱有色、包围盒近似正方形），`#e0a11e` 是给深色任务栏手调的值，不等于 `--tk-warn` |
+| `naming/window-id-is-the-app` | 窗口源的 id 是 app 名，**两扇门都算**：面板 picker 走后端 `window.app`（`uniqueId(app)`），控制面走 `unique_id(existing, &base)`，两处都从同一个 `w.app` 取材。只改一处，同一个窗口按添加路径不同会得到两个文件名——这正是两套 id 生成器对齐时要消灭的那种静默分叉。段名 `-part2` 由 `takekit-media` 的单测 `a_segment_is_named_apart_from_a_second_source` 钉（它挡的是「一个 mic 停一次」与「两个 mic 不停」写出同一组名字）；**切开的源第一段也要带编号**由 `a_split_numbers_every_part_including_the_first` 钉（同一个测试文件里，真建临时目录真改名：一段不动、两段从 `win.mp4` 变 `win-part1.mp4`、重复调用不产生 `win-part1-part1.mp4`） |
 
 两脚本都以 `target/checks/` 为隔离 APPDATA，**跑之前先关掉正在运行的面板**（单实例会让第二个进程
 直接退出，脚本拿不到控制端口）。新增界面加进 `SCREENS`，新增语言/主题扩 `LANGS` / `THEMES`。
 
-**开发约定**：沟通中文；代码、注释、标识符一律英文；`docs/` 下文档用中文。新行为走 TDD（先写失败测试）。不自动 commit / push——只有用户明确发话才提交。
+**这条现在是脚本自己拦（2026-10-27）**：五个起面板的脚本都先 `await` `scripts/lib/panel-guard.mjs` 的
+`assertNoPanel()` —— 有面板在跑就直接退出（码 2）并打印 pid 与 `taskkill` 命令，而不是等 50 秒后报
+`panel-start port undefined pid undefined`（那句话离真因隔了三步）。它**先等最多 10 秒**再判定：
+`taskkill` 返回时进程对象还在，上一个检查刚收工、下一个立刻起面板时每次都撞上，报的是「已死进程」——
+`check-midtake && check-pause` 连跑踩了这个（2026-10-27，`ours 41304` 但 `tasklist` 已经空）。4 秒不够：
+前一个面板的 **WebView2 子进程**比 `/T` 杀掉的父进程活得久，五个检查连着跑仍复现，所以拉到 10 秒。
+  - 🔴 **等不是根治，重试才是**（2026-10-27 二次复发）：`assertNoPanel` 只能证明 `tasklist` 里没有进程，
+    不能证明上一个进程**已经放手**。在「`taskkill` 返回」和「最后一个句柄关闭」之间有一道缝：
+    新进程要么输给 `-sim` 互斥量、要么打不开旧进程子窗口还占着的 WebView2 profile 目录，于是**静默退出**，
+    `control.json` 一个字节都不写。所以四个要控制端口的脚本改用 `startPanel(launch, appDir)`：
+    起进程 → 等 `control.json`（pid 必须是自己）→ 进程若已退出或 20 秒没出来就**重来一次**（最多 3 次）。
+    判据从「等够了没有」换成「起来了没有」。半分钟的空等从此不会发生，假红也不会。**为什么不能给脚本一份自己的实例**：
+`tauri-plugin-single-instance` 在 Windows 上用 `{identifier}-sim` 命名互斥量（`platform_impl/windows.rs`
+L66-75），identifier 来自 `tauri.conf.json`，而 builder 只开放 `dbus_id`（Linux 专用）——**没有运行时换 key 的口子**。
+隔离 APPDATA 只隔离了配置文件与 WebView2 profile，隔离不了这个互斥量。
+守卫**故意不杀**：一个开着的面板揣着别人配好的源列表（`config.json` 不存 sources），检查脚本没有资格把它扔掉。
+
+**开发约定**：沟通中文；代码、注释、标识符一律英文；`docs/` 下文档用中文。新行为走 TDD（先写失败测试）。不自动 commit / push——只有用户明确发话才提交。**开发期间 agent 可以自行结束正在运行的 `takekit-gui`**（用户 2026-10-27 授权，不必逐次确认）——单实例互斥量是全局的，不结束它任何 GUI 检查都跑不起来。
 
 ---
 
@@ -140,13 +198,32 @@ crates/
   → 停止（按钮 / F9 / 托盘面板）→ take::stop(announce)
        recording.stop()（采集停 → writer 收尾 → StopResult）
        → record(&result) 写 journal.json（历史在 Rust 落库，不靠前端）
-       → 遮罩停留到 ≥2 s（`finalize_panel` 开时；纯音频几十毫秒就收完，不留就等于没显示）
-       → 收遮罩 → show_main_window()（热键停止时被录窗口在前台，面板必须回来）
-       → 880 Hz 完成音（**在面板回来之后发**：隐藏窗口的音频上下文唤醒太晚，等于没响）
-       ⇒ 这 2 s 里 `begin` 一律拒绝（`err.finalizing`）：否则新 take 会在即将被收掉的遮罩上倒数，
-         永远到不了 GO，`pending` 卡住，之后每次开始都报「倒计时进行中」
+       → take:done → 遮罩**不立刻收**（`finalize_panel` 开时）：
+            set_clickable(true)（撤掉 WS_EX_TRANSPARENT，页面才能收到点击）
+            state.stop_screen = true + 起一个 1 分钟看门狗线程（STOP_SCREEN_SECS）
+            主窗口**先不回来**——它在遮罩后面，提前显示只会白闪一帧
+       → 点击（页面 pointerdown → overlay_dismiss）/ 看门狗 / 下一次 begin
+            → dismiss_stop_screen()：收遮罩 → show_main_window()
+       ⇒ 幂等：三条路都走同一个 swap(false)，所以只会关一次
+       ⇒ 收尾写入期间（take:finalize ~ take:done）不可点、也没有第二次提示音
+       ⇒ 写入期 `begin` 仍拒绝（`err.finalizing`），但**遮罩停留期不再拒绝**：
+          begin 会先把遮罩收掉（不带面板），失败时再把面板叫回来
   → main.js showSaved()：failed>0 才弹浮窗；随后 refreshJournal()
 ```
+
+**界面的四条不变量**（2026-10-27，`scripts/check-ui-matrix.mjs` 有断言）
+
+1. **运输栏跟着 take，不跟着页签**：不录制时除「录制」页签外整条不显示；录制中浮在**所有**页签，
+   但只带计时、暂停、停止——源数量属于它数的那张列表，在别的页签上隐藏。
+2. **暂停紧挨停止**：同一个 `.transport` 组，同高（38px）、8px 间距、靠右。它是次级按钮
+   （描边 + 文字），停止仍是唯一的红键。录制中暂停态时，徽章 / 计时 / 继续键三处同时转琥珀。
+3. **一个状态，三个窗口都得说**：暂停这件事面板、托盘 popover、托盘图标各有一个表达面，
+   而且都在**自己的尺寸约束**里做——面板有宽度，popover 有高度，任务栏只有 16px。
+   所以图标不用换色而用换形状（见上表 `tray/icon-*`），popover 多一行「这段 0:12 不计入录制」。
+   **只改一处就是用户说的「提示不充分」**（2026-10-27）。
+4. **所有可滚区域共用一个 `.scroll`**（`.source-list` / `.take-list` / `.picker-body` / `.pane-scroll`）：
+   同样的 10px 槽、3px 透明边距的 4px 圆角滑块、透明轨道。**加新的可滚容器就挂这个类**，
+   不要再写一份 `::-webkit-scrollbar`。
 
 **录制中动态加源（2026-10-24）**
 
@@ -360,7 +437,7 @@ js-error:<msg>
    （20s/180s/600s 差 ≤0.04s，量级就是 AAC 帧量化），不做 slew 校正，`drift_ppm` 字段也不加。
    顺带修了一个上报口径 bug（前导静音没算进 `seconds`，导致 60 秒录制凭空少 0.5s）。
    **遗留**：30 分钟那次多出 4.9 秒的音频是设备一次性重投造成的，会让之后的音频永久后移 ——
-   修法（用 `chunk.time` 检测空洞/重投）见 §11.2，未做。
+   ~~修法见 §11.2，未做~~ → **已修（2026-10-27）**，见 §11.2 与下面「2026-10-27 技术债清理」。
 3. ~~待拍板 5 项~~ ✅（2026-10-23 全部拍板并落地：单实例二次启动聚焦已有窗口；提示层创建失败降级为
    "无提示层 + 记探针"；历史「清空」连磁盘文件一起删（删不动的行保留）；CLI `--marks` 与
    UI「鼠标效果」文案对齐；ffmpeg 路径可配置（设置行 + CLI `--ffmpeg` + 控制面 `ffmpeg_path`）；
@@ -370,6 +447,32 @@ js-error:<msg>
    状态条 `正在写入… n/m`，「已保存」横幅按口径不做；`finalize_panel` 开关已进设置）。
 6. ~~状态条 failed 态~~ ✅（2026-10-21：菱形 + 原因单行 + 查看日志）。
 7. ~~光标/多屏对齐~~ ✅（2026-10-21：`WithCursor` 实测光标进画；picker 逐屏 + rect→Monitor）。
+
+### 2026-10-27 技术债清理（用户点名「逐个做了」）
+
+七条一起清的，新代码都有测试或检查钉着。**仍留一条开放项**（最后一行）。
+
+| 项 | 落点 | 钉住它的东西 |
+|---|---|---|
+| 关窗丢最后一次编辑 | `persist()` 防抖 300ms→0（同 tick 合并）+ `flushPersist()`；Rust `CloseRequested` 不再直接 `exit`，先 emit `app:quitting`，前端 flush 完回 `quit_now`，**400ms 兜底**（webview 卡死也必须能关） | 靠 `config.json` 的 mtime/内容人工验；无自动化 |
+| 倒计时挂住无法退出 | `take::start_countdown_watchdog`：`secs + 5s` 后 pending 还在 → `drop_pending` + `err.countdown-lost` | 未做自动化（要能人为让 overlay JS 不响应） |
+| DDA 判定永不过期 | `ffmpeg::dda_forget()`，在 DDA 选中的 take **spawn 失败**时清该 rect 的 verdict | `forgetting_a_verdict_leaves_no_answer_behind` |
+| 热键注册失败无入口 | `proto::HotkeyStatus` + `AppState.hotkey_error` + `hotkey_status` 命令；设置页 chip 转琥珀 + hint 换成「`{key}` 没能注册」 | `hotkey/a-refused-key-is-reported`、`hotkey/the-card-shows-a-refused-key`（用 pause 抢 toggle 的组合造真实拒绝） |
+| 源失效判断依赖隐藏面板的 250ms 轮询 | `take::start_source_watch`：Rust 侧 500ms `try_lock` 轮询，失效即 `stop_source` + emit `source:stopped`；前端 `forgetSources()` 只负责移出清单 | `check-midtake::a-window-that-closes-is-stopped-without-the-panel`（冻页面 + 控制面轮询 + 要求 `source:vanished` 探针） |
+| 音频重投后永久错位 | `AudioWriter::write` 的 `place()` 三分支 + `skew_base` 基线 | `a_redelivered_chunk_is_dropped_and_a_real_hole_is_filled`、`a_standing_clock_offset_is_learned_not_repaired` |
+| ~~窗口源 pid 校验~~ | **早已实现**（`resolve_window` / `owns_window` / `window_is_alive`），backlog 条目过期 | — |
+
+🔴 **本轮最值钱的一条教训**：`place()` 的判定**不能直接用绝对 skew**。WASAPI 时间戳与字节累计
+不在同一绝对基准上，设备时钟偏 200ms 就会让每个 chunk 都被判成空洞、文件被静音撑爆——比原来的
+bug 更糟。判据必须是**相对首个可测量偏差的变化量**。这条只有在写第二条单测（50 个连续偏移）时
+才暴露出来。
+
+🔴 **第二条**：`check-midtake` / `check-three-surface` 其实一直不读 `TK_GUI`，过去所有「对 release
+跑过」的说法对这两项是假的（详见 §2「`TK_GUI` 指向出货件」）。新加的断言对 release 是绿的、对这轮
+跑出来是红的，才把这件事翻出来。
+
+**开放项**：`docs/development.md` §7 #4 与 §11.1 的「未实测」（150% 缩放 / 双屏真机 / 深色历史页
+观感）一直没跑，属硬件条件受限，不是没时间。
 
 **性能 review**（2026-10-23）：录制热路径已过一遍。帧通道原为无界 `mpsc::channel`，与"队列满则丢帧"
 的注释矛盾 —— 写入端落后时帧会在内存无限堆积（4K BGRA 帧约 33 MB）。已改为有界 `sync_channel` +

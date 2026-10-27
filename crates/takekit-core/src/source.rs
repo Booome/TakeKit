@@ -406,6 +406,13 @@ pub struct WindowItem {
     pub hwnd: isize,
     pub pid: u32,
     pub title: String,
+    /// The app behind it, ready to be a file name — `chrome`, `code`, `win`.
+    ///
+    /// This is what a source picked from this window is *called*, so it is what
+    /// the take's file is called too (2026-10-27). Before it, every window was
+    /// `win.mp4` / `win-2.mp4` and a folder of four takes could not say which
+    /// app was recorded without opening the files.
+    pub app: String,
     pub rect: ScreenRect,
 }
 
@@ -657,10 +664,12 @@ pub fn window_by_hwnd(hwnd: isize) -> Result<WindowItem, String> {
     if rect.w == 0 || rect.h == 0 {
         return Err(format!("window {hwnd} has no area"));
     }
+    let pid = window_pid(handle);
     Ok(WindowItem {
         hwnd,
-        pid: window_pid(handle),
+        pid,
         title: window_title(handle),
+        app: app_of(pid),
         rect,
     })
 }
@@ -1069,10 +1078,12 @@ fn capture_target(hwnd: HWND) -> Option<WindowItem> {
     if rect.w == 0 || rect.h == 0 {
         return None;
     }
+    let pid = window_pid(hwnd);
     Some(WindowItem {
         hwnd: hwnd.0 as isize,
-        pid: window_pid(hwnd),
+        pid,
         title,
+        app: app_of(pid),
         rect,
     })
 }
@@ -1086,6 +1097,105 @@ fn window_pid(hwnd: HWND) -> u32 {
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
     }
     pid
+}
+
+/// The app behind a pid, already shaped like a file name. `win` when the pid
+/// cannot answer — a window whose owner has exited is still recordable, and
+/// `win` is the name every window source had before this existed (2026-10-27),
+/// so nothing that used to work starts failing.
+///
+/// A UWP window would be named after its host (`applicationframehost`), which
+/// says nothing. There is no cheap way around it here: `ApplicationFrameUser
+/// ModelId` on that host answers "not packaged" — the packaged process is the
+/// app, not the frame — and UWP windows are cloaked often enough to be filtered
+/// out of the picker anyway (measured on this machine: both live Settings
+/// windows, 2026-10-27). Left alone rather than papered over.
+fn app_of(pid: u32) -> String {
+    app_of_pid(pid).unwrap_or_else(|| "win".to_string())
+}
+
+/// The app behind a pid, or `None` when the pid cannot answer. `app_of` needs
+/// a name unconditionally; a caller that must *keep* an older name when the
+/// process has gone needs to tell "no answer" apart from the word `win`
+/// (`config::name_window_sources`).
+pub fn app_of_pid(pid: u32) -> Option<String> {
+    process_image(pid).and_then(|path| app_slug(&path))
+}
+
+/// The full path of a process's executable, or `None` when the pid is gone or
+/// not ours to ask about.
+fn process_image(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    if pid == 0 {
+        return None;
+    }
+    // Long paths exist: the buffer is generous rather than `MAX_PATH`, and a
+    // short one is reported through `len` so the string is not padded with
+    // zeros.
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: the handle is closed on every path out. `buf` outlives the call
+    // and `len` is its length in UTF-16 units both in and out, which is the
+    // contract `QueryFullProcessImageNameW` documents.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let asked = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        asked.ok()?;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// A process image name as a stem a file can be called: `chrome.exe` →
+/// `chrome`, `C:\…\Code - Insiders.exe` → `code-insiders`.
+///
+/// Four things happen, and each one is a rule the file name needs: the
+/// directory goes (a path is not a name), `.exe` goes (the extension on disk
+/// says what it is), anything outside `[a-z0-9_-]` collapses to a single `-`
+/// (spaces, dots and parentheses are all legal in a title and none of them
+/// help), and the result is cut to 24 characters (a stem that long already
+/// leaves room for nothing else). `None` when nothing survives — a process
+/// named entirely in a script this does not transliterate gets `win` instead
+/// of an empty name.
+pub fn app_slug(image: &str) -> Option<String> {
+    let base = image.rsplit(['\\', '/']).next().unwrap_or(image);
+    let lower = base.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+
+    let mut out = String::with_capacity(stem.len());
+    for ch in stem.chars() {
+        // `_` is kept because it is already a safe, meaningful name character;
+        // everything else that is not a letter or a digit becomes a separator.
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.len() > 24 {
+        out.truncate(24);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    Some(out)
 }
 
 fn window_title(hwnd: HWND) -> String {
@@ -1220,6 +1330,53 @@ mod tests {
     }
 
     #[test]
+    fn an_app_name_becomes_a_file_name() {
+        assert_eq!(
+            app_slug(r"C:\Program Files\Google\Chrome\chrome.exe").unwrap(),
+            "chrome"
+        );
+        assert_eq!(app_slug(r"D:\apps\Code.exe").unwrap(), "code");
+        assert_eq!(app_slug("WeChat.exe").unwrap(), "wechat");
+        // Spaces, dots and parentheses are all legal in an image name and none
+        // of them survive: a stem is what the file is called.
+        assert_eq!(
+            app_slug(r"C:\x\Code - Insiders.exe").unwrap(),
+            "code-insiders"
+        );
+        assert_eq!(app_slug("a.b.c.exe").unwrap(), "a-b-c");
+        assert_eq!(app_slug("my_app-2.exe").unwrap(), "my_app-2");
+        // Nothing left to use — the caller falls back to `win`.
+        assert_eq!(app_slug(r"C:\x\微信.exe"), None);
+        assert_eq!(app_slug(""), None);
+        assert_eq!(app_slug(".exe"), None);
+        // Long enough to crowd out the take folder is cut, not kept.
+        assert_eq!(
+            app_slug(&format!("{}.exe", "a".repeat(40))).unwrap().len(),
+            24
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pid_still_names_the_window() {
+        // Pid 0 cannot be opened, which is the same answer a window whose owner
+        // already exited gets. Both have to stay recordable.
+        assert_eq!(app_of(0), "win");
+        // This process does answer, and does not answer with the fallback.
+        assert_ne!(app_of(std::process::id()), "win");
+    }
+
+    /// Not a real assertion — prints what this machine's windows would be
+    /// called, which is the only way to check the Win32 lookup against a
+    /// desktop instead of against a string this file wrote itself.
+    #[test]
+    #[ignore = "reads the live desktop; run by hand with --nocapture"]
+    fn print_the_app_of_every_open_window() {
+        for w in list_windows("", Some(std::process::id())) {
+            println!("{:>7}  {:<28} {}", w.pid, w.app, w.title);
+        }
+    }
+
+    #[test]
     fn crop_moves_the_origin_of_the_kept_region() {
         // Left/top cut from the near side, so the captured rectangle has to
         // start there — a size-only shrink would keep the old corner and cut
@@ -1273,6 +1430,7 @@ mod tests {
             hwnd,
             pid,
             title: "Editor".to_string(),
+            app: "editor".to_string(),
             rect: ScreenRect {
                 x: 0,
                 y: 0,

@@ -26,6 +26,7 @@
   --tk-ok-soft: rgba(14, 112, 14, 0.12);
   --tk-warn: #8a5300;
   --tk-warn-soft: rgba(138, 83, 0, 0.12);
+  --tk-warn-fg: #ffffff;
   --tk-radius-sm: 6px;
   --tk-radius-md: 8px;
   --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
@@ -63,8 +64,8 @@
     --tk-ok: #6ccb5f;
     --tk-ok-soft: rgba(108, 203, 95, 0.18);
     --tk-warn: #e8b339;
-  --tk-warn-soft: rgba(232, 179, 57, 0.18);
     --tk-warn-soft: rgba(232, 179, 57, 0.18);
+    --tk-warn-fg: #1a1205;
   }
 }
 
@@ -86,6 +87,7 @@
   --tk-ok-soft: rgba(108, 203, 95, 0.18);
   --tk-warn: #e8b339;
   --tk-warn-soft: rgba(232, 179, 57, 0.18);
+  --tk-warn-fg: #1a1205;
   --tk-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
   --tk-shadow-2: 0 2px 8px rgba(0, 0, 0, 0.45);
 }
@@ -308,6 +310,16 @@ select {
   padding: 16px 16px 0;
 }
 
+/* The settings pane's own scroll box: `.pane` stays the flex column, this is
+   what moves inside it. Eight groups do not fit a 640px window, and before
+   this the pane simply ran past the bottom edge with no scrollbar to say so.
+   The 16px inset comes from `.pane`, the same as the lists, so the scrollbar
+   lands in the same place on every tab. */
+.pane-scroll {
+  flex: 1;
+  padding-bottom: 16px;
+}
+
 .section-head {
   display: flex;
   align-items: center;
@@ -351,11 +363,11 @@ select {
   background: var(--tk-sunken);
 }
 
+/* Layout only: the scrolling and the scrollbar come from `.scroll`, which every
+   scrollable area in the panel shares. */
 .source-list,
 .take-list {
   flex: 1;
-  min-height: 0;
-  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -488,28 +500,107 @@ body.recording .row-name {
 /* ── paused ───────────────────────────────────────────────────────────────
    The clock has stopped because the user stopped it. Two things have to read at
    a glance: the number is not moving (so it is not a hang) and nothing is being
-   written (so "停止" is safe to press). The badge names the second, the dimmed
-   clock the first. */
+   written (so "停止" is safe to press). The badge names the second, the clock the
+   first — and the clock wears the badge's amber rather than the disabled grey it
+   used to: grey is the colour of a control that cannot be used, and this one is
+   working exactly as asked (2026-10-27, reported as "提示不充分"). */
 
 .paused-badge {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 2px 7px;
   border-radius: 4px;
   background: var(--tk-warn-soft);
   color: var(--tk-warn);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
-body.paused .clock {
-  color: var(--tk-text-3);
+/* Two bars, drawn rather than typed: U+23F8 renders as a full-width glyph in
+   some UI fonts and as tofu in others, and this badge is 12px of text. The
+   gradient is the two bars; the gap between them is the transparent stop. */
+.paused-badge::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 8px;
+  background: linear-gradient(
+    to right,
+    currentColor 0 2px,
+    transparent 2px 4px,
+    currentColor 4px 6px
+  );
 }
 
-/* The pause key sits next to the stop key and must never look like it: stop is
-   the red one, this is a quiet text button. */
-#pause-btn.pause {
+body.paused .clock {
+  color: var(--tk-warn);
+}
+
+/* ── The transport pair ───────────────────────────────────────────────────
+   Pause and stop are one unit (2026-10-27): same height, one gap, and they
+   share the bar's right edge. Stop stays the red one and pause the quiet
+   outline beside it — the two are never mistaken for each other, but they are
+   no longer separated by the whole clock. Pause used to sit on the far side of
+   the clock as a 30px ghost, where the one control that matters most mid-take
+   read as decoration. */
+
+.transport {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pause {
   flex: none;
+  height: 38px;
+  padding: 0 16px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  color: var(--tk-text);
+  background: var(--tk-surface);
+  border: 1px solid var(--tk-border-strong);
+  border-radius: var(--tk-radius-md);
+  cursor: pointer;
+  transition:
+    border-color var(--tk-dur) var(--tk-ease),
+    background var(--tk-dur) var(--tk-ease),
+    color var(--tk-dur) var(--tk-ease);
+}
+
+.pause:hover:not(:disabled) {
+  border-color: var(--tk-text-2);
+}
+
+.pause:active:not(:disabled) {
+  background: var(--tk-sunken);
+}
+
+/* Paused: this key is the only thing to press, and it says so by being the only
+   filled control in the bar. The outline version (amber text on the surface)
+   read as a second disabled button next to the red one (2026-10-27). */
+body.paused .pause:not(:disabled) {
+  background: var(--tk-warn);
+  border-color: var(--tk-warn);
+  color: var(--tk-warn-fg);
+}
+
+body.paused .pause:hover:not(:disabled) {
+  border-color: var(--tk-warn);
+  background: var(--tk-warn);
+}
+
+/* The filled key is already the loudest thing in the bar; pressing it should
+   still feel pressed. */
+body.paused .pause:active:not(:disabled) {
+  background: var(--tk-warn);
+  filter: brightness(0.9);
 }
 
 /* The size column (2026-10-21 方案 A): source size, `→ cropped size` when a
@@ -892,6 +983,14 @@ body:not([data-tab="sources"]):not(.recording) .bar {
   display: none;
 }
 
+/* On those tabs the bar carries the take and nothing else: the source count
+   counts a list that is not on screen, and a number about a hidden list is
+   noise next to the timer. The paused badge and the transport stay — both are
+   about the take, not about the pane. */
+body:not([data-tab="sources"]) .bar .hint {
+  display: none;
+}
+
 /* Two rows (layout plan A, 2026-10-20): the output path owns the first row
    — widest and most-read field, never squeezed half-hidden by controls — and
    nothing else is left: capture method, encoder, switches and the hotkey
@@ -1097,11 +1196,16 @@ button.browse:hover {
   color: var(--tk-text);
 }
 
+/* A hint that is standing bad news rather than help — a hotkey the OS refused
+   (`params.hotkeyHint`'s slot says so instead of explaining how to capture). */
+.hint.warn {
+  color: var(--tk-warn);
+}
+
 .rec {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-left: auto;
   height: 38px;
   min-width: 136px;
   justify-content: center;
@@ -1193,8 +1297,6 @@ button.browse:hover {
 
 .picker-body {
   flex: 1;
-  min-height: 0;
-  overflow-y: auto;
   padding: 0 10px 10px;
 }
 
@@ -1273,18 +1375,38 @@ button.browse:hover {
 }
 
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
+/* One treatment, one class. Before this each scrolling area spelled the same
+   webkit rules out again (and the settings pane was simply missing them, so
+   its content ran past the window edge with no way to reach the rest).
+   Anything that scrolls carries `.scroll`. */
 
-.source-list::-webkit-scrollbar,
-.picker-body::-webkit-scrollbar {
+.scroll {
+  overflow-y: auto;
+  min-height: 0;
+  /* A wheel at the end of a list stops there instead of scrolling whatever is
+     behind it: the panel is a control strip, not a document. */
+  overscroll-behavior: contain;
+}
+
+.scroll::-webkit-scrollbar {
   width: 10px;
 }
 
-.source-list::-webkit-scrollbar-thumb,
-.picker-body::-webkit-scrollbar-thumb {
+/* A thumb, not a gutter: the 3px transparent border + content-box clip is what
+   makes it a rounded 4px bar floating in a 10px lane, in both themes. */
+.scroll::-webkit-scrollbar-thumb {
   background: var(--tk-border-strong);
   border: 3px solid transparent;
   background-clip: content-box;
   border-radius: 5px;
+}
+
+.scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--tk-text-3);
+}
+
+.scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 /* ── Hotkey chip (params row) ───────────────────────────────────────────── */
@@ -1328,6 +1450,15 @@ button.browse:hover {
 .chip.error {
   border-color: var(--tk-rec);
   color: var(--tk-rec);
+}
+
+/* The OS refused this key: the chip still names the binding the user set, but
+   it must not read as live. Amber rather than red — nothing failed just now,
+   and a red chip on every launch is a drum, not a signal; the line underneath
+   says what happened. */
+.chip.warn {
+  border-color: var(--tk-warn);
+  color: var(--tk-warn);
 }
 
 .chip.ok {

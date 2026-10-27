@@ -16,6 +16,7 @@ const big = document.getElementById("big");
 // behind the veil must not show the previous take's duration and file sizes.
 const sub = document.getElementById("sub");
 const list = document.getElementById("list");
+const foot = document.getElementById("foot");
 
 // The veil is shown before `overlay:countdown` arrives, so it must start
 // empty: a digit left in the DOM flashes for a frame every time it comes up.
@@ -23,6 +24,13 @@ const list = document.getElementById("list");
 // the cover, not the text.)
 big.textContent = "";
 big.classList.remove("go");
+
+// Which screen the veil is showing, as far as a click is concerned. Only the
+// finished stop screen is dismissible: Rust gives the window the clicks once
+// the take is over (it is click-through while the take runs, so the app being
+// recorded keeps painting), and this is the half that knows a click there means
+// "I have read it".
+let stopScreen = false;
 
 // ── The countdown ───────────────────────────────────────────────────────────
 
@@ -68,6 +76,10 @@ function startCountdown(secs) {
   // stayed on screen under the freshly painted "1".
   sub.textContent = "";
   list.replaceChildren();
+  // A countdown is not dismissible, and its "click anywhere to close" line
+  // would be a promise this screen does not keep.
+  stopScreen = false;
+  foot.hidden = true;
   // Whatever the veil last showed is still in the DOM — the demo's GO, or a
   // digit left by a cancelled countdown — and the veil becomes visible before
   // its first frame arrives. Paint the first digit NOW so a stale one never
@@ -147,17 +159,32 @@ function step() {
 // ── The stop screen (B4) ────────────────────────────────────────────────────
 // `take:finalize` paints STOP and freezes the timer at the moment the button
 // was pressed; `take:source` appends one checklist row per file as it lands;
-// `take:done` ends it — Rust takes the veil down and brings the panel back.
-// There is deliberately no "saved" banner at the end (README B4 note): the
-// fresh history row is the success feedback, and a checklist that completed
-// needs no second ending. The veil is up for the finalise, with a 2 s floor
-// (Rust holds it, `take::stop`) — no early dismiss, since (focusable(false) +
-// click-through) nothing can reach this window to dismiss it.
+// `take:done` completes it and makes it dismissible. There is deliberately no
+// "saved" banner at the end (README B4 note): the fresh history row is the
+// success feedback, and a checklist that completed needs no second ending.
+//
+// How long it lives (2026-10-27): Rust keeps it up for a minute, which is long
+// enough to read the timings and short enough that the panel behind it is never
+// hostage. A click anywhere leaves earlier — but only from `take:done` on: the
+// files are still being written before that, and the panel has nothing to show
+// yet. Rust is what makes the window clickable at that same moment
+// (`overlay::set_clickable`), so the timing lives in one place.
 
 // `clock` comes from shared.js (loaded before this file): the panel, the
 // veil and the popover all print a duration, and a second copy of the
 // formatter here used to be free to drift.
 const fmtClock = (secs) => clock(Math.max(0, secs));
+
+// The checklist prints the same take's length once per source, so `00:00:03`
+// three times over is three times the width of the number for no more
+// information. `shortClock` (shared.js) is that shorter form.
+
+// Sizes in one unit, MB, except where that stops being a size anyone can hold
+// in their head: `1536.0 MB` is a number, `1.5 GB` is an amount.
+const fmtBytes = (bytes) => {
+  const mb = (Number(bytes) || 0) / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
+};
 
 window.__TAURI__.event.listen("take:finalize", (e) => {
   const p = e.payload || {};
@@ -165,48 +192,98 @@ window.__TAURI__.event.listen("take:finalize", (e) => {
   big.classList.remove("go");
   big.textContent = "STOP";
   sub.textContent = fmtClock(Number(p.elapsed) || 0);
+  // One empty slot per file, reserved now, before any of them has landed.
+  //
+  // The veil centres its three children, so a list that grows a row at a time
+  // walks STOP and the timer upwards by half a row per file — measured on the
+  // unfixed build, 12.8px on the first row and 15.8px on each one after it.
+  // That is the flicker: the screen jumps exactly as many times as the take has
+  // sources, right when the user is trying to read the duration.
+  //
+  // `total` is in this payload, so the height is known here and never has to
+  // change: `take:source` fills the next slot instead of adding to the list.
   list.replaceChildren();
+  const total = Math.max(0, Number(p.total) || 0);
+  for (let i = 0; i < total; i += 1) {
+    const slot = document.createElement("div");
+    slot.className = "row pending";
+    list.append(slot);
+  }
+  // A new stop: not dismissible until its files are closed.
+  stopScreen = false;
+  foot.hidden = true;
   PROBE(`overlay:finalize total=${p.total ?? "?"}`);
 });
 
 window.__TAURI__.event.listen("take:source", (e) => {
   const p = e.payload || {};
-  const row = document.createElement("div");
+  // Fill the next reserved slot. Only a report with no slot left to fill (more
+  // files than `total` promised) creates a row — and only then does the stack
+  // move, which is the right trade for a count that was wrong.
+  const reserved = list.querySelector(".row.pending");
+  const row = reserved || document.createElement("div");
   row.className = "row";
+  row.replaceChildren();
   const name = document.createElement("span");
   name.className = "row-id";
   name.textContent = String(p.id ?? "");
   row.append(name);
   if (p.error) {
-    // cam  ✗  <why> — the reason is the source's own log tail or a stand-in
-    // line, already one sentence in English/Chinese from the backend.
+    // One cell, not two: `✗ ` and the reason belong to the same sentence, and
+    // letting the reason span the rest of the row keeps it on the column grid
+    // (overlay.css) without a wrapper element to line it up.
+    const why = document.createElement("span");
+    why.className = "row-why";
     const bad = document.createElement("span");
     bad.className = "row-bad";
     bad.textContent = "✗";
-    const why = document.createElement("span");
-    why.className = "row-why";
-    why.textContent = String(p.error);
-    row.append(bad, why);
+    why.append(bad, document.createTextNode(` ${p.error}`));
+    row.append(why);
   } else {
     const time = document.createElement("span");
     time.className = "row-num";
-    time.textContent = fmtClock(Number(p.seconds) || 0);
-    row.append(time);
+    time.textContent = shortClock(Number(p.seconds) || 0);
     const size = document.createElement("span");
-    size.className = "row-num";
-    size.textContent = p.width && p.height ? `${p.width}×${p.height}` : "";
-    row.append(size);
+    size.className = "row-num row-res";
+    // An audio-only source has no frame size. The dash is not decoration — a
+    // blank cell is what used to pull that row's size column left (2026-10-27).
+    size.textContent = p.width && p.height ? `${p.width}×${p.height}` : "—";
     const bytes = document.createElement("span");
     bytes.className = "row-num";
-    bytes.textContent = `${((Number(p.bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
-    row.append(bytes);
+    bytes.textContent = fmtBytes(p.bytes);
+    row.append(time, size, bytes);
   }
-  list.append(row);
+  if (!reserved) list.append(row);
   PROBE(`overlay:source ${p.id} ok=${!p.error}`);
 });
 
 window.__TAURI__.event.listen("take:done", () => {
+  // Every file is closed, so the screen can be left. Rust made the window
+  // clickable on this same event; the line it enables says so.
+  stopScreen = true;
+  foot.hidden = false;
   PROBE("overlay:done");
+});
+
+// Click = leave. The veil covers the whole virtual screen, so there is no
+// smaller target to aim at and nothing else on it to press: any click is the
+// answer. `pointerdown` rather than `click`, because a click needs the press and
+// release in one place and a window that is not focused can lose the release.
+window.addEventListener("pointerdown", () => {
+  if (!stopScreen) return;
+  stopScreen = false;
+  foot.hidden = true;
+  PROBE("overlay:dismiss-click");
+  invoke("overlay_dismiss").catch((e) =>
+    PROBE("overlay:dismiss-failed:" + String(e).slice(0, 120)),
+  );
+});
+
+// The stop screen's hint is in the panel's language, and the two can change
+// while this page is alive (the veil is created at startup and reused).
+window.__TAURI__.event.listen("ui:settings", (e) => {
+  const lang = e.payload && e.payload.language;
+  if (lang) setUiLang(lang);
 });
 
 // The stop screen's two tones arrive like the countdown-off one does on the

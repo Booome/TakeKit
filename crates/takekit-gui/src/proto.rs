@@ -170,6 +170,26 @@ pub struct SettingsInfo {
     pub theme: String,
 }
 
+/// Why a hotkey the config asks for is not actually claimed.
+///
+/// `None` means it registered. The panel shows the configured combination
+/// either way — that is the whole problem this answers: a chip that reads `F9`
+/// while nothing is listening looks exactly like one that works, and the user
+/// finds out by pressing it at the moment they needed it.
+///
+/// The message is Rust's own (`err.hotkey-conflict` and friends), so the panel
+/// can show it verbatim as `title` and put a short localised line underneath.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HotkeyStatus {
+    /// The start/stop key. Always exists, so a failure here is always a defect
+    /// to report.
+    pub toggle: Option<String>,
+    /// The pause key. `None` covers both "registered" and "switched off" — the
+    /// panel knows which from the config, and a switched-off key is not a
+    /// failure.
+    pub pause: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

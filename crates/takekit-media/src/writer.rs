@@ -39,6 +39,48 @@ use crate::devices::ensure_media_foundation;
 use crate::error::{MediaError, Result};
 use crate::frame::{AudioChunk, MediaFrame, PixelFormat, VideoFrame};
 use crate::mediatype::{pcm_type, video_type};
+
+/// How far a sound chunk's timestamp may disagree with the byte-derived
+/// timeline before it stops being jitter and becomes an event, in 100 ns units.
+///
+/// 40 ms is about one device buffer: long enough that ordinary scheduling
+/// absorbs into the chained writes, short enough that a real stall or a
+/// re-delivered buffer is caught while it is still worth correcting. See
+/// `AudioWriter::write`.
+const SKEW_TOLERANCE: i64 = 400_000;
+
+/// Where a chunk goes, given the device's timestamp and where the file's
+/// timeline currently ends.
+///
+/// Pulled out of `AudioWriter::write` so the three cases can be tested without
+/// a Media Foundation sink — an untestable branch here is a branch that stays
+/// wrong, and this one stays wrong *silently*.
+#[derive(Debug, PartialEq, Eq)]
+enum Placement {
+    /// Write it where the last chunk ended, absorbing the difference.
+    Chain,
+    /// Write it at its own timestamp, with silence filling the hole first.
+    AfterHole,
+    /// Drop it: the device re-sent what it had already sent.
+    Skip,
+}
+
+/// `skew_base` is state: the first measurement becomes the baseline, and the
+/// answer is judged against the *change* since it. Without that, a device whose
+/// clock sits 200 ms off would look like a 200 ms hole on every chunk.
+fn place(arrival: i64, next: i64, skew_base: &mut Option<i64>) -> Placement {
+    let skew = arrival - next;
+    let base = *skew_base.get_or_insert(skew);
+    let relative = skew - base;
+    if relative < -SKEW_TOLERANCE {
+        Placement::Skip
+    } else if relative > SKEW_TOLERANCE {
+        Placement::AfterHole
+    } else {
+        Placement::Chain
+    }
+}
+
 /// A frame held until the next one says how long it was on screen.
 struct Pending {
     time: i64,
@@ -208,7 +250,16 @@ impl VideoWriter {
     pub fn flush(&mut self, end: Option<i64>) -> Result<()> {
         if let Some(last) = self.pending.take() {
             let duration = match end {
-                Some(end) => (end - last.time).max(self.last_duration),
+                // The frame ends before the cut: hold it until there.
+                Some(end) if end > last.time => end - last.time,
+                // The frame is stamped *past* the cut, so it belongs to the
+                // pause and not to this file. Writing it — or giving it its
+                // usual slot, which is what the `last_duration` fallback did —
+                // runs the file past the length the manifest records, and that
+                // is the second face of the 2026-10-27 `len.mismatch`: a 1.8 s
+                // segment measured 2.07 s because the frame after the freeze
+                // was held for another fifth of a second.
+                Some(_) => return Ok(()),
                 None => self.last_duration,
             };
             // SAFETY: owned buffer, as above.
@@ -240,6 +291,16 @@ pub struct AudioWriter {
     /// from the start; a source added mid-take sets its own first sample, so
     /// its file opens where its sound begins (see `Origin`).
     origin: i64,
+    /// The standing difference between the device's clock and this file's
+    /// byte-derived timeline, learned from the first chunk that can measure it.
+    ///
+    /// WASAPI timestamps and a byte count are not guaranteed to agree in
+    /// absolute terms; a device whose clock runs 100 ms ahead would otherwise
+    /// read as a 100 ms hole on every single chunk, and the file would grow
+    /// silence forever. What is worth acting on is the *change*, so the first
+    /// measurement becomes the baseline and everything after is judged against
+    /// it. See `write`.
+    skew_base: Option<i64>,
 }
 
 impl AudioWriter {
@@ -262,6 +323,7 @@ impl AudioWriter {
             next: None,
             started: false,
             origin: 0,
+            skew_base: None,
         }
     }
 
@@ -283,10 +345,24 @@ impl AudioWriter {
 
     /// Write one chunk.
     ///
-    /// A capture device hands audio over whenever it has some, in pieces whose
-    /// length has nothing to do with the piece before, so a chunk starts where
-    /// the previous one ended. Using the timestamp it arrived with instead would
-    /// leave a hole in the container every time the device stalled.
+    /// Three things can be true of the chunk's own timestamp, and they need
+    /// different answers (2026-10-27, `docs/api-recording.md` §11.2):
+    ///
+    /// * It agrees with where the last chunk ended → write it there. The
+    ///   difference is absorbed, so ordinary jitter never reaches the file.
+    /// * It is *later* than that by more than a buffer → the device really did
+    ///   stall. Silence fills the hole, so the sound after it keeps the
+    ///   picture's timeline.
+    /// * It is *earlier* → the device handed over a buffer it had already
+    ///   handed over. WASAPI does this after a device change or a long stall,
+    ///   and writing it pushes everything after it later by exactly the repeat.
+    ///   Nothing later wins that time back, so the rest of the file drifts out
+    ///   of sync with its picture — permanently and silently. Dropping the copy
+    ///   is the cheaper loss: the same audio twice, at worst.
+    ///
+    /// Before this, the timestamp was ignored past the first chunk and every
+    /// chunk was chained by byte count, which made the third case a one-way
+    /// error no later measurement could see.
     pub fn write(&mut self, chunk: &AudioChunk) -> Result<()> {
         if chunk.data.is_empty() {
             return Ok(());
@@ -296,17 +372,23 @@ impl AudioWriter {
         // that origin (sound can arrive before the picture it belongs to) is
         // pinned to zero rather than written at a negative time, which MP4
         // cannot express.
-        let start = self.next.unwrap_or((chunk.time - self.origin).max(0));
+        let arrival = (chunk.time - self.origin).max(0);
+        let start = match self.next {
+            None => arrival,
+            Some(next) => match place(arrival, next, &mut self.skew_base) {
+                Placement::Skip => return Ok(()),
+                Placement::AfterHole => {
+                    self.write_silence(next, arrival)?;
+                    arrival
+                }
+                Placement::Chain => next,
+            },
+        };
         if !self.started && start > 0 {
             // The microphone woke up after the take did: fill the gap with
             // silence so the file's timeline keeps the shared origin, exactly
             // like the video writer's black lead-in.
-            let silence =
-                vec![0u8; (start as u128 * self.bytes_per_second as u128 / 10_000_000) as usize];
-            // SAFETY: owned zeros, as below.
-            unsafe {
-                write_sample(&self.writer, self.stream, &silence, 0, start)?;
-            }
+            self.write_silence(0, start)?;
         }
         self.started = true;
         // SAFETY: the chunk is borrowed for the duration of the call, which
@@ -317,6 +399,24 @@ impl AudioWriter {
         }
         self.next = Some(start + duration);
         Ok(())
+    }
+
+    /// Zeroes on this stream, from `from` to `to`.
+    ///
+    /// One shape for two callers: the lead-in (0 → the first sample) and a hole
+    /// in the middle (0 → the first sample is the same operation, and so is
+    /// next → arrival after a stall).
+    fn write_silence(&self, from: i64, to: i64) -> Result<()> {
+        if to <= from {
+            return Ok(());
+        }
+        let bytes = ((to - from) as u128 * self.bytes_per_second as u128 / 10_000_000) as usize;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let silence = vec![0u8; bytes];
+        // SAFETY: owned zeros; the call copies them out.
+        unsafe { write_sample(&self.writer, self.stream, &silence, from, to - from) }
     }
 
     /// Close the file and report how far its timeline reached, in 100 ns units
@@ -806,25 +906,92 @@ fn latch_origin(
     origin
 }
 
-/// The path of segment `n` (1-based) for a source whose first file is `base`:
-/// `win.mp4`, `win-2.mp4`, `win-3.mp4` …
+/// `win-part{n}.mp4` — a part's number, suffix and all.
+///
+/// The suffix spells `part` out (2026-10-27) because a bare number was already
+/// taken: `-2` is how a *second source of the same app* is named (`chrome`,
+/// `chrome-2`), so one mic paused once and two mics never paused wrote the same
+/// two file names. Two different takes, two different meanings, one folder
+/// shape — which is the kind of collision that only shows up when someone tries
+/// to line the parts up again.
+fn numbered_path(base: &std::path::Path, n: usize) -> std::path::PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "take".into());
+    match base.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) if !ext.is_empty() => base.with_file_name(format!("{stem}-part{n}.{ext}")),
+        _ => base.with_file_name(format!("{stem}-part{n}")),
+    }
+}
+
+/// The path a writer opens for segment `n` while the take is still running.
 ///
 /// A separate file per pause is the only way to cut a video exactly. MP4 can
 /// only be split between keyframes, and nothing here sets a GOP — the encoder's
 /// default is seconds long — so a split after the fact would land wherever the
 /// last IDR happened to be. Starting a new file puts the boundary at frame
 /// zero, where it is exact by construction.
+///
+/// The first one is plain `base` because nobody knows yet whether a second will
+/// follow — numbering it up front would mean renaming back on every take that
+/// was never paused. [`number_all_parts`] settles the names once the count is
+/// known.
 pub fn segment_path(base: &std::path::Path, n: usize) -> std::path::PathBuf {
     if n <= 1 {
-        return base.to_path_buf();
+        base.to_path_buf()
+    } else {
+        numbered_path(base, n)
     }
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "take".into());
-    match base.extension().map(|e| e.to_string_lossy().into_owned()) {
-        Some(ext) if !ext.is_empty() => base.with_file_name(format!("{stem}-{n}.{ext}")),
-        _ => base.with_file_name(format!("{stem}-{n}")),
+}
+
+/// Number every part once a source turns out to have more than one.
+///
+/// A source with one file keeps its plain name, because there `win.mp4` really
+/// is the whole thing. The moment a second file exists that reading breaks:
+/// `win.mp4` sitting next to `win-part2.mp4` looks like the first one holds
+/// everything and the rest are extras — which is exactly backwards, and it is
+/// what the user read off the folder (2026-10-27). So the whole set gets
+/// numbered together, or none of them does.
+///
+/// `base` is passed in rather than read off `files[0]`: a second call is then a
+/// no-op instead of renaming `win-part1.mp4` to `win-part1-part1.mp4`. Entries
+/// are only changed when their rename actually succeeded, so a caller that
+/// writes the list back cannot point at a file that is not there.
+pub fn number_all_parts(
+    base: &std::path::Path,
+    files: &mut [std::path::PathBuf],
+) -> std::io::Result<()> {
+    if files.len() < 2 {
+        return Ok(());
+    }
+    for (i, file) in files.iter_mut().enumerate() {
+        let want = numbered_path(base, i + 1);
+        if *file == want {
+            continue;
+        }
+        std::fs::rename(&*file, &want)?;
+        *file = want;
+    }
+    Ok(())
+}
+
+/// Apply [`number_all_parts`] to a report's segments.
+///
+/// A rename that fails leaves the original name in place: the files are
+/// complete either way and the manifest stays truthful about what is on disk
+/// (it just says `win.mp4` + `win-part2.mp4`, the pre-2026-10-27 shape). Losing
+/// the take over a naming nicety would be the worse trade.
+fn name_parts(base: &std::path::Path, segments: &mut [SegmentReport]) {
+    let mut files: Vec<std::path::PathBuf> = segments.iter().map(|s| s.file.clone()).collect();
+    if let Err(e) = number_all_parts(base, &mut files) {
+        eprintln!(
+            "takekit: could not number the parts of {}: {e}",
+            base.display()
+        );
+    }
+    for (seg, file) in segments.iter_mut().zip(files) {
+        seg.file = file;
     }
 }
 
@@ -917,22 +1084,35 @@ pub fn write_stream(
     loop {
         if clock.is_paused() {
             // The clock was stopped before the cut reached here, so whatever is
-            // already queued was captured before the pause and belongs in this
-            // file. Write it, then close the file exactly at the frozen
-            // instant. A frame still in a capture's hand is the only thing this
-            // can lose: one frame, at the cut, and the pause was the user's own
-            // doing.
+            // already queued with an earlier stamp was captured before the
+            // pause and belongs in this file. Write it, then close the file
+            // exactly at the frozen instant. A frame still in a capture's hand
+            // is the only thing this can lose: one frame, at the cut, and the
+            // pause was the user's own doing.
             let frozen = clock.now_100ns();
             if let Sampling::EveryFrame = sampling {
                 while let Ok(msg) = rx.try_recv() {
                     if let MediaFrame::Video(frame) = msg {
+                        // The capture never stops, so a window that keeps
+                        // painting keeps delivering — and every one of those
+                        // frames is stamped past the freeze. Writing them was
+                        // the 2026-10-27 bug: with nothing open the loop opened
+                        // the *first* file again (that is the path `out` names),
+                        // overwrote the take with one frame, and recorded a
+                        // zero-second segment for each pass — sixteen of them in
+                        // a 5-second pause, and a `len.mismatch` for the file
+                        // that really did lose its content.
+                        if frame.time > frozen {
+                            continue;
+                        }
                         frames += 1;
                         seg_frames += 1;
                         let frame = even_frame(crop_frame(frame, crop));
                         let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
                         if video.is_none() {
                             size = (frame.width, frame.height);
-                            video = Some(open_for(&frame, out, fps, bitrate)?);
+                            let path = segment_path(out, segments.len() + 1);
+                            video = Some(open_for(&frame, &path, fps, bitrate)?);
                         }
                         video
                             .as_mut()
@@ -968,19 +1148,32 @@ pub fn write_stream(
                 let path = segment_path(out, segments.len() + 1);
                 video = Some(open_for(frame, &path, fps, bitrate)?);
                 video.as_mut().expect("opened above").write_at(frame, 0)?;
+                seg_frames = 1;
             }
         }
 
         match sampling {
             Sampling::EveryFrame => match rx.recv_timeout(interval) {
                 Ok(MediaFrame::Video(frame)) => {
+                    // A pause can land between the check at the top of the loop
+                    // and this frame arriving — the writer is parked in this
+                    // `recv` when the user presses pause. The frame is then
+                    // stamped past the freeze and belongs to the pause, exactly
+                    // like the ones the paused branch drops (measured: this is
+                    // where the first post-pause frame used to slip in).
+                    if clock.is_paused() && frame.time > clock.now_100ns() {
+                        continue;
+                    }
                     frames += 1;
                     seg_frames += 1;
                     let frame = even_frame(crop_frame(frame, crop));
                     let at = latch_origin(&mut base, &mut reported, first.as_ref(), frame.time);
                     if video.is_none() {
                         size = (frame.width, frame.height);
-                        video = Some(open_for(&frame, out, fps, bitrate)?);
+                        // Same rule as above: never `out`, which may already
+                        // hold a closed segment.
+                        let path = segment_path(out, segments.len() + 1);
+                        video = Some(open_for(&frame, &path, fps, bitrate)?);
                     }
                     video
                         .as_mut()
@@ -1043,6 +1236,11 @@ pub fn write_stream(
     };
     close_segment(&mut video, &mut segments, base, seg_frames, out, end)?;
 
+    // The file count is finally known, so a source that was cut gets its parts
+    // numbered from one instead of leaving the first file looking like the
+    // whole recording.
+    name_parts(out, &mut segments);
+
     // The source's own span: its files back to back. Because a pause removes
     // time from the timeline instead of recording it, those files really are
     // contiguous — `start + seconds` of one segment is the next one's `start`,
@@ -1093,6 +1291,152 @@ fn open_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three answers a chunk's timestamp can deserve, and the reason the
+    /// baseline exists.
+    ///
+    /// Units are 100 ns throughout; 100 ms is `1_000_000` and the tolerance is
+    /// 40 ms, so the numbers below are deliberately far from the line.
+    #[test]
+    fn a_redelivered_chunk_is_dropped_and_a_real_hole_is_filled() {
+        const MS: i64 = 10_000;
+
+        // Chained: the timestamp agrees with where the last chunk ended.
+        let mut base = None;
+        assert_eq!(place(1_000 * MS, 1_000 * MS, &mut base), Placement::Chain);
+        assert_eq!(place(1_005 * MS, 1_004 * MS, &mut base), Placement::Chain);
+
+        // A redelivery: the device hands over audio it already handed over.
+        // Writing it would push everything after it later by the repeat, and
+        // nothing later can win that time back.
+        assert_eq!(
+            place(900 * MS, 1_010 * MS, &mut base),
+            Placement::Skip,
+            "a second and a half of re-sent audio must not become permanent drift"
+        );
+
+        // A real stall: the device stopped and came back. Silence holds the
+        // timeline so the sound after it still matches its picture.
+        let mut base = None;
+        assert_eq!(place(1_000 * MS, 1_000 * MS, &mut base), Placement::Chain);
+        assert_eq!(
+            place(3_000 * MS, 1_005 * MS, &mut base),
+            Placement::AfterHole,
+            "two seconds of silence must land as two seconds of silence, not as \
+             two seconds of drift"
+        );
+    }
+
+    /// A device whose clock is simply *wrong* must not be treated as stalling
+    /// on every chunk — that is what the baseline is for, and getting it wrong
+    /// would grow the file's silence without bound.
+    #[test]
+    fn a_standing_clock_offset_is_learned_not_repaired() {
+        const MS: i64 = 10_000;
+        let mut base = None;
+        // Every timestamp is 200 ms later than the byte count says it should
+        // be, chunk after chunk: a clock offset, not a hole.
+        for i in 0..50 {
+            let next = 1_000 * MS + i * 10 * MS;
+            let arrival = next + 200 * MS;
+            assert_eq!(
+                place(arrival, next, &mut base),
+                Placement::Chain,
+                "chunk {i}: a standing offset is not fifty holes"
+            );
+        }
+        // And a genuine event on top of that offset is still caught.
+        assert_eq!(
+            place(
+                1_000 * MS + 50 * 10 * MS + 200 * MS - 2_000 * MS,
+                1_000 * MS + 50 * 10 * MS,
+                &mut base
+            ),
+            Placement::Skip
+        );
+    }
+
+    /// A pause names its files `-part2`, never `-2`: a bare number is already
+    /// how a second source of the same app is named, and one mic paused once
+    /// must not produce the same two names as two mics never paused.
+    #[test]
+    fn a_segment_is_named_apart_from_a_second_source() {
+        use std::path::Path;
+        assert_eq!(
+            segment_path(Path::new("/t/chrome.mp4"), 1),
+            Path::new("/t/chrome.mp4")
+        );
+        assert_eq!(
+            segment_path(Path::new("/t/chrome.mp4"), 2),
+            Path::new("/t/chrome-part2.mp4")
+        );
+        assert_eq!(
+            segment_path(Path::new("/t/chrome-2.mp4"), 3),
+            Path::new("/t/chrome-2-part3.mp4")
+        );
+        // A source id and a part number can never be confused for each other:
+        // the second source of an app still ends in a bare `-2`.
+        assert_ne!(
+            segment_path(Path::new("/t/mic.mp4"), 2),
+            Path::new("/t/mic-2.mp4")
+        );
+        // No extension at all still gets a name.
+        assert_eq!(
+            segment_path(Path::new("/t/raw"), 2),
+            Path::new("/t/raw-part2")
+        );
+    }
+
+    /// A split numbers **every** file, the first one included: leaving the
+    /// first file plain next to `-part2` reads as "the one without a number
+    /// holds it all" — the opposite of what a split means (2026-10-27, the
+    /// user's reading of the folder). A take that was never cut keeps the plain
+    /// name, so the rule only kicks in when there is something to line up.
+    #[test]
+    fn a_split_numbers_every_part_including_the_first() {
+        // Stamped, not just pid-keyed: a recycled pid would land in a directory
+        // a previous run left behind, and then `win.mp4 → win-part1.mp4` fails
+        // on Windows because the target already exists — a failure that says
+        // nothing about the code under test.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("tk-parts-{stamp}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("win.mp4");
+        let two = dir.join("win-part2.mp4");
+
+        // One part: untouched, and nothing renamed on disk.
+        std::fs::write(&base, b"a").unwrap();
+        let mut lone = vec![base.clone()];
+        number_all_parts(&base, &mut lone).unwrap();
+        assert_eq!(lone, vec![base.clone()]);
+        assert!(base.is_file());
+
+        // Two parts: the first gains its number, the second keeps the one it
+        // already had.
+        std::fs::write(&two, b"b").unwrap();
+        let mut pair = vec![base.clone(), two.clone()];
+        number_all_parts(&base, &mut pair).unwrap();
+        let first = dir.join("win-part1.mp4");
+        assert_eq!(pair, vec![first.clone(), two.clone()]);
+        assert!(
+            first.is_file() && !base.exists(),
+            "the plain name must be gone"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"a");
+
+        // Running it again changes nothing — `base` is passed in rather than
+        // read off the first entry, which is the whole reason it is a parameter.
+        let mut again = pair.clone();
+        number_all_parts(&base, &mut again).unwrap();
+        assert_eq!(again, pair);
+        assert!(!dir.join("win-part1-part1.mp4").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A bottom-up RGB32 media type is the default, so a top-down frame has to
     /// come out with its rows reversed — and a frame only ever has to be
@@ -1339,6 +1683,79 @@ mod tests {
         assert!(watch_rx.try_recv().is_err(), "reported once, not per frame");
         // The file covers what it recorded, not the twelve seconds it missed.
         assert!(report.seconds < 1.0, "got {}", report.seconds);
+    }
+
+    /// A paused take of a window that keeps painting. The capture never stops
+    /// during a pause, so a busy window keeps handing over frames stamped past
+    /// the freeze; writing them opened a fresh file per frame, each one over
+    /// the take's *first* file, and left sixteen zero-second segments in the
+    /// manifest for a five-second pause (measured 2026-10-27). Only the two
+    /// real cuts may survive.
+    #[test]
+    fn frames_that_arrive_during_a_pause_are_dropped() {
+        let dir = std::env::temp_dir().join("takekit-writer-paused-frames");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chrome.mp4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clock = crate::clock::TakeClock::start();
+
+        let frame = |t: i64| {
+            crate::frame::MediaFrame::Video(VideoFrame {
+                width: 100,
+                height: 50,
+                format: PixelFormat::Bgra,
+                data: vec![0; 100 * 50 * 4],
+                time: t,
+            })
+        };
+
+        let _ = tx.send(frame(0));
+        let _ = tx.send(frame(33_333_333));
+
+        let writer_clock = clock.clone();
+        let handle = std::thread::spawn(move || {
+            write_stream(
+                rx,
+                &path,
+                Encode {
+                    fps: 30,
+                    bitrate: 2_000,
+                    crop: CropBox::default(),
+                    sampling: Sampling::EveryFrame,
+                    origin: Origin::Take,
+                    first: None,
+                },
+                writer_clock,
+                std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            )
+        });
+
+        // Long enough for the encoder to open and take both frames; it opens
+        // lazily on the first one, which is the slow part.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        clock.pause();
+        let frozen = clock.now_100ns();
+        for i in 1..=10 {
+            let _ = tx.send(frame(frozen + i * 33_333_333));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        clock.resume();
+        let _ = tx.send(frame(clock.now_100ns() + 33_333_333));
+        drop(tx);
+
+        let report = handle.join().unwrap().unwrap();
+        let shape: Vec<(u64, f64)> = report
+            .segments
+            .iter()
+            .map(|s| (s.frames, s.seconds))
+            .collect();
+        assert_eq!(
+            report.segments.len(),
+            2,
+            "one file per real cut; got {shape:?}"
+        );
+        assert_eq!(report.segments[0].frames, 2, "before the pause: {shape:?}");
     }
 
     #[test]

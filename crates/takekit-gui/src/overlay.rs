@@ -13,6 +13,10 @@ use takekit_core::source::virtual_screen_rect;
 pub const LABEL: &str = "overlay";
 
 pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    // The veil has one line of prose now (the stop screen's way out), so it
+    // needs the same language seed the panel gets — otherwise an English user
+    // reads that line in Chinese until they switch language by hand.
+    let cfg = crate::config::Config::load();
     let window =
         tauri::WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("overlay.html".into()))
             .title("TakeKit")
@@ -33,6 +37,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             .focused(false)
             .focusable(false)
             .visible(false)
+            .initialization_script(crate::ui_script(
+                &cfg.effective_language(),
+                &cfg.effective_theme(),
+            ))
             // No `additional_browser_args` here even though B3's countdown beeps need
             // `--autoplay-policy=no-user-gesture-required`: wry already passes that
             // (its `autoplay` attribute defaults to true). Passing flags per window is
@@ -78,6 +86,9 @@ pub fn show(app: &AppHandle) -> bool {
     // The virtual screen is not fixed: a monitor can be added or unplugged
     // between takes, so the cover is recomputed every time it comes up.
     cover_virtual_screen(&window);
+    // Whatever this window last was, it comes up as the veil: click-through.
+    // A stop screen may have taken the clicks (and failed to hand them back).
+    let _ = window.set_ignore_cursor_events(true);
     match window.show() {
         Ok(()) => {
             crate::probe("overlay:shown");
@@ -94,8 +105,31 @@ pub fn show(app: &AppHandle) -> bool {
 pub fn hide(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) {
         if window.hide().is_ok() {
+            // Back to a pure veil for the next countdown, whether or not this
+            // hide was a stop screen handing the clicks back.
+            let _ = window.set_ignore_cursor_events(true);
             crate::probe("overlay:hidden");
         }
+    }
+}
+
+/// The stop screen is the one frame with something to click.
+///
+/// While a countdown runs the veil must stay click-through: a full-screen
+/// topmost window that hit-tests everything is read as an occluder by Chromium
+/// apps behind it and they stop painting (see `create`), and the user is busy
+/// arranging the window being recorded. Once the take is over there is nothing
+/// left to protect, and the summary needs a way out that is not a one-minute
+/// wait — so the stop screen takes the clicks, and a click anywhere on it
+/// dismisses it.
+pub fn set_clickable(app: &AppHandle, clickable: bool) {
+    let Some(window) = app.get_webview_window(LABEL) else {
+        crate::probe("overlay:clickable-missing");
+        return;
+    };
+    match window.set_ignore_cursor_events(!clickable) {
+        Ok(()) => crate::probe(&format!("overlay:clickable={clickable}")),
+        Err(e) => crate::probe(&format!("overlay:clickable-failed {e}")),
     }
 }
 

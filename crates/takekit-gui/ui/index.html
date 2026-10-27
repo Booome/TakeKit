@@ -86,7 +86,7 @@
         <h2 class="section-title" id="sources-title" data-i18n="section.sources">源</h2>
         <button class="ghost" id="add-btn" type="button" data-i18n="sources.add">添加源</button>
       </div>
-      <div id="source-list" class="source-list"></div>
+      <div id="source-list" class="source-list scroll"></div>
       <div id="empty" class="empty">
         <div class="mark" aria-hidden="true">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
@@ -107,7 +107,7 @@
           清空…
         </button>
       </div>
-      <div id="history-list" class="take-list"></div>
+      <div id="history-list" class="take-list scroll"></div>
       <div id="history-empty" class="empty">
         <div class="mark" aria-hidden="true">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
@@ -128,7 +128,7 @@
           清空…
         </button>
       </div>
-      <div id="log-list" class="take-list"></div>
+      <div id="log-list" class="take-list scroll"></div>
       <div id="log-empty" class="empty">
         <div class="mark" aria-hidden="true">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
@@ -148,154 +148,188 @@
       role="tabpanel"
       aria-labelledby="tab-settings"
     >
-      <div class="set-body">
-        <div class="set-group">
-          <p class="set-label" data-i18n="settings.capture">采集与编码</p>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="backend" data-i18n="params.backend">采集方式</label>
+      <div class="pane-scroll scroll">
+        <div class="set-body">
+          <div class="set-group">
+            <p class="set-label" data-i18n="settings.capture">采集与编码</p>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="backend" data-i18n="params.backend">采集方式</label>
+              </div>
+              <div class="ctl">
+                <select class="value" id="backend">
+                  <option value="windows" data-i18n="params.backendWindows">
+                    Windows API（后台窗口可录）
+                  </option>
+                  <option value="ffmpeg" data-i18n="params.backendFfmpeg">ffmpeg</option>
+                </select>
+              </div>
             </div>
-            <div class="ctl">
-              <select class="value" id="backend">
-                <option value="windows" data-i18n="params.backendWindows">
-                  Windows API（后台窗口可录）
-                </option>
-                <option value="ffmpeg" data-i18n="params.backendFfmpeg">ffmpeg</option>
-              </select>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="encoder" data-i18n="params.encoder">视频编码</label>
+              </div>
+              <div class="ctl">
+                <select class="value" id="encoder">
+                  <option value="" data-i18n="params.encoderAuto">自动</option>
+                  <option value="nvenc">NVENC</option>
+                  <option value="qsv">QSV</option>
+                  <option value="amf">AMF</option>
+                  <option value="x264">libx264</option>
+                </select>
+              </div>
             </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="encoder" data-i18n="params.encoder">视频编码</label>
-            </div>
-            <div class="ctl">
-              <select class="value" id="encoder">
-                <option value="" data-i18n="params.encoderAuto">自动</option>
-                <option value="nvenc">NVENC</option>
-                <option value="qsv">QSV</option>
-                <option value="amf">AMF</option>
-                <option value="x264">libx264</option>
-              </select>
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="ffmpeg-path" data-i18n="params.ffmpegPath">ffmpeg 路径</label>
-              <span class="hint" data-i18n="params.ffmpegPathHint"></span>
-            </div>
-            <div class="ctl">
-              <div class="path-row">
-                <input
-                  class="value mono"
-                  id="ffmpeg-path"
-                  type="text"
-                  placeholder="PATH"
-                  spellcheck="false"
-                />
-                <button
-                  class="browse"
-                  id="ffmpeg-browse"
-                  type="button"
-                  aria-label="选择 ffmpeg 程序"
-                  title="选择 ffmpeg 程序"
-                  data-i18n-aria="params.ffmpegPick"
-                  data-i18n-title="params.ffmpegPick"
-                >
-                  …
-                </button>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="ffmpeg-path" data-i18n="params.ffmpegPath">
+                  ffmpeg 路径
+                </label>
+                <span class="hint" data-i18n="params.ffmpegPathHint"></span>
+              </div>
+              <div class="ctl">
+                <div class="path-row">
+                  <input
+                    class="value mono"
+                    id="ffmpeg-path"
+                    type="text"
+                    placeholder="PATH"
+                    spellcheck="false"
+                  />
+                  <button
+                    class="browse"
+                    id="ffmpeg-browse"
+                    type="button"
+                    aria-label="选择 ffmpeg 程序"
+                    title="选择 ffmpeg 程序"
+                    data-i18n-aria="params.ffmpegPick"
+                    data-i18n-title="params.ffmpegPick"
+                  >
+                    …
+                  </button>
+                </div>
               </div>
             </div>
           </div>
+          <div class="set-group">
+            <p class="set-label" data-i18n="settings.recording">录制行为</p>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="marks-value" data-i18n="params.marks">鼠标效果</label>
+                <span class="hint" data-i18n="params.marksHint"></span>
+              </div>
+              <div class="ctl">
+                <input class="switch" id="marks-value" type="checkbox" role="switch" checked />
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="countdown-value" data-i18n="params.countdown">倒计时</label>
+                <span class="hint" data-i18n="params.countdownHint"></span>
+              </div>
+              <div class="ctl">
+                <input class="switch" id="countdown-value" type="checkbox" role="switch" checked />
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="finalize-value" data-i18n="params.finalizePanel">收尾面板</label>
+                <span class="hint" data-i18n="params.finalizePanelHint"></span>
+              </div>
+              <div class="ctl">
+                <input class="switch" id="finalize-value" type="checkbox" role="switch" checked />
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="raise-value" data-i18n="params.raise">窗口置前</label>
+                <span class="hint" data-i18n="params.raiseHint"></span>
+              </div>
+              <div class="ctl">
+                <input class="switch" id="raise-value" type="checkbox" role="switch" />
+              </div>
+            </div>
+          </div>
+          <div class="set-group">
+            <!-- Keys are their own group (2026-10-27): they are the only two
+                 rows on this page that change how the app is driven rather than
+                 what it records, and they were the two rows buried furthest
+                 down inside 录制行为. Two rows and a label is a cheaper way to
+                 say "these are the shortcuts" than reading the hint text.
+                 The label is not 快捷键 twice over — the rows say what each key
+                 does, which is what the group name would otherwise have to. -->
+            <p class="set-label" data-i18n="settings.hotkeys">快捷键</p>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="hotkey-btn" data-i18n="params.startStopHotkey">
+                  开始与停止
+                </label>
+                <!-- The capture hint comes and goes in this slot; its height is
+                     reserved so the row list never jumps. -->
+                <span class="hint" id="hotkey-note" data-i18n="params.hotkeyHint"></span>
+              </div>
+              <div class="ctl">
+                <button class="chip" id="hotkey-btn" type="button">F9</button>
+              </div>
+            </div>
+            <div class="set-row">
+              <!-- The pause key has its own row because it is its own
+                   registration, and because it can be switched off (Delete on
+                   the chip) while the start/stop key cannot. -->
+              <div class="txt">
+                <label class="title" for="pause-hotkey-btn" data-i18n="params.pauseHotkey">
+                  暂停
+                </label>
+                <span
+                  class="hint"
+                  id="pause-hotkey-note"
+                  data-i18n="params.pauseHotkeyHint"
+                ></span>
+              </div>
+              <div class="ctl">
+                <button class="chip" id="pause-hotkey-btn" type="button">F10</button>
+              </div>
+            </div>
+          </div>
+          <div class="set-group">
+            <p class="set-label" data-i18n="settings.interface">界面</p>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="lang-select" data-i18n="settings.language">语言</label>
+              </div>
+              <div class="ctl">
+                <!-- Dropdown like 采集方式 (2026-10-20): the seg block was the
+                     one shape on the page that looked foreign. Language names
+                     stay in their own language on purpose. -->
+                <select class="value" id="lang-select">
+                  <option value="zh">中文</option>
+                  <option value="en">English</option>
+                </select>
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="theme-select" data-i18n="settings.theme">主题</label>
+              </div>
+              <div class="ctl">
+                <select class="value" id="theme-select">
+                  <option value="auto" data-i18n="settings.themeAuto">跟随系统</option>
+                  <option value="light" data-i18n="settings.themeLight">浅色</option>
+                  <option value="dark" data-i18n="settings.themeDark">深色</option>
+                </select>
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="txt">
+                <label class="title" for="control-value" data-i18n="settings.control">Agent 控制</label>
+                <span class="hint" data-i18n="settings.controlHint"></span>
+              </div>
+              <div class="ctl">
+                <input class="switch" id="control-value" type="checkbox" role="switch" checked />
+              </div>
+            </div>
+          </div>
+          <p class="set-note" data-i18n="settings.note">各项设置立即生效，并记住到下次启动。</p>
         </div>
-        <div class="set-group">
-          <p class="set-label" data-i18n="settings.recording">录制行为</p>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="marks-value" data-i18n="params.marks">鼠标效果</label>
-              <span class="hint" data-i18n="params.marksHint"></span>
-            </div>
-            <div class="ctl">
-              <input class="switch" id="marks-value" type="checkbox" role="switch" checked />
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="countdown-value" data-i18n="params.countdown">倒计时</label>
-              <span class="hint" data-i18n="params.countdownHint"></span>
-            </div>
-            <div class="ctl">
-              <input class="switch" id="countdown-value" type="checkbox" role="switch" checked />
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="finalize-value" data-i18n="params.finalizePanel">收尾面板</label>
-              <span class="hint" data-i18n="params.finalizePanelHint"></span>
-            </div>
-            <div class="ctl">
-              <input class="switch" id="finalize-value" type="checkbox" role="switch" checked />
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="raise-value" data-i18n="params.raise">窗口置前</label>
-              <span class="hint" data-i18n="params.raiseHint"></span>
-            </div>
-            <div class="ctl">
-              <input class="switch" id="raise-value" type="checkbox" role="switch" />
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="hotkey-btn" data-i18n="params.hotkey">快捷键</label>
-              <!-- The capture hint comes and goes in this slot; its height is
-                   reserved so the row list never jumps. -->
-              <span class="hint" id="hotkey-note" data-i18n="params.hotkeyHint"></span>
-            </div>
-            <div class="ctl">
-              <button class="chip" id="hotkey-btn" type="button">F9</button>
-            </div>
-          </div>
-        </div>
-        <div class="set-group">
-          <p class="set-label" data-i18n="settings.interface">界面</p>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="lang-select" data-i18n="settings.language">语言</label>
-            </div>
-            <div class="ctl">
-              <!-- Dropdown like 采集方式 (2026-10-20): the seg block was the
-                   one shape on the page that looked foreign. Language names
-                   stay in their own language on purpose. -->
-              <select class="value" id="lang-select">
-                <option value="zh">中文</option>
-                <option value="en">English</option>
-              </select>
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="theme-select" data-i18n="settings.theme">主题</label>
-            </div>
-            <div class="ctl">
-              <select class="value" id="theme-select">
-                <option value="auto" data-i18n="settings.themeAuto">跟随系统</option>
-                <option value="light" data-i18n="settings.themeLight">浅色</option>
-                <option value="dark" data-i18n="settings.themeDark">深色</option>
-              </select>
-            </div>
-          </div>
-          <div class="set-row">
-            <div class="txt">
-              <label class="title" for="control-value" data-i18n="settings.control">Agent 控制</label>
-              <span class="hint" data-i18n="settings.controlHint"></span>
-            </div>
-            <div class="ctl">
-              <input class="switch" id="control-value" type="checkbox" role="switch" checked />
-            </div>
-          </div>
-        </div>
-        <p class="set-note" data-i18n="settings.note">各项设置立即生效，并记住到下次启动。</p>
       </div>
     </section>
 
@@ -334,16 +368,19 @@
       <span class="paused-badge hidden" id="paused-badge"></span>
       <span class="hint" id="hint">0 个源</span>
       <button class="ghost flat" id="logs-btn" type="button" hidden data-i18n="bar.viewLogs">查看日志</button>
-      <button
-        class="ghost flat pause"
-        id="pause-btn"
-        type="button"
-        hidden
-        data-i18n="bar.pause"
-      >
-        暂停
-      </button>
-      <button class="rec" id="rec-btn" type="button" disabled data-i18n="bar.rec">开始录制</button>
+      <!-- The transport pair (2026-10-27): pause and stop sit together and read
+           as one unit — the two buttons a take is driven with. Pause used to be
+           a small ghost on the far side of the clock, where the one control
+           that matters most mid-take looked like decoration. It is hidden
+           unless a take is running; paintTransport decides. -->
+      <div class="transport">
+        <button class="pause" id="pause-btn" type="button" hidden data-i18n="bar.pause">
+          暂停
+        </button>
+        <button class="rec" id="rec-btn" type="button" disabled data-i18n="bar.rec">
+          开始录制
+        </button>
+      </div>
     </footer>
 
     <!-- ── The source editor ─────────────────────────────────────────────
@@ -542,7 +579,7 @@
         data-i18n-ph="picker.search"
         autocomplete="off"
       />
-      <div class="picker-body" id="picker-body"></div>
+      <div class="picker-body scroll" id="picker-body"></div>
     </div>
 
 

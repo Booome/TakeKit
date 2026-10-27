@@ -153,6 +153,25 @@ pub fn dda_verdict(ffmpeg: &Path, r: crate::source::ScreenRect) -> Option<bool> 
     slot.get(&(ffmpeg.to_path_buf(), r)).copied()
 }
 
+/// Throw away one cached verdict after it was shown to be wrong.
+///
+/// The cache is keyed by rectangle, so a monitor being unplugged or a scaling
+/// change that alters the virtual screen invalidates the entry by itself. What
+/// it cannot see is the same rectangle becoming unrecordable underneath it — a
+/// display swapped for one of the same geometry, a driver update, the D3D
+/// device going away. Those show up as a take that *chose* DDA and then failed
+/// to spawn, and the verdict is the thing that lied: keeping it means every
+/// later take repeats the same failure, because nothing else ever asks again.
+///
+/// Retrying costs 2.6s on a background thread and one take on GDI. Not
+/// retrying costs the feature.
+pub fn dda_forget(ffmpeg: &Path, r: crate::source::ScreenRect) {
+    dda_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(ffmpeg.to_path_buf(), r));
+}
+
 /// Probe now (or read the cache). Call this from a background thread.
 ///
 /// Only one probe per rect runs at a time: the startup warm-up and the
@@ -427,5 +446,32 @@ mod tests {
 
         super::set_path(None);
         let _ = std::fs::remove_file(&fake);
+    }
+
+    #[test]
+    fn forgetting_a_verdict_leaves_no_answer_behind() {
+        // A rectangle nobody else in this file uses: the cache is process-wide
+        // and the tests run in parallel, so a shared key would make this depend
+        // on ordering rather than on `dda_forget`.
+        let r = ScreenRect {
+            x: 77_007,
+            y: 31,
+            w: 641,
+            h: 481,
+        };
+        let ff = Path::new("ffmpeg-forget");
+        super::dda_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((ff.to_path_buf(), r), true);
+        assert_eq!(super::dda_verdict(ff, r), Some(true));
+
+        super::dda_forget(ff, r);
+        assert_eq!(
+            super::dda_verdict(ff, r),
+            None,
+            "a forgotten verdict must look like one never reached, or the next \
+             prepare repeats the failure instead of asking again"
+        );
     }
 }

@@ -280,6 +280,17 @@ impl Prepared {
                 recording.start_ffmpeg_source(src).map(|_| ())
             };
             if let Err(e) = started {
+                // A take that *chose* DDA and then could not start a desktop
+                // source is the one signal that distinguishes a stale verdict
+                // from a good one. Nothing else ever re-asks: the rectangle is
+                // unchanged, so the cache keeps saying yes and every later take
+                // fails the same way. Forgetting it costs 2.6s on a background
+                // thread and one take on GDI.
+                if recording.engine == Engine::Dda
+                    && let Some(r) = src.screen_rect()
+                {
+                    ffmpeg::dda_forget(&recording.ffmpeg, r);
+                }
                 // Nothing usable was recorded: stop the encoders that did
                 // start, then remove the folder so a failed start does not
                 // leave a take with no manifest and no frames.
@@ -1794,8 +1805,17 @@ impl Recording {
         });
 
         let mut sources = Vec::with_capacity(collected.len());
-        for c in collected {
+        for mut c in collected {
             if c.bytes > 0 {
+                // A source that was cut while paused has several files, and the
+                // first one must not keep the plain name: `win.mp4` beside
+                // `win-part2.mp4` reads as "the one without a number holds it
+                // all". The count is only known now, so the names are settled
+                // here — before the manifest is written, so what it records is
+                // what is on disk (2026-10-27).
+                if let Some((_, base)) = files.iter().find(|(id, _)| *id == c.id) {
+                    number_parts(base, &mut c.segments);
+                }
                 self.take.set_duration(&c.id, c.seconds);
                 self.take.set_frames(&c.id, c.frames);
                 self.take
@@ -1845,6 +1865,28 @@ impl Recording {
             duration: self.take.manifest.duration,
             sources,
         })
+    }
+}
+
+/// Rename a cut source's files so every part carries its number, then write
+/// the settled names back into the report.
+///
+/// Same rule as `takekit_media::writer::number_all_parts`, applied here too
+/// because the ffmpeg-backed sources build their segment list inside this
+/// module and never go through the writer's own finaliser. It is a no-op when
+/// the names are already right, so a path that did both is not double-numbered.
+fn number_parts(base: &Path, segments: &mut [Seg]) {
+    let mut files: Vec<PathBuf> = segments.iter().map(|s| s.file.clone()).collect();
+    let moved = takekit_media::writer::number_all_parts(base, &mut files);
+    // Assign back whatever the rename managed: an entry only changes when the
+    // rename really happened, so the report cannot name a file that is absent.
+    for (seg, file) in segments.iter_mut().zip(files) {
+        seg.file = file;
+    }
+    if moved.is_err() && segments.len() > 1 {
+        // The take is still complete, so this must not fail it — the manifest
+        // will just keep the older `win.mp4` + `win-part2.mp4` shape.
+        eprintln!("takekit: could not number the parts of {}", base.display());
     }
 }
 

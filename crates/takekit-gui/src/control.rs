@@ -721,11 +721,19 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
                             title: w.title.clone(),
                         }
                     };
-                    Ok(Source::new(
-                        unique_id(existing, if kind == "window" { "win" } else { "win-audio" }),
-                        capture,
-                        fps,
-                    ))
+                    // The app's name is the source's name (2026-10-27), the
+                    // same way the panel names a window it picks: the file in
+                    // the take folder says which app it is. The sound of a
+                    // window is its own source, so it keeps `-audio` — a take
+                    // of Chrome's picture and Chrome's sound reads as
+                    // `chrome.mp4` + `chrome-audio.mp4`, not as two `chrome`s.
+                    let app = w.app.as_str();
+                    let base = if kind == "window" {
+                        app.to_string()
+                    } else {
+                        format!("{app}-audio")
+                    };
+                    Ok(Source::new(unique_id(existing, &base), capture, fps))
                 }
                 _ => Err(fail(
                     409,
@@ -870,7 +878,12 @@ fn resolve_spec(body: &Value, existing: &[Source]) -> Result<Source, Fail> {
 }
 
 /// An id that survives being a file name and does not collide with the ones
-/// already in the list (`win`, `win-2`, `win-3`, …).
+/// already in the list (`chrome`, `chrome-2`, `chrome-3`, …).
+///
+/// A bare `-2` means *the second source of this app* and nothing else. That is
+/// the whole reason a pause names its files `-part1` / `-part2` (see
+/// `segment_path`): one mic paused once and two mics never paused used to write
+/// the same two names.
 fn unique_id(existing: &[Source], base: &str) -> String {
     let taken: Vec<&str> = existing.iter().map(|s| s.id.as_str()).collect();
     if !taken.contains(&base) {
@@ -1400,10 +1413,23 @@ mod tests {
     #[test]
     fn unique_ids_do_not_collide_with_the_list() {
         let s = |id: &str| Source::new(id, Capture::desktop(None), 30);
-        assert_eq!(unique_id(&[], "win"), "win");
-        assert_eq!(unique_id(&[s("win")], "win"), "win-2");
-        assert_eq!(unique_id(&[s("win"), s("win-2")], "win"), "win-3");
-        assert_eq!(unique_id(&[s("win"), s("win-3")], "win"), "win-2");
+        assert_eq!(unique_id(&[], "chrome"), "chrome");
+        assert_eq!(unique_id(&[s("chrome")], "chrome"), "chrome-2");
+        assert_eq!(
+            unique_id(&[s("chrome"), s("chrome-2")], "chrome"),
+            "chrome-3"
+        );
+        assert_eq!(
+            unique_id(&[s("chrome"), s("chrome-3")], "chrome"),
+            "chrome-2"
+        );
+        // Two apps that are only different by number stay apart, and the sound
+        // of a window is its own source rather than a second `chrome`.
+        assert_eq!(unique_id(&[s("chrome")], "chrome-audio"), "chrome-audio");
+        assert_eq!(
+            unique_id(&[s("chrome"), s("chrome-audio")], "chrome-audio"),
+            "chrome-audio-2"
+        );
     }
 
     #[test]

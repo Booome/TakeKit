@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use takekit_core::session::{Prepared, Recording, Session, Settings};
 use takekit_core::source::{Backend, Capture};
@@ -49,7 +49,28 @@ pub struct AppState {
     /// The shortcut currently registered, so replacing it unregisters exactly
     /// the old one instead of dropping every registration.
     pub hotkey: Mutex<Option<Shortcut>>,
+    /// The pause shortcut, kept apart so the two can be replaced independently.
+    /// `None` while the pause key is switched off.
+    pub pause_hotkey: Mutex<Option<Shortcut>>,
+    /// Why a configured hotkey is not claimed, if it is not. Written by the two
+    /// `install_*` functions, read by the settings card — the chip must not
+    /// claim a binding that the OS refused.
+    pub hotkey_error: Mutex<crate::proto::HotkeyStatus>,
+    /// The stop flag of the thread watching a running take's sources. `None`
+    /// when no take is running.
+    pub source_watch: Mutex<Option<Arc<AtomicBool>>>,
+    /// True while the veil is showing the stop screen. The take is over and
+    /// written by then — this is what says the veil belongs to the last take,
+    /// so a new take has to take it down first and the panel stays hidden
+    /// until the screen is dismissed.
+    pub stop_screen: AtomicBool,
 }
+
+/// How long the stop screen stays up on its own (2026-10-27). It is a screen to
+/// read, not a flash: the panel is hidden behind it, so it must not be a place
+/// the app can be stuck, and it must not be so short that the checklist cannot
+/// be read. One minute, and a click leaves earlier.
+pub const STOP_SCREEN_SECS: u64 = 60;
 
 /// Prepare a take and hand the screen to the veil: raise the window sources,
 /// probe the toolchain, then count down. Nothing is recorded yet — `spawn`
@@ -161,6 +182,16 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
     }
 
     let secs = crate::config::Config::load().countdown_secs;
+    // The stop screen of the last take can still be up (it lives a minute). It
+    // is the same veil this take is about to draw its countdown on, so it has to
+    // come down first — otherwise the takes' numbers would change under a screen
+    // that still says STOP. It comes down *without* the panel, because the panel
+    // steps aside in a moment anyway; the one case that needs it back is the
+    // prepare failure below, and that is handled where it can happen.
+    let stop_screen_down = dismiss_stop_screen(app, false);
+    if stop_screen_down {
+        crate::probe("begin:dismissed-stop-screen");
+    }
     let prepared = Session::prepare(Settings {
         sources: req.sources,
         out_root: std::path::PathBuf::from(req.out_root),
@@ -189,6 +220,12 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         };
         *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
         crate::probe(&format!("begin:failed {err}"));
+        if stop_screen_down {
+            // The stop screen was taken down on the way in, so "the panel is
+            // still on screen" is not true here: without this the reason lands
+            // on a window nobody can see.
+            crate::show_main_window(app);
+        }
         err
     })?;
     // Where the click-to-countdown time went: locate / encoder / engine.
@@ -243,7 +280,10 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
             spawn_started(&state, &mut guard)
         };
         return match outcome {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                start_source_watch(app, &state);
+                Ok(true)
+            }
             Err(err) => {
                 crate::tray::set_recording(app, false);
                 crate::show_main_window(app);
@@ -269,6 +309,7 @@ pub fn begin(app: &tauri::AppHandle, req: StartRequest) -> Result<bool, UiError>
         let _ = window.hide();
     }
     start_esc_watch(app, &state);
+    start_countdown_watchdog(app, secs);
     crate::probe(&format!("countdown:begin secs={secs}"));
     Ok(false)
 }
@@ -320,9 +361,90 @@ fn stop_esc_watch(state: &tauri::State<'_, AppState>) {
     }
 }
 
+/// Watch a running take's sources for ones that went away — from the side that
+/// knows, and without asking the window.
+///
+/// `status` already reports `usable` per source and the panel already drops the
+/// dead ones. But the panel hides itself for the whole take (it would otherwise
+/// be in the recording), and Chromium throttles a hidden window's timers to
+/// roughly once a minute. A window closed at 0:05 could therefore go on having
+/// the desktop behind it recorded until 1:05 — and the resulting clip is worse
+/// than no clip, because nothing about it says it is wrong.
+///
+/// The verdict (`source::is_recordable`) is computed here anyway, so the watch
+/// belongs here. The panel keeps its own tick as the visible half of the same
+/// rule; both end up in `stop_source`, which is idempotent.
+fn start_source_watch(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>) {
+    crate::probe("source:watch-on");
+    stop_source_watch(state);
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let app = app.clone();
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // `try_lock`, never `lock`: `begin` holds this across a prepare
+                // and `stop` across the whole finalise. A watcher that waits
+                // there is a watcher that can deadlock the click path.
+                let dead: Vec<String> = {
+                    let state = app.state::<AppState>();
+                    let mut guard = match state.recording.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    };
+                    match guard.as_mut() {
+                        // No take: this thread is out of job. It stops
+                        // itself rather than waiting to be told, so a take that
+                        // ended by any of its several routes cannot leave a
+                        // watcher behind.
+                        None => return,
+                        Some(recording) => recording
+                            .snapshot()
+                            .into_iter()
+                            .filter(|s| !s.usable)
+                            .map(|s| s.id)
+                            .collect(),
+                    }
+                };
+                let mut gone = Vec::new();
+                for id in dead {
+                    if stop_source(&app, &id) {
+                        crate::probe(&format!("source:vanished {id}"));
+                        gone.push(id);
+                    }
+                }
+                if !gone.is_empty() {
+                    // The panel does the forgetting — dropping it from the
+                    // saved list and saying so — because that is its list. The
+                    // event is the only part that has to come from here: an
+                    // IPC callback is not a throttled timer.
+                    let _ = app.emit_to("main", "source:stopped", &gone);
+                }
+            }
+        }
+    });
+    *state.source_watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
+}
+
+/// Retire the source watcher. The thread also retires itself when the take
+/// ends; this is for the paths that end one while the lock is still held.
+fn stop_source_watch(state: &tauri::State<'_, AppState>) {
+    if let Some(stop) = state
+        .source_watch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Clears a flag however its owner leaves scope.
 struct StartingGuard<'a>(&'a AtomicBool);
-
 impl Drop for StartingGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
@@ -355,6 +477,7 @@ pub fn spawn(app: &tauri::AppHandle) -> Result<StartResult, UiError> {
     match outcome {
         Ok(result) => {
             let _ = app.emit_to("main", "take:started", ());
+            start_source_watch(app, &state);
             Ok(result)
         }
         Err(err) => {
@@ -426,10 +549,13 @@ fn spawn_started(
     }
 }
 
-/// Throw the pending take away: Esc during the countdown. `Prepared::start` is
-/// what creates the take directory, so dropping it here leaves no trace on
-/// disk — which is what makes this free.
-pub fn cancel(app: &tauri::AppHandle) {
+/// Take the pending take away, if there is one. Returns whether there was.
+///
+/// Split from [`cancel`] because the two callers differ only in what they say
+/// afterwards: Esc says "cancelled", the countdown watchdog says "it never got
+/// going" — and a take that never started is not the same event as one the user
+/// withdrew.
+fn drop_pending(app: &tauri::AppHandle) -> bool {
     let state = app.state::<AppState>();
     if state
         .pending
@@ -440,8 +566,7 @@ pub fn cancel(app: &tauri::AppHandle) {
     {
         // Either the countdown already finished (spawn took the take) or
         // nothing was ever prepared: there is nothing to cancel.
-        crate::probe("cancel:nothing");
-        return;
+        return false;
     }
     // Retire the watcher even when this call did not come from it: the hotkey
     // during the countdown and the Esc poll both land here.
@@ -454,8 +579,44 @@ pub fn cancel(app: &tauri::AppHandle) {
     // tone) over a take that no longer exists.
     let _ = app.emit_to(crate::overlay::LABEL, "overlay:stop", ());
     crate::show_main_window(app);
+    true
+}
+
+/// Throw the pending take away: Esc during the countdown. `Prepared::start` is
+/// what creates the take directory, so dropping it here leaves no trace on
+/// disk — which is what makes this free.
+pub fn cancel(app: &tauri::AppHandle) {
+    if !drop_pending(app) {
+        crate::probe("cancel:nothing");
+        return;
+    }
     crate::probe("cancelled");
     let _ = app.emit_to("main", "take:cancelled", ());
+}
+
+/// A countdown that never reaches GO must not be able to hang the app.
+///
+/// Every step after `begin` lives in the veil's JavaScript: it receives
+/// `overlay:countdown`, runs the clock, and calls `start_recording` at zero.
+/// If that script throws — a bad asset in a fresh build, a webview that failed
+/// to boot — the take sits in `pending` with a full-screen veil and the only
+/// way out is guessing Esc, which is not a thing anyone guesses. So the one
+/// path that does not go through the veil watches it: after the countdown's own
+/// length plus a grace longer than any plausible beep, a take still pending
+/// never got started, and whatever the reason, the user gets their screen back
+/// with the reason on the status bar.
+fn start_countdown_watchdog(app: &tauri::AppHandle, secs: u8) {
+    const GRACE_MS: u64 = 5000;
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs as u64) + Duration::from_millis(GRACE_MS));
+        if !drop_pending(&handle) {
+            return;
+        }
+        crate::probe("countdown:lost");
+        let err = UiError::new("err.countdown-lost");
+        let _ = handle.emit_to("main", "take:failed", &err);
+    });
 }
 
 pub fn status(app: &tauri::AppHandle) -> StatusInfo {
@@ -517,6 +678,9 @@ pub fn pause_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
     match rec.pause() {
         Ok(()) => {
             crate::probe(&format!("take:paused at {:.3}", rec.elapsed()));
+            // The icon is the only signal left once the panel has hidden itself
+            // — which it does, to stay out of the recording (DESIGN §4.7).
+            crate::tray::set_paused(app, true);
             Ok(())
         }
         Err(e) => {
@@ -540,6 +704,7 @@ pub fn resume_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
             .unwrap_or_else(|| UiError::with_detail("err.pause-failed", text))
     })?;
     crate::probe(&format!("take:resumed at {:.3}", rec.elapsed()));
+    crate::tray::set_paused(app, false);
     Ok(())
 }
 
@@ -624,6 +789,11 @@ pub fn stop_source(app: &tauri::AppHandle, id: &str) -> bool {
 /// bar — read the same stream, so a stop feels the same whoever pressed it.
 pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiError> {
     let state = app.state::<AppState>();
+    // Nothing to watch from here on: the take is about to leave `recording`.
+    // The watcher would notice on its own, but not before its next tick, and
+    // "not for another half second" is still a thread reading a take that is
+    // being written out.
+    stop_source_watch(&state);
     // From here the recording is out of `recording` and the take is not
     // finished: without this flag a close during finalise looks like "idle"
     // and exits the process mid-write.
@@ -644,13 +814,13 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     // The full-screen stop screen is a choice (`finalize_panel`); either way
     // the panel's status bar follows the same events.
     let panel = crate::config::Config::load().finalize_panel;
-    // When the stop tone went out, so the done tone below can wait for it to
-    // finish instead of playing on top of it.
-    let stop_tone_at = Instant::now();
-    if panel {
+    // The stop screen needs the veil. A veil that will not come up is not a
+    // reason to lose the stop: it degrades to "the panel comes straight back",
+    // rather than holding a screen that is not on the monitor for a minute.
+    let stop_screen = panel && crate::overlay::show(app);
+    if stop_screen {
         // Cover first, then the event that paints STOP on it: the veil must
         // not come up empty and fill in a frame later.
-        crate::overlay::show(app);
         let _ = app.emit_to(
             crate::overlay::LABEL,
             "take:beep",
@@ -709,40 +879,75 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
         failed,
     };
     record(&result);
+    // The stop screen stays up after the take is over (2026-10-27): it is a
+    // summary to read, and the panel underneath would cover it. Three things
+    // take it down — a click on it (`overlay_dismiss`), the watchdog below, and
+    // a new take — and all three go through `dismiss_stop_screen`, so the veil
+    // can only come down once.
+    //
+    // Armed *before* `take:done` goes out: the page shows "click anywhere to
+    // close" on that event, and a window that is still click-through when the
+    // line appears would swallow the click it just promised to honour.
+    if stop_screen {
+        state.stop_screen.store(true, Ordering::SeqCst);
+        crate::overlay::set_clickable(app, true);
+    }
     // Completion travels the same way the rest of the stop did. There is
     // deliberately no "saved" banner on the veil (README B4 note): the fresh
     // history row is the success feedback, and a checklist that finished
     // needs no second ending.
     let _ = app.emit("take:done", &result);
-    // A stop screen that lives 50 ms shows nothing, which defeats the point of
-    // `finalize_panel`: a mic-only take finalises in tens of milliseconds, so
-    // the veil is held to a floor. A slow finalise already exceeds the floor
-    // and pays nothing. The hold is also what spaces the two tones — 660 Hz at
-    // the press, 880 Hz when the panel comes back — so they can never sound on
-    // top of each other.
-    //
-    // Sleeping is safe here: `stop_recording` runs this on the blocking pool
-    // (`spawn_blocking`), not on the UI thread.
-    if panel {
-        if let Some(rest) = Duration::from_secs(2).checked_sub(stop_tone_at.elapsed()) {
-            std::thread::sleep(rest);
+    // The earlier 2 s hold existed to space two tones apart (660 Hz at the
+    // press, 880 Hz when the panel came back). The second tone is gone: the
+    // stop is already confirmed by the press tone and by the screen itself, and
+    // a sound arriving after the take says nothing the summary does not.
+    if stop_screen {
+        let handle = app.clone();
+        // A watchdog, not the only timer: the page can be dismissed early, and
+        // this is what still fires when the page's own timer is throttled or
+        // broken. Sleeping here is safe — `stop_recording` runs on the blocking
+        // pool, and this thread is detached from it anyway.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(STOP_SCREEN_SECS));
+            dismiss_stop_screen(&handle, true);
+        });
+    } else {
+        if panel {
+            // The veil could not come up: there is no stop screen to hold, so
+            // the panel comes straight back (the old behaviour).
+            crate::overlay::hide(app);
         }
+        crate::show_main_window(app);
     }
-    crate::overlay::hide(app);
-    // Same reason as the failure path: the hotkey stops the take while another
-    // window is in front, and "it stopped" has to be something the user sees.
-    // Stopping from the panel itself is a no-op here — it is already front.
-    crate::show_main_window(app);
-    // After the window is back, not before it: the panel is the window that
-    // plays this tone, and a hidden document's audio context resumes too late
-    // to be heard — which is how the 2 s hold above turned into silence.
-    let _ = app.emit_to("main", "take:beep", &BeepInfo { hz: 880, ms: 150 });
     // `take:done` above is the one completion event: the panel's status bar,
     // the history refresh and the stop screen all read it. A second
     // `take:stopped` used to exist and now has no listener — the event
     // contract lives in proto.rs and DESIGN §4.11, so it was removed rather
     // than left as an alias.
     Ok(result)
+}
+
+/// Take the stop screen down. `panel` says whether the panel should come back
+/// with it — `false` is the "a new take is about to raise the veil again" case,
+/// where showing the panel first would be a flash of a window that is about to
+/// be hidden.
+///
+/// Idempotent on purpose: the click, the watchdog and a new take can all arrive
+/// within the same second, and only the first one may move windows.
+pub fn dismiss_stop_screen(app: &tauri::AppHandle, panel: bool) -> bool {
+    let state = app.state::<AppState>();
+    if !state.stop_screen.swap(false, Ordering::SeqCst) {
+        return false;
+    }
+    crate::overlay::hide(app);
+    crate::probe("stop-screen:dismissed");
+    if panel {
+        // Same reason as the failure path: the hotkey stops the take while
+        // another window is in front, and "it is over, here is what you got"
+        // has to be something the user sees.
+        crate::show_main_window(app);
+    }
+    true
 }
 
 /// Put the finished take in the history. Best effort on purpose: a journal that
@@ -800,6 +1005,19 @@ pub fn resolve(current: Option<Shortcut>, spec: &str) -> Result<Resolution, UiEr
 /// hotkey working, so a rejected change can never leave the panel with no way
 /// to start or stop.
 pub fn install_hotkey(app: &tauri::AppHandle, spec: &str) -> Result<String, UiError> {
+    let result = install_toggle_hotkey(app, spec);
+    // Recorded whether it worked or not: the settings card asks, and a chip
+    // that says F9 while the OS refused it is worse than no chip at all — it
+    // gets pressed at exactly the moment it was needed.
+    app.state::<AppState>()
+        .hotkey_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .toggle = result.as_ref().err().map(ToString::to_string);
+    result
+}
+
+fn install_toggle_hotkey(app: &tauri::AppHandle, spec: &str) -> Result<String, UiError> {
     let state = app.state::<AppState>();
     let resolution = resolve(
         *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()),
@@ -841,6 +1059,85 @@ pub fn install_hotkey(app: &tauri::AppHandle, spec: &str) -> Result<String, UiEr
     }
     crate::probe(&format!("hotkey:registered {}", resolution.normalized));
     Ok(resolution.normalized)
+}
+
+/// Register the pause hotkey, replacing whatever was registered before.
+///
+/// `None` switches it off: the previous registration is dropped and nothing
+/// takes its place. The pause key has no forced default for that reason — a
+/// key the user did not ask for would take the shortcut away from whatever
+/// else owns it, and the button plus the tray already cover the case.
+///
+/// Same register-before-drop order as `install_hotkey`: a combination another
+/// program owns fails here and leaves the previous key working.
+pub fn install_pause_hotkey(
+    app: &tauri::AppHandle,
+    spec: Option<&str>,
+) -> Result<Option<String>, UiError> {
+    let result = install_pause_binding(app, spec);
+    app.state::<AppState>()
+        .hotkey_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pause = result.as_ref().err().map(ToString::to_string);
+    result
+}
+
+fn install_pause_binding(
+    app: &tauri::AppHandle,
+    spec: Option<&str>,
+) -> Result<Option<String>, UiError> {
+    let state = app.state::<AppState>();
+    let current = *state.pause_hotkey.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(spec) = spec else {
+        if let Some(previous) = state
+            .pause_hotkey
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = app.global_shortcut().unregister(previous);
+        }
+        crate::probe("pause-hotkey:off");
+        return Ok(None);
+    };
+
+    let resolution = resolve(current, spec)?;
+    let Some(next) = resolution.register else {
+        return Ok(Some(resolution.normalized));
+    };
+
+    app.global_shortcut()
+        .on_shortcut(next, |app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                crate::probe("hotkey:pause-pressed");
+                // Same split as the toggle key: the panel owns the rules
+                // ("a take has to be running", "not during the countdown"),
+                // so the key only asks and every guard lives in one place.
+                let _ = app.emit_to("main", "hotkey:pause", ());
+            }
+        })
+        .map_err(|e| {
+            UiError::with_detail(
+                "err.hotkey-conflict",
+                format!("{}: {e}", resolution.normalized),
+            )
+        })?;
+
+    let previous = state
+        .pause_hotkey
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(next);
+    if let Some(previous) = previous {
+        let _ = app.global_shortcut().unregister(previous);
+    }
+    crate::probe(&format!(
+        "pause-hotkey:registered {}",
+        resolution.normalized
+    ));
+    Ok(Some(resolution.normalized))
 }
 
 #[cfg(test)]

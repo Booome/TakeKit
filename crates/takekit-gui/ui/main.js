@@ -64,7 +64,17 @@ const state = {
   // (`control+alt+KeyR`); shown through prettyHotkey(). Replaceable while the
   // app runs.
   hotkey: "F9",
-  // True while the chip is waiting for the next key combination.
+  // The pause binding in the same form, or "" when it is switched off. Off is
+  // a real state, not a missing value: no key is registered then, and the
+  // button plus the popover still pause.
+  pauseHotkey: "",
+  // Why the OS refused a key, by binding. Empty while both are live; a failed
+  // registration is not in the config (which still says `F9`), so this is the
+  // only place the panel can learn that the chip it draws is decorative.
+  hotkeyError: { toggle: null, pause: null },
+  // True while a chip is waiting for the next key combination. Both hotkey
+  // listeners check it: the keys being pressed into a capture must not start
+  // or pause a take underneath it.
   capturing: false,
   // Seeded by Rust before load; applySaved() confirms it from the file.
   language: window.__TAKEKIT_LANG__ === "en" ? "en" : "zh",
@@ -110,8 +120,10 @@ function uniqueId(base) {
   if (!state.sources.some((s) => s.id === base)) return base;
   let i = 2;
   // The same shape the control surface generates (`unique_id` in control.rs):
-  // "win", "win-2", "win-3" — an id is a file name, and the two generators
-  // producing "win2" and "win-2" for the same list was a silent split.
+  // "chrome", "chrome-2", "chrome-3" — an id is a file name, and the two
+  // generators producing "chrome2" and "chrome-2" for the same list was a
+  // silent split. A bare number is the *second source* shape and nothing else:
+  // a pause writes "-part2" instead (2026-10-27).
   while (state.sources.some((s) => s.id === `${base}-${i}`)) i += 1;
   return `${base}-${i}`;
 }
@@ -282,16 +294,33 @@ function sessionParams() {
   };
 }
 
-// Debounced: a session edit is a handful of clicks, but the settings file
-// should not be written once per keystroke either.
+// Coalesced, not delayed: a session edit arrives as a handful of clicks that
+// can land in the same tick (add a source → it re-renders → the output folder
+// changes), and one write per tick is enough. The delay is 0 rather than 300 ms
+// because of the close path: `app.exit(0)` does not wait for a timer, so a
+// three-hundred-millisecond one means the last edit — the one made right before
+// closing — is the one that never lands. `flushPersist` is what the close path
+// calls; it writes now and resolves when the write is done.
 let persistTimer = null;
+let persistedJson = null;
+function flushPersist() {
+  clearTimeout(persistTimer);
+  persistTimer = null;
+  const session = sessionParams();
+  const json = JSON.stringify(session);
+  // Unchanged since the last write: nothing to say, and `Config::update` is a
+  // read-modify-write, so a redundant call is also a chance to lose a write
+  // racing it.
+  if (json === persistedJson) return Promise.resolve();
+  persistedJson = json;
+  return invoke("save_session", { session }).catch((e) => {
+    persistedJson = null;
+    console.error("save_session", e);
+  });
+}
 function persist() {
   clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    invoke("save_session", { session: sessionParams() }).catch((e) =>
-      console.error("save_session", e),
-    );
-  }, 300);
+  persistTimer = setTimeout(flushPersist, 0);
 }
 
 // No display text is stored: the row derives its label from the capture spec
@@ -346,17 +375,6 @@ async function addLive(source) {
     addingId = null;
     render();
   }
-}
-
-// The row chip's own form: mm:ss while the take is that short, h:mm:ss once it
-// is not. The bar's clock always shows hours; a chip inside a row has no room
-// for a leading 00: that never changes.
-function offsetClock(seconds) {
-  const total = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = String(total % 60).padStart(2, "0");
-  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
 // Warm the DDA probe for this source's geometry so start_recording does not
@@ -478,18 +496,29 @@ async function titleLoop() {
 // would go on recording whatever is behind it. Stop that one where it stands —
 // the other sources have nothing to do with it — and take it off the list so
 // the next take starts without it.
+//
+// Split in two because the stopping half may already have happened in Rust: the
+// panel is hidden for the whole take and a hidden window's timers are throttled
+// to about once a minute, so the watch that catches a closed window runs there
+// and arrives here as `source:stopped`. Forgetting the source is the panel's
+// job either way — this is its list.
+function forgetSources(ids) {
+  if (!ids || ids.length === 0) return;
+  const gone = new Set(ids);
+  state.sources = state.sources.filter((s) => !gone.has(s.id));
+  persist();
+  render();
+  PROBE(`sources-dropped:${ids.length}`);
+  notify("warn", t("notice.dropped", { n: ids.length }));
+}
+
 async function dropUnusable(sources) {
   const dead = sources.filter((x) => x.alive && !x.usable);
   if (dead.length === 0) return;
   for (const x of dead) {
     await invoke("stop_source", { id: x.id }).catch((e) => console.error("stop_source", e));
   }
-  const gone = new Set(dead.map((x) => x.id));
-  state.sources = state.sources.filter((s) => !gone.has(s.id));
-  persist();
-  render();
-  PROBE(`sources-dropped:${dead.length}`);
-  notify("warn", t("notice.dropped", { n: dead.length }));
+  forgetSources(dead.map((x) => x.id));
 }
 
 // What the row says about a source without opening it: the two numbers that
@@ -623,7 +652,7 @@ function paintTransport() {
   // clock), but a frozen number with no explanation reads as a hang.
   const badge = $("paused-badge");
   badge.classList.toggle("hidden", !state.paused);
-  if (state.paused) badge.textContent = t("bar.pausedFor", { at: offsetClock(state.pauseLen) });
+  if (state.paused) badge.textContent = t("bar.pausedFor", { at: shortClock(state.pauseLen) });
   document.body.classList.toggle("paused", state.paused);
 }
 
@@ -664,7 +693,7 @@ function render() {
       const start = state.starts.get(s.id);
       const chip = document.createElement("span");
       chip.className = start == null ? "row-start pending" : "row-start";
-      chip.textContent = start == null ? "—" : offsetClock(start);
+      chip.textContent = start == null ? "—" : shortClock(start);
       chip.title =
         start == null
           ? `${t("row.startTitle")} · ${t("row.startPending")}`
@@ -748,9 +777,15 @@ function render() {
   emptyEl.classList.toggle("hidden", n > 0);
   listEl.classList.toggle("hidden", n === 0);
   renderTabs();
-  $("hint").textContent = state.recording
-    ? t("bar.hintRecording")
-    : t("bar.hintSources", { n });
+  // Paused says something the badge cannot: the badge names the state and how
+  // long, this says what it means — nothing is reaching the disk. Without it
+  // the bar read `已暂停 0:12  录制中`, two claims that contradict each other
+  // (2026-10-27).
+  $("hint").textContent = state.paused
+    ? t("bar.hintPaused")
+    : state.recording
+      ? t("bar.hintRecording")
+      : t("bar.hintSources", { n });
   // A take outlives its last source: one can be dropped mid-recording, and the
   // button has to stay live so the take can still be stopped.
   $("rec-btn").disabled = n === 0 && !state.recording;
@@ -1186,17 +1221,22 @@ function buildPicker() {
   const gWindows = group(t("picker.windows"));
   for (const w of state.windows) {
     const name = truncate(w.title, 48);
+    // The app name leads the meta line because it is what the source (and so
+    // the file) will be called: without it `chrome.mp4` in the take folder
+    // looks like it came from nowhere.
+    const app = w.app || "win";
+    const size = `${w.w}×${w.h}`;
     const meta =
       state.backend === "windows"
-        ? `${w.w}×${w.h} · ${t("picker.bgCapable")}`
-        : `${w.w}×${w.h}`;
+        ? `${app} · ${size} · ${t("picker.bgCapable")}`
+        : `${app} · ${size}`;
     item(
       gWindows,
       name,
       meta,
-      (q) => w.title.toLowerCase().includes(q),
+      (q) => w.title.toLowerCase().includes(q) || app.includes(q),
       () =>
-        addSource(uniqueId("win"), {
+        addSource(uniqueId(app), {
           Window: { hwnd: w.hwnd, pid: w.pid, title: w.title, crop: CROP() },
         }),
       { Window: { hwnd: w.hwnd } },
@@ -1572,7 +1612,12 @@ $("add-btn").addEventListener("click", openPicker);
 // Pause is a button, not a setting: it does the thing now. The label only flips
 // once the backend has actually stopped the clock — a failure says why and
 // leaves the bar telling the truth about what the take is doing.
-$("pause-btn").addEventListener("click", async () => {
+//
+// Three ways in (the button below, the tray popover, its own global hotkey) all
+// funnel through here, so the label, the badge and the backend can never
+// disagree about whether the take is paused.
+async function togglePause() {
+  if (!state.recording || state.countdown) return;
   const going = !state.paused;
   $("pause-btn").disabled = true;
   try {
@@ -1583,7 +1628,9 @@ $("pause-btn").addEventListener("click", async () => {
     notify("warn", uiErrorText(e));
   }
   paintTransport();
-});
+}
+
+$("pause-btn").addEventListener("click", togglePause);
 
 // The popover's "添加源": it brought the panel back and asks for the picker.
 // Mid-take that is the only way to grow a take from the tray, so the picker has
@@ -1672,6 +1719,15 @@ window.__TAURI__.event.listen("hotkey:toggle", () => {
   if (!$("rec-btn").disabled) toggleRecording();
 });
 
+// The pause hotkey. Same rule: the panel owns the decision, the key only asks.
+// Worth having on its own key because the panel is hidden for the whole take —
+// reaching the pause button otherwise means going through the tray popover.
+window.__TAURI__.event.listen("hotkey:pause", () => {
+  PROBE("hotkey:pause");
+  if (state.capturing) return;
+  togglePause();
+});
+
 // The stop, told in three events (B4): the same stream feeds the full-screen
 // stop screen and this bar, so a stop reads the same whoever pressed it.
 //
@@ -1727,6 +1783,14 @@ window.__TAURI__.event.listen("take:cancelled", () => {
   resetToIdle();
 });
 
+// A source's window went away mid-take and Rust already stopped that one
+// channel. This window is hidden for the whole take, so its own tick cannot be
+// trusted to notice in time — the event is the fast half, the tick is the half
+// that runs when the panel is actually on screen.
+window.__TAURI__.event.listen("source:stopped", (e) => {
+  forgetSources(e.payload);
+});
+
 // The encoders refused to start after the countdown: the veil is already down
 // and this window is back, with the reason to show.
 window.__TAURI__.event.listen("take:failed", (e) => {
@@ -1740,6 +1804,15 @@ window.__TAURI__.event.listen("take:failed", (e) => {
 // is the pair in force, so a window that missed one event is still correct.
 window.__TAURI__.event.listen("ui:settings", (e) => {
   applySettings(e.payload);
+});
+
+// The window is being closed and the process is about to go. Rust holds the
+// exit for a beat so this can answer: write the session out, then say so.
+// The fallback on the Rust side fires whether or not this runs, so a webview
+// that is already gone cannot wedge the close.
+window.__TAURI__.event.listen("app:quitting", async () => {
+  await flushPersist();
+  invoke("quit_now").catch(() => {});
 });
 
 // A take can start and stop outside this panel: `POST /record/start`, the
@@ -1798,7 +1871,7 @@ function setParamsDisabled(off) {
   // while one runs. Recording controls are selected by name: the
   // language/theme rows share .set-row but are UI settings and stay usable.
   for (const el of document.querySelectorAll(
-    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn, #ffmpeg-path, #ffmpeg-browse",
+    ".params input, .params button, #backend, #encoder, #marks-value, #countdown-value, #finalize-value, #raise-value, #hotkey-btn, #pause-hotkey-btn, #ffmpeg-path, #ffmpeg-browse",
   )) {
     el.disabled = off;
   }
@@ -1949,6 +2022,7 @@ function applySaved(cfg) {
   // `data-theme` before the first paint (so an explicit choice does not flash
   // the other palette); this confirms it and fills in the strings.
   state.hotkey = cfg.hotkey || "F9";
+  state.pauseHotkey = cfg.pause_hotkey || "";
   state.language = cfg.language === "en" ? "en" : "zh";
   state.theme = cfg.theme === "light" || cfg.theme === "dark" ? cfg.theme : "auto";
   applyTheme(state.theme);
@@ -1967,6 +2041,9 @@ function applySaved(cfg) {
     } hotkey=${prettyHotkey(state.hotkey)}`,
   );
   PROBE(`ipc-config-applied:${savedSources.length}s`);
+  // Not awaited: the first paint must not wait on a round trip, and a chip
+  // that turns amber a frame later is cheaper than a panel that opens late.
+  refreshHotkeyStatus();
 }
 
 // ── Language and palette ───────────────────────────────────────────────────
@@ -1989,7 +2066,8 @@ function applyLanguageUi() {
   setUiLang(state.language);
   $("rec-btn").textContent = state.recording ? t("bar.stop") : t("bar.rec");
   $("encoder").options[0].textContent = encoderAutoLabel();
-  renderHotkey();
+  // Both chips, because the language can change the word for "off".
+  renderChips();
   render();
   buildPicker();
   renderJournal();
@@ -2032,38 +2110,88 @@ $("theme-select").addEventListener("change", (e) => {
     .catch((err) => notify("error", uiErrorText(err)));
 });
 
-// ── The hotkey chip ────────────────────────────────────────────────────────
-// Registration lives in Rust: `set_hotkey` re-registers through the plugin,
-// writes the config, and puts the previous binding back when the new one is
-// rejected. The panel only decides what combination the keys spell.
+// ── The hotkey chips ───────────────────────────────────────────────────────
+// Two bindings, one mechanism (2026-10-27): start/stop and pause. Registration
+// lives in Rust — `set_hotkey` and `set_pause_hotkey` re-register through the
+// plugin, write the config, and put the previous binding back when the new one
+// is rejected. The panel only decides what combination the keys spell.
+//
+// The pause chip can be emptied (Delete on it) where the start/stop chip cannot:
+// the button and the popover still pause, so the key is a convenience, and a
+// combination the user did not ask for takes that shortcut away from whatever
+// else owns it.
 
-const chip = $("hotkey-btn");
-const chipNote = $("hotkey-note");
+// The chip waiting for a key, or null. `state.capturing` mirrors it — the two
+// hotkey listeners above use that flag to ignore keys pressed into a capture.
+let captureChip = null;
 
-function renderHotkey() {
-  if (state.capturing) return;
-  chip.textContent = prettyHotkey(state.hotkey);
+function makeChip(opts) {
+  const o = {
+    button: $(opts.id),
+    note: $(opts.noteId),
+    hint: opts.hint,
+    allowOff: Boolean(opts.allowOff),
+    read: opts.read,
+    set: opts.set,
+    submit: opts.submit,
+    error: opts.error,
+  };
+  o.button.addEventListener("click", () => {
+    // Clicking the chip again is the way out of a capture the user changed
+    // their mind about (Esc does the same, but the pointer already landed).
+    if (captureChip === o) endChipCapture();
+    else beginChipCapture(o);
+  });
+  return o;
 }
 
-function beginHotkeyCapture() {
+function renderChips() {
+  for (const o of hotkeyChips) {
+    if (captureChip === o) continue;
+    const spec = o.read();
+    o.button.textContent = spec ? prettyHotkey(spec) : t("hotkey.off");
+    // A key the OS refused is still in the config, so the chip would otherwise
+    // say `F9` and lie. Marked rather than blanked: the binding is what the
+    // user set, and telling them it is not in force is more useful than
+    // pretending it was never set.
+    const why = spec ? o.error() : null;
+    o.button.classList.toggle("warn", Boolean(why));
+    // The registrar's own words (`Ctrl+F9: already registered`) go on the
+    // tooltip; the visible line is localised, because that is the one that has
+    // to be read rather than hunted for.
+    o.button.title = why || "";
+    o.note.textContent = why
+      ? t("hotkey.notRegistered", { key: prettyHotkey(spec) })
+      : t(o.hint);
+    o.note.classList.toggle("warn", Boolean(why));
+  }
+}
+
+function beginChipCapture(o) {
+  if (captureChip) endChipCapture();
+  captureChip = o;
   state.capturing = true;
-  chip.classList.remove("error", "ok");
-  chip.classList.add("capturing");
-  chip.textContent = t("hotkey.capturing");
-  chipNote.textContent = t("hotkey.cancelNote");
+  o.button.classList.remove("error", "ok");
+  o.button.classList.add("capturing");
+  o.button.textContent = t("hotkey.capturing");
+  o.note.textContent = t(o.allowOff ? "hotkey.cancelOrOff" : "hotkey.cancelNote");
   // Capture phase: this must see the key before the panel's own Escape
   // handling or any focused control acts on it.
   window.addEventListener("keydown", captureHotkey, true);
 }
 
-function endHotkeyCapture() {
+function endChipCapture() {
+  const o = captureChip;
+  captureChip = null;
   state.capturing = false;
-  chip.classList.remove("capturing");
-  // Back to the standing hint — the slot stays filled so the row keeps its
-  // height and the line reads as help rather than a gap.
-  chipNote.textContent = t("params.hotkeyHint");
   window.removeEventListener("keydown", captureHotkey, true);
-  renderHotkey();
+  if (!o) return;
+  o.button.classList.remove("capturing");
+  // Back to the standing hint — the slot stays filled so the row keeps its
+  // height and the line reads as help rather than a gap. `renderChips` owns
+  // that text: it may be an error line instead of the hint, when the OS
+  // refused the key.
+  renderChips();
 }
 
 // "Ctrl+KeyR": the names the registrar round-trips. The Windows key is left
@@ -2078,42 +2206,85 @@ function hotkeyFromEvent(e) {
 }
 
 function captureHotkey(e) {
+  const o = captureChip;
+  if (!o) return;
   e.preventDefault();
   e.stopPropagation();
   if (e.key === "Escape") {
-    endHotkeyCapture();
+    endChipCapture();
+    return;
+  }
+  // Delete empties a binding that is allowed to be empty: the pause key's way
+  // of being switched off without a second control in the row.
+  if (o.allowOff && (e.key === "Delete" || e.key === "Backspace")) {
+    endChipCapture();
+    commitChip(o, "");
     return;
   }
   // A modifier on its own is half a shortcut: wait for the real key.
   if (/^(Control|Shift|Alt|Meta)/.test(e.code)) return;
   if (!e.code) return;
   const spec = hotkeyFromEvent(e);
-  endHotkeyCapture();
-  commitHotkey(spec);
+  endChipCapture();
+  commitChip(o, spec);
 }
 
-function commitHotkey(spec) {
-  invoke("set_hotkey", { hotkey: spec })
+function commitChip(o, spec) {
+  o.submit(spec)
     .then((normalized) => {
-      state.hotkey = normalized;
-      renderHotkey();
-      chip.classList.add("ok");
-      setTimeout(() => chip.classList.remove("ok"), 1200);
+      o.set(normalized || "");
+      renderChips();
+      o.button.classList.add("ok");
+      setTimeout(() => o.button.classList.remove("ok"), 1200);
+      // The answer to "did the OS take it?" is written by Rust on the way past,
+      // success included — a key that just failed leaves a stale error on the
+      // card until this asks again.
+      refreshHotkeyStatus();
     })
     .catch((err) => {
       // The old binding is still live: say why, and put its name back.
-      chip.classList.add("error");
-      setTimeout(() => chip.classList.remove("error"), 1600);
+      o.button.classList.add("error");
+      setTimeout(() => o.button.classList.remove("error"), 1600);
       notify("error", uiErrorText(err));
     });
 }
 
-chip.addEventListener("click", () => {
-  // Clicking the chip again is the way out of a capture the user changed
-  // their mind about (Esc does the same, but the pointer already landed).
-  if (state.capturing) endHotkeyCapture();
-  else beginHotkeyCapture();
-});
+const hotkeyChips = [
+  makeChip({
+    id: "hotkey-btn",
+    noteId: "hotkey-note",
+    hint: "params.hotkeyHint",
+    read: () => state.hotkey,
+    set: (v) => (state.hotkey = v),
+    submit: (spec) => invoke("set_hotkey", { hotkey: spec }),
+    error: () => state.hotkeyError.toggle,
+  }),
+  makeChip({
+    id: "pause-hotkey-btn",
+    noteId: "pause-hotkey-note",
+    hint: "params.pauseHotkeyHint",
+    allowOff: true,
+    read: () => state.pauseHotkey,
+    set: (v) => (state.pauseHotkey = v),
+    submit: (spec) => invoke("set_pause_hotkey", { hotkey: spec }),
+    error: () => state.hotkeyError.pause,
+  }),
+];
+
+// Ask Rust whether the OS actually gave us the keys. A binding can fail long
+// after the config was written — another program grabbed the combination at the
+// next launch — so this is a standing question, not a startup one: read on
+// load, and again after any attempt to change a key.
+async function refreshHotkeyStatus() {
+  try {
+    const status = await invoke("hotkey_status");
+    state.hotkeyError = { toggle: status.toggle || null, pause: status.pause || null };
+  } catch (e) {
+    console.error("hotkey_status", e);
+  }
+  renderChips();
+}
+
 
 
 // ── The source editor ──────────────────────────────────────────────────────

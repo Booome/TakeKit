@@ -18,17 +18,17 @@
 
 ## 2. 现状：能力全都有，缺的只是门
 
-面板已有 44 个 Tauri 命令（`main.rs` 的 `invoke_handler`，2026-10-27 数），恰好覆盖 Agent 需要的全部动作：
+面板已有 49 个 Tauri 命令（`main.rs` 的 `invoke_handler`，2026-10-28 数），恰好覆盖 Agent 需要的全部动作：
 
 | 领域 | 现有命令 |
 |---|---|
 | 枚举 | `list_windows` / `list_mics` / `list_devices` / `env_info` / `source_preview` / `source_titles` |
 | Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` / `restore_window` / `add_live_source`（录制中加源）/ `add_source_from_tray`（托盘唤回面板并开选择器） |
-| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `pause_recording` / `resume_recording` / `stop_source` / `overlay_finish` / `overlay_cancel` / `preheat_engine` |
+| 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `pause_recording` / `resume_recording` / `stop_source` / `overlay_finish` / `overlay_cancel` / `overlay_dismiss`（点击收尾面板退出）/ `preheat_engine` |
 | 状态 | `status`（`StatusInfo`：recording/elapsed/paused/live/error）/ `config_get` / `journal_get` |
-| 设置 | `set_hotkey` / `set_countdown` / `set_finalize_panel` / `set_ffmpeg_path` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `set_active_tab` / `pick_folder` / `pick_file` |
+| 设置 | `set_hotkey` / `set_pause_hotkey` / `hotkey_status`（两颗热键的注册结果）/ `set_countdown` / `set_finalize_panel` / `set_ffmpeg_path` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `set_active_tab` / `pick_folder` / `pick_file` |
 | 历史 | `journal_seen` / `journal_clear` / `log_delete`（单条删日志）/ `log_push` / `take_delete` / `open_take` |
-| 面板自身 | `show_main` / `hide_tray` / `ui_ping` / `ui_settings` |
+| 面板自身 | `show_main` / `hide_tray` / `size_tray` / `ui_ping` / `ui_settings` / `quit_now` |
 
 > 本节写的是 **v1 之前的现状**（为什么需要那道门）。当时 CLI 只是一次性录制器；v1 之后
 > `takekit ctl` 已经能指挥运行中的面板（§7.2），这句话只作历史保留，别当成现在的约束。
@@ -150,7 +150,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
   "sources": [
     {
       "index": 0,
-      "id": "win",
+      "id": "wechat",
       "capture": { "Window": { "hwnd": 131542, "pid": 20488, "title": "微信",
                                "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
       "fps": 30,
@@ -268,6 +268,7 @@ takekit ctl devices --kind window      # 列窗口
 takekit ctl add --kind window --target 微信
 takekit ctl add --kind desktop --sound on   # 桌面 + 整机系统声音
 takekit ctl remove --index 1
+takekit ctl set-sources < sources.json  # 整表替换（JSON 数组从 stdin 进）
 takekit ctl config --out-root D:\takes --countdown 5
 takekit ctl config --ffmpeg-path ""    # 清掉 ffmpeg 路径覆盖，回到 PATH 查找
 takekit ctl start

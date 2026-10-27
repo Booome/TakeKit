@@ -22,6 +22,7 @@
   --tk-rec-fg: #ffffff;
   --tk-ok: #0e700e;
   --tk-warn: #8a5300;
+  --tk-warn-soft: rgba(138, 83, 0, 0.12);
   --tk-radius-sm: 6px;
   --tk-radius-md: 8px;
   --tk-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
@@ -51,6 +52,7 @@
     --tk-rec-fg: #1a0503;
     --tk-ok: #6ccb5f;
     --tk-warn: #e8b339;
+  --tk-warn-soft: rgba(232, 179, 57, 0.18);
   }
 }
 
@@ -70,6 +72,7 @@
   --tk-rec-fg: #1a0503;
   --tk-ok: #6ccb5f;
   --tk-warn: #e8b339;
+  --tk-warn-soft: rgba(232, 179, 57, 0.18);
 }
 
 * {
@@ -113,6 +116,20 @@ body {
   border-radius: 12px;
 }
 
+/* One synchronous read, then gone again (tray.js -> fit). `height: 100%` would
+   report the window's height back — the very number the measurement exists to
+   replace — so the card is let loose for the length of that read. */
+.card.measuring {
+  height: auto;
+}
+
+/* `flex: 1` resolves to zero in an auto-height card, so while measuring the
+   rows size to their content instead. Six rows is the ceiling either way: the
+   window is sized to this card, and a popover is a glance, not a log. */
+.card.measuring .rows {
+  flex: 0 0 auto;
+}
+
 .head {
   display: flex;
   align-items: center;
@@ -145,12 +162,51 @@ body.live .dot {
   color: var(--tk-text-2);
 }
 
+/* ── paused ────────────────────────────────────────────────────────────────
+   A paused take is not a quiet recording, and the popover used to draw it as
+   one: red dot, frozen clock, the word 录制中. That is the same picture as an
+   encoder that hung. Amber is already this popover's "something is off but
+   nothing is lost" colour (a stopped source's diamond, `.row .note`), so the
+   whole header takes it, and only the pause key follows — stop stays red
+   because stopping is still stop. */
+
+body.paused .dot {
+  background: var(--tk-warn);
+}
+
+body.paused .clock,
+body.paused .state {
+  color: var(--tk-warn);
+}
+
+body.paused #pause:not(:disabled) {
+  border-color: var(--tk-warn);
+  color: var(--tk-warn);
+}
+
+/* The two things a frozen clock cannot say: for how long, and that the stretch
+   is not in the file. Sits above the source rows because it explains them —
+   their sizes are not growing, which is the same fact from the other side. */
+.pause-note {
+  margin: 0;
+  padding: 4px 8px;
+  border-radius: var(--tk-radius-sm);
+  background: var(--tk-warn-soft);
+  color: var(--tk-warn);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
 .rows {
   display: flex;
   flex: 1;
   flex-direction: column;
   gap: 4px;
   min-height: 0;
+  /* Six rows, then it scrolls. The window around this card is sized to it (see
+     `.measuring`), so without a ceiling a take with twenty sources would ask
+     for a popover taller than the screen to show them all. */
+  max-height: 126px;
   overflow-y: auto;
 }
 
@@ -202,26 +258,35 @@ body.live .dot {
   color: var(--tk-text-3);
 }
 
-.empty.hidden {
+/* One rule for both lines that come and go: the empty state and the paused
+   note. Two copies of `display: none` were already one too many. */
+.hidden {
   display: none;
 }
 
+/* Two keys per line, and not by luck. Four flex items with a zero basis all fit
+   on one line — the labels then wrap inside 50px-wide keys, which is what the
+   first attempt did. The shape is a decision, so it is written down: pause and
+   stop act on the take in progress, add and show are the ways out of here, and
+   neither pair belongs on the other's line. */
 .acts {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
 }
 
-/* Stop takes the whole first line; the two ways out of the popover share the
-   second. Three buttons abreast in 220px is where a translated label gets
-   truncated, and the stop key is the one that must never be hard to hit. */
-.acts .stop {
-  flex: 1 1 100%;
+/* `1fr` floors at min-content: one long unbreakable word would otherwise push
+   its column past half the card and the pair would go ragged. */
+.acts button {
+  min-width: 0;
 }
 
 button {
-  height: 30px;
-  padding: 0 10px;
+  /* A floor, not a height: a label that wraps to two lines in one language has
+     to make the key taller — the card follows it — rather than spill over the
+     key's own edge. */
+  min-height: 30px;
+  padding: 4px 10px;
   border: 1px solid transparent;
   border-radius: 8px;
   font: inherit;
@@ -241,14 +306,12 @@ button:disabled {
 }
 
 .stop {
-  flex: 1;
   background: var(--tk-rec);
   border-color: var(--tk-rec);
   color: var(--tk-rec-fg);
 }
 
 .ghost {
-  flex: 1;
   background: transparent;
   border-color: var(--tk-border);
   color: var(--tk-text);

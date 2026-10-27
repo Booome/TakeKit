@@ -17,10 +17,14 @@
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import path from "node:path";
+import { assertNoPanel, startPanel } from "./lib/panel-guard.mjs";
+import { pickBinary } from "./lib/build.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const GUI = path.join(ROOT, "target", "debug", "takekit-gui.exe");
-const TK = path.join(ROOT, "target", "debug", "takekit.exe");
+// Debug by default; `TK_GUI=target/release/takekit-gui.exe` re-runs the whole
+// matrix against the profile that ships (same discipline as check-tray-layout).
+const GUI = pickBinary(ROOT, "takekit-gui.exe", "TK_GUI");
+const TK = pickBinary(ROOT, "takekit.exe", "TK_CLI");
 const OUT = path.join(ROOT, "target", "checks", "ui-matrix");
 const APPDATA = path.join(OUT, "appdata");
 const appDir = path.join(APPDATA, "TakeKit");
@@ -41,7 +45,196 @@ function record(name, ok, detail) {
   say(`${ok ? "PASS" : "FAIL"}  ${name}  ${detail || ""}`);
 }
 
-try { rmSync(OUT, { recursive: true, force: true }); } catch {}
+// ── The three ways into pause ──────────────────────────────────────────────
+// Static, because the tray popover lives in its own window and everything below
+// only drives the panel. Three ways in means three files, and any one of them
+// can be left behind while the other two look fine — the panel's own button,
+// the popover's, and the pause hotkey's listener.
+const readUi = (f) => readFileSync(path.join(ROOT, "crates", "takekit-gui", "ui", f), "utf8");
+const trayHtml = readUi("tray.html");
+const trayJs = readUi("tray.js");
+const mainJsSrc = readUi("main.js");
+const i18nSrc = readUi("i18n.js");
+
+const hasTrayButton = trayHtml.includes('id="pause"');
+const trayPauses = trayJs.includes('"pause_recording"') && trayJs.includes('"resume_recording"');
+const panelListens = mainJsSrc.includes('"hotkey:pause"');
+const trayStrings = (i18nSrc.match(/"tray\.pause"/g) || []).length === 2 &&
+  (i18nSrc.match(/"tray\.resume"/g) || []).length === 2;
+record(
+  "pause/three-ways-in",
+  hasTrayButton && trayPauses && panelListens && trayStrings,
+  `popover=${hasTrayButton} popoverInvoke=${trayPauses} hotkey=${panelListens} strings=${trayStrings}`,
+);
+
+// ── The popover is sized to its card ───────────────────────────────────────
+// The window is 220×152 at build time and the page resizes it afterwards, so
+// both halves are load-bearing: a page that stops calling `size_tray` leaves a
+// clipped card, and a CSS rule that stops letting the card loose leaves the
+// measurement reporting the window's own height back. Neither shows up in the
+// panel screenshots below, which is why this is static.
+const trayCss = readUi("tray.css");
+const measures = trayJs.includes('invoke("size_tray"') && trayJs.includes("measuring");
+const cssLoosens = /\.card\.measuring\s*\{[^}]*height:\s*auto/.test(trayCss);
+record(
+  "tray/fits-content",
+  measures && cssLoosens,
+  `measure=${measures} css=${cssLoosens}`,
+);
+
+// ── Both mouse buttons open the popover ───────────────────────────────────
+// Static: the icon lives in the shell's notification area, not in a webview, so
+// nothing in this matrix can click it (no UIA content tree, see
+// docs/development.md §5.2). There is no native menu behind the icon, which
+// makes an unhandled button a button that does nothing — indistinguishable from
+// a mis-click. The `show_menu_on_left_click(false)` half is asserted too: it is
+// what keeps the shell from ever interposing a menu of its own on top of the
+// popover.
+const trayRs = readFileSync(path.join(ROOT, "crates", "takekit-gui", "src", "tray.rs"), "utf8");
+const bothButtons = /button:\s*MouseButton::Left\s*\|\s*MouseButton::Right/.test(trayRs);
+const noNativeMenu = trayRs.includes("show_menu_on_left_click(false)");
+record(
+  "tray/both-buttons-open-the-popover",
+  bothButtons && noNativeMenu,
+  `both=${bothButtons} noNativeMenu=${noNativeMenu}`,
+);
+
+// ── The stop screen is a screen, not a flash ───────────────────────────────
+// Static, because it needs a real take to reach: it is raised by `take::stop`
+// and lives outside the panel's window. Three things have to hold together —
+// Rust keeps it up for a minute and hands the window the clicks, the page turns
+// a click into `overlay_dismiss`, and no tone follows the take. Any one of them
+// alone either makes the panel unreachable for a minute or leaves a click with
+// nothing behind it.
+const takeSrc = readFileSync(path.join(ROOT, "crates", "takekit-gui", "src", "take.rs"), "utf8");
+const overlayJsSrc = readUi("overlay.js");
+const minuteLong = /STOP_SCREEN_SECS:\s*u64\s*=\s*60/.test(takeSrc);
+const clickableOverlay = takeSrc.includes("overlay::set_clickable(app, true)");
+const clickDismisses =
+  overlayJsSrc.includes('invoke("overlay_dismiss")') &&
+  overlayJsSrc.includes("stopScreen = true");
+const noToneAfter = !/hz:\s*880/.test(takeSrc);
+record(
+  "stop-screen/one-minute-click-to-leave",
+  minuteLong && clickableOverlay && clickDismisses && noToneAfter,
+  `minute=${minuteLong} clickable=${clickableOverlay} click=${clickDismisses} silent=${noToneAfter}`,
+);
+
+// ── Both shortcut chips are one component ─────────────────────────────────
+// The start/stop key and the pause key differ only in what they are bound to;
+// a second copy of the capture code is how one of them quietly loses Escape or
+// the conflict message. Static: the wiring is what a screenshot cannot show.
+const pauseChipRow = readUi("index.html").includes('id="pause-hotkey-btn"');
+const pauseChipWired =
+  mainJsSrc.includes('invoke("set_pause_hotkey"') && mainJsSrc.includes('id: "pause-hotkey-btn"');
+const oneCapturePath = (mainJsSrc.match(/function beginChipCapture/g) || []).length === 1;
+record(
+  "hotkey/both-chips-one-component",
+  pauseChipRow && pauseChipWired && oneCapturePath,
+  `row=${pauseChipRow} wired=${pauseChipWired} onePath=${oneCapturePath}`,
+);
+
+// Each key gets a row, both keys share one group, and that group is its own
+// (2026-10-27). Cheap to assert, easy to undo by accident: a different row
+// added to 录制行为 and a chip left behind there still looks fine in a
+// screenshot, because the page lists both chips either way — they are just
+// filed under the wrong label.
+// The group is read the way the page reads it: the nearest `.set-label` above
+// the control, and the block runs to the next label.
+const indexHtml = readUi("index.html");
+const groupOf = (id) => {
+  const at = indexHtml.indexOf(`id="${id}"`);
+  if (at < 0) return null;
+  const label = indexHtml.lastIndexOf('class="set-label"', at);
+  if (label < 0) return null;
+  const m = /data-i18n="([\w.]+)"/.exec(indexHtml.slice(label, label + 120));
+  return m ? m[1] : null;
+};
+const startGroup = groupOf("hotkey-btn");
+const pauseGroup = groupOf("pause-hotkey-btn");
+const shortcutsGroup = (() => {
+  const at = indexHtml.indexOf('data-i18n="settings.hotkeys"');
+  if (at < 0) return "";
+  const next = indexHtml.indexOf('class="set-label"', at);
+  return indexHtml.slice(at, next < 0 ? undefined : next);
+})();
+record(
+  "settings/shortcuts-have-their-own-group",
+  startGroup === "settings.hotkeys" &&
+    pauseGroup === startGroup &&
+    shortcutsGroup.includes('id="hotkey-btn"') &&
+    shortcutsGroup.includes('id="pause-hotkey-btn"') &&
+    // A group named 快捷键 whose rows are switches is a mislabel, not a group.
+    !shortcutsGroup.includes('class="switch"'),
+  `${startGroup} / ${pauseGroup} rows=${(shortcutsGroup.match(/class="set-row"/g) || []).length}`,
+);
+
+
+// ── A window source is named after its app ────────────────────────────────
+// Both doors have to agree. The panel's picker and the control surface are two
+// separate id generators (`uniqueId` / `unique_id`), and the point of naming a
+// window after its app (2026-10-27) is that the name they produce is the app's.
+// If only one door moves, the same window gets a different file name depending
+// on how it was added — which is the silent split the two generators were
+// aligned to avoid in the first place.
+const controlRsSrc = readFileSync(
+  path.join(ROOT, "crates", "takekit-gui", "src", "control.rs"),
+  "utf8",
+);
+const pickerNamesByApp =
+  /const app = w\.app \|\| "win";[\s\S]{0,600}?addSource\(uniqueId\(app\)/.test(mainJsSrc);
+const controlNamesByApp =
+  /let app = w\.app\.as_str\(\);[\s\S]{0,400}?unique_id\(existing, &base\)/.test(controlRsSrc);
+record(
+  "naming/window-id-is-the-app",
+  pickerNamesByApp && controlNamesByApp,
+  `picker=${pickerNamesByApp} control=${controlNamesByApp}`,
+);
+
+{
+  const keys = (lang) => {
+    const start = i18nSrc.indexOf(`  ${lang}: {`);
+    const end = i18nSrc.indexOf("\n  },", start);
+    return new Set([...i18nSrc.slice(start, end).matchAll(/"([\w.]+)":/g)].map((m) => m[1]));
+  };
+  const zh = keys("zh");
+  const en = keys("en");
+  const onlyZh = [...zh].filter((k) => !en.has(k));
+  const onlyEn = [...en].filter((k) => !zh.has(k));
+  record("i18n/same-keys-both-languages", onlyZh.length === 0 && onlyEn.length === 0,
+    `zh-only ${onlyZh.join(",") || "none"} | en-only ${onlyEn.join(",") || "none"}`);
+}
+
+// Only two stale files matter, so only two are deleted.
+//
+// `control.json` from a previous run points at a port whose process is gone:
+// the wait loop below sees a port on its first poll and stops waiting, and every
+// assertion after that describes a window this script never started. It fails
+// loudly on `panel-start pid` now, but a silent catch is what let it look like a
+// product bug the first time (2026-10-27). `probe-handle.txt` is the same bug
+// with a different face — an old HWND is not a window, so the seeded source
+// renders as dead and the minimized-window screens assert on the wrong thing.
+//
+// The rest of the tree is left alone on purpose. Wiping `target/checks/ui-matrix`
+// meant handing 200+ files to the host's bulk-delete guard, which refuses
+// anything over 50 (measured: `SAFE_DELETE_BULK_CONFIRM_REQUIRED`), so the wipe
+// failed on every run after the first and the failure looked like a timing
+// problem. Screenshots and `wv2/` are overwritten or reused anyway.
+for (const stale of [
+  path.join(appDir, "control.json"),
+  path.join(OUT, "probe-handle.txt"),
+]) {
+  try {
+    rmSync(stale, { force: true });
+  } catch (e) {
+    console.error(`could not remove the stale ${stale}: ${e.message}`);
+    process.exit(2);
+  }
+  if (existsSync(stale)) {
+    console.error(`a stale ${stale} survived — is a previous run still up?`);
+    process.exit(2);
+  }
+}
 mkdirSync(appDir, { recursive: true });
 
 // A window of our own, minimized — the one state where a window source has a
@@ -211,31 +404,40 @@ writeFileSync(path.join(appDir, "config.json"), JSON.stringify({
   theme: "light",
 }));
 
-const gui = spawn(GUI, [], {
-  env: {
-    ...process.env,
-    APPDATA,
-    TAKEKIT_WEBVIEW_NO_SANDBOX: "1",
-    WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2"),
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
-  },
-  detached: true,
-  stdio: "ignore",
-});
-gui.unref();
-guiPid = gui.pid;
+await assertNoPanel();
 
-const controlFile = path.join(appDir, "control.json");
-let control = null;
-for (let i = 0; i < 60; i++) {
-  await sleep(500);
-  if (existsSync(controlFile)) {
-    try { control = JSON.parse(readFileSync(controlFile, "utf8")); if (control.port) break; } catch {}
-  }
-}
-record("panel-start", Boolean(control?.port), `port ${control?.port}`);
-if (!control?.port) {
-  say("the panel did not come up — is another instance already running?");
+const guiLaunch = () => {
+  const child = spawn(GUI, [], {
+    env: {
+      ...process.env,
+      APPDATA,
+      TAKEKIT_WEBVIEW_NO_SANDBOX: "1",
+      WEBVIEW2_USER_DATA_FOLDER: path.join(OUT, "wv2"),
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
+    },
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  guiPid = child.pid;
+  return child;
+};
+
+// Retried: this runs after other checks that kill their panel, and a panel that
+// cannot start says nothing about the layout (see `startPanel`).
+const boot = await startPanel(guiLaunch, appDir);
+const control = boot.control;
+// The pid is half of it: a control.json left by an earlier instance points at a
+// port this process never opened, and every assertion below would then report
+// on a window that is not the one under test (2026-10-27 — that is exactly how
+// check-midtake turned green-script/red-product the wrong way round).
+record(
+  "panel-start",
+  Boolean(control?.port) && control.pid === guiPid,
+  `port ${control?.port} pid ${control?.pid} (ours ${guiPid})`
+);
+if (!control?.port || control.pid !== guiPid) {
+  say("the panel did not come up under this pid — is another instance running, or a stale control.json?");
   process.exit(1);
 }
 
@@ -243,20 +445,71 @@ if (!control?.port) {
 // passes and the fetch below is refused for a second or two. Waiting for it is
 // the difference between a harness that reports on the UI and one that fails
 // whenever the machine is a little slower than the last run.
+//
+// The port answers before the *targets* do, too, and a WebView2 document that
+// is still navigating shows up as an extra target with the same URL and an
+// empty DOM. Picking by URL alone attached to that one — every read came back
+// as `Uncaught` (there is no `#editor` yet), all four language × theme
+// screenshots were byte-identical, and 78 assertions went red on a panel that
+// renders fine. So candidates are tried by what they *contain*, not by their
+// address.
 let list = null;
-for (let i = 0; i < 50 && !list; i += 1) {
+let target = null;
+let tried = [];
+for (let attempt = 0; attempt < 40 && !target; attempt += 1) {
   try {
     const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`);
     list = JSON.parse(await resp.text());
   } catch {
-    await new Promise((r) => setTimeout(r, 200));
+    list = null;
+    await new Promise((r) => setTimeout(r, 250));
+    continue;
   }
+  const candidates = list.filter(
+    (t) => t.type === "page" && /tauri\.localhost/.test(t.url || "") && !/tray|overlay/.test(t.url || ""),
+  );
+  for (const candidate of candidates) {
+    const probe = await probeTarget(candidate.webSocketDebuggerUrl);
+    if (probe.hasEditor) { target = candidate; break; }
+    tried.push(`${candidate.url} rows=${probe.rows}`);
+  }
+  if (!target) await new Promise((r) => setTimeout(r, 250));
 }
-if (!list) { record("cdp-target", false, `no debug port on ${CDP_PORT} after 10s`); process.exit(1); }
-const target =
-  list.find((t) => t.type === "page" && /tauri\.localhost/.test(t.url || "")) ||
-  list.find((t) => t.type === "page" && /TakeKit/i.test(t.title || ""));
-if (!target) { record("cdp-target", false, "no panel target"); process.exit(1); }
+if (!list) { record("cdp-target", false, `no debug port on ${CDP_PORT} after 15s`); process.exit(1); }
+if (!target) {
+  record(
+    "cdp-target",
+    false,
+    `no target with the panel's DOM (tried ${tried.length ? tried.join(" | ") : "none"}; saw ${list.map((t) => t.url).join(", ")})`,
+  );
+  process.exit(1);
+}
+
+/// Does this target hold the panel? A document that is still navigating
+/// answers the handshake and has nothing in it.
+async function probeTarget(url) {
+  const sock = new WebSocket(url);
+  const opened = await new Promise((res) => {
+    sock.onopen = () => res(true);
+    sock.onerror = () => res(false);
+    setTimeout(() => res(false), 4000);
+  });
+  if (!opened) return { hasEditor: false, rows: "no-ws" };
+  const value = await new Promise((res) => {
+    sock.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.id === 1) res(m.result?.result?.value ?? "null");
+    };
+    sock.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: {
+      expression: `JSON.stringify({ hasEditor: !!document.getElementById("editor"), rows: document.querySelectorAll(".row").length })`,
+      returnByValue: true } }));
+    setTimeout(() => res("null"), 4000);
+  });
+  sock.close();
+  let parsed = {};
+  try { parsed = JSON.parse(value); } catch {}
+  return { hasEditor: parsed.hasEditor === true, rows: parsed.rows ?? "?" };
+}
 
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; setTimeout(() => rej(new Error("ws timeout")), 8000); });
@@ -763,6 +1016,60 @@ for (const lang of LANGS) {
         pausedUi.text === (lang === "zh" ? "继续" : "Resume") && pausedUi.dimmed === true,
       JSON.stringify(pausedUi));
 
+    // Three signals, one colour (2026-10-27, reported as 提示不充分). The badge
+    // alone was 11px of amber in the middle of the bar: the clock now keeps the
+    // same amber, so a frozen number reads as "paused" rather than as
+    // "disabled", and the resume key is the only filled control in the bar.
+    //
+    // Compared against each other, not against literals: a palette change must
+    // not need this check rewritten.
+    // Sample it in a loop, not once. Two things undo this state under us: the
+    // panel polls `status` and repaints from it (which is what a real panel
+    // does), and `.pause` transitions its background over 160ms — so a sample
+    // taken straight after render() reports the colour it is leaving, and one
+    // taken 260ms later can land after the poll has put the bar back to idle.
+    // Re-assert and re-sample until the class and the colours agree.
+    const READ_PAUSED = `(() => {
+      const cs = (id) => getComputedStyle(document.getElementById(id));
+      const bars = getComputedStyle(document.getElementById("paused-badge"), "::before");
+      return JSON.stringify({
+        badge: cs("paused-badge").color,
+        clock: cs("clock").color,
+        keyBg: cs("pause-btn").backgroundColor,
+        bars: parseFloat(bars.width) > 0 && bars.backgroundImage.includes("gradient"),
+        hint: document.getElementById("hint").textContent.trim(),
+        bodyClass: document.body.className,
+      });
+    })()`;
+    let pausedLook = {};
+    for (let i = 0; i < 12; i += 1) {
+      await evalJs(`(() => {
+        state.recording = true;
+        state.paused = true;
+        state.pauseLen = 12;
+        render();
+      })()`);
+      await sleep(190); // past the 160ms transition
+      pausedLook = await evalJson(READ_PAUSED, {});
+      if (pausedLook.bodyClass?.includes("paused")) {
+        // Photograph inside the loop, in the same gap between two polls the
+        // sample was taken in. Taken after the loop, the shot caught the bar
+        // already repainted to idle (2026-10-27: `暂停` greyed out, no badge).
+        const shot = await send("Page.captureScreenshot", { format: "png" });
+        writeFileSync(path.join(OUT, `${tag}-paused.png`), Buffer.from(shot.result.data, "base64"));
+        break;
+      }
+    }
+    record(`${tag}/paused-look-is-one-colour`,
+      pausedLook.badge === pausedLook.clock && pausedLook.badge === pausedLook.keyBg,
+      `badge=${pausedLook.badge} clock=${pausedLook.clock} resume=${pausedLook.keyBg} body="${pausedLook.bodyClass}"`);
+    record(`${tag}/paused-badge-carries-the-mark`, pausedLook.bars === true, `bars=${pausedLook.bars}`);
+    // The badge and the hint sat next to each other saying `已暂停 0:12` and
+    // `录制中` — two claims, opposite meanings (2026-10-27).
+    record(`${tag}/paused-hint-agrees-with-the-badge`,
+      pausedLook.hint === (lang === "zh" ? "不写入文件" : "Not writing to disk"),
+      `hint="${pausedLook.hint}"`);
+
     const ff = await evalJs(`(() => {
       state.backend = "ffmpeg";
       state.paused = false;
@@ -779,6 +1086,120 @@ for (const lang of LANGS) {
       state.pauseLen = 0;
       state.recording = false;
       state.starts.clear();
+      render();
+    })()`);
+    await sleep(200);
+
+    // ── the transport pair, and where the bar may appear ─────────────────
+    // Pause used to sit on the far side of the clock, away from the button it
+    // is half of. It is next to stop now, and the two have to read as one unit:
+    // same height, one gap, stop on the right.
+    const pair = await evalJs(`(() => {
+      state.recording = true;
+      state.paused = false;
+      state.backend = "windows";
+      render();
+      const p = document.getElementById("pause-btn").getBoundingClientRect();
+      const r = document.getElementById("rec-btn").getBoundingClientRect();
+      return {
+        before: p.left < r.left,
+        gap: Math.round(r.left - p.right),
+        dH: Math.round(Math.abs(p.height - r.height)),
+      };
+    })()`);
+    record(`${tag}/pause-sits-beside-stop`,
+      pair.before === true && pair.dH <= 1 && pair.gap >= 4 && pair.gap <= 12,
+      JSON.stringify(pair));
+
+    // The bar follows the take, not the tab: while one is running it is on
+    // every tab (a stop button you cannot see is how a recording gets
+    // forgotten) — and the output path stays behind on the Record tab, where
+    // it belongs.
+    const onSettings = await evalJs(`(() => {
+      selectTab("settings");
+      const shown = (id) => document.getElementById(id).getBoundingClientRect().height > 0;
+      return { bar: shown("rec-btn"), pause: shown("pause-btn"), params: shown("out-path") };
+    })()`);
+    record(`${tag}/bar-stays-on-every-tab-while-recording`,
+      onSettings.bar === true && onSettings.pause === true && onSettings.params === false,
+      JSON.stringify(onSettings));
+
+    // …but the source count does not come with it: it counts a list that is
+    // not on this tab.
+    const hintBox = await evalJs(`(() => {
+      const h = document.getElementById("hint");
+      return { h: Math.round(h.getBoundingClientRect().height), text: h.textContent.trim() };
+    })()`);
+    record(`${tag}/bar-count-stays-with-the-list`, hintBox.h === 0, JSON.stringify(hintBox));
+
+    const idleSettings = await evalJs(`(() => {
+      state.recording = false;
+      render();
+      const shown = (id) => document.getElementById(id).getBoundingClientRect().height > 0;
+      return { bar: shown("rec-btn"), tab: document.body.dataset.tab };
+    })()`);
+    record(`${tag}/bar-leaves-a-tab-with-no-take`,
+      idleSettings.bar === false && idleSettings.tab === "settings",
+      JSON.stringify(idleSettings));
+
+    // ── the settings pane scrolls, like every other pane ─────────────────
+    // Nine groups do not fit a 640px window. Without a scroll container the
+    // last rows simply left the window: no scrollbar, no way to reach them.
+    const scrollBox = await evalJs(`(() => {
+      const box = document.querySelector("#pane-settings .pane-scroll");
+      const list = document.querySelector(".source-list");
+      if (!box) return { missing: true };
+      return {
+        overflow: getComputedStyle(box).overflowY,
+        sharesClass: box.classList.contains("scroll") && list.classList.contains("scroll"),
+        overflows: box.scrollHeight > box.clientHeight,
+      };
+    })()`);
+    record(`${tag}/settings-pane-scrolls`,
+      scrollBox.missing !== true && scrollBox.overflow === "auto" && scrollBox.sharesClass === true,
+      JSON.stringify(scrollBox));
+
+    // The point of the scrollbar: the last row can be reached. Scrolled to the
+    // end, its bottom edge is inside the box.
+    const reach = await evalJs(`(() => {
+      const box = document.querySelector("#pane-settings .pane-scroll");
+      box.scrollTop = box.scrollHeight;
+      const note = box.querySelector(".set-note").getBoundingClientRect();
+      const b = box.getBoundingClientRect();
+      const r = { inside: note.bottom <= b.bottom + 1, note: Math.round(note.bottom), box: Math.round(b.bottom) };
+      box.scrollTop = 0;
+      return r;
+    })()`);
+    record(`${tag}/settings-last-row-reachable`, reach.inside === true, JSON.stringify(reach));
+
+    // ── the pause chip ───────────────────────────────────────────────────
+    // It is the second half of "pause has three ways in": the button, the
+    // popover, and a key the user chose. The chip has to show the current
+    // binding, enter a capture, and leave it on Escape without committing.
+    const pauseChipState = await evalJs(`(() => {
+      const b = document.getElementById("pause-hotkey-btn");
+      // What the chip is supposed to say, from the state it reads — a chip
+      // showing a hardcoded key passes every other check here.
+      const expected = state.pauseHotkey ? prettyHotkey(state.pauseHotkey) : t("hotkey.off");
+      const idle = b.textContent.trim();
+      b.click();
+      const capturing = b.classList.contains("capturing");
+      const during = b.textContent.trim();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+      return {
+        idle, expected, capturing, during,
+        after: b.textContent.trim(),
+        stillCapturing: b.classList.contains("capturing"),
+      };
+    })()`);
+    record(`${tag}/pause-chip-shows-and-captures`,
+      pauseChipState.idle === pauseChipState.expected &&
+        pauseChipState.capturing === true && pauseChipState.stillCapturing === false &&
+        pauseChipState.after === pauseChipState.idle,
+      JSON.stringify(pauseChipState));
+
+    await evalJs(`(() => {
+      selectTab("sources");
       render();
     })()`);
     await sleep(200);
@@ -951,6 +1372,65 @@ try {
 record("picker/window-list-carries-pid",
   pids.length > 0 && pids.every((p) => Number.isInteger(p) && p > 0),
   `pids ${JSON.stringify(pids)}`);
+
+// A refused hotkey has to reach the panel, not just the config file.
+//
+// `hotkey_status` is the only place the panel can learn that a chip it draws is
+// decorative: the config keeps saying `F9` whether the OS took the key or not,
+// and the refusal happens at launch — long after the user picked it, and
+// exactly when they are not looking at this card. The conflict is forced by
+// handing the pause key the start/stop key's own combination: `RegisterHotKey`
+// refuses the second claim on a combination the process already holds.
+//
+// Two halves, and they fail differently. The first is Rust remembering the
+// refusal; the second is the card acting on it — the chip reads `state` (the
+// config value), so the check adopts the refused combination the way
+// `applySaved()` would, which is exactly the state a failing launch is in.
+const hotkeyReport = await evalJson(
+  `(async () => {
+    const invoke = window.__TAURI__.core.invoke;
+    const same = state.hotkey;
+    let refused = false;
+    try {
+      await invoke("set_pause_hotkey", { hotkey: same });
+    } catch (e) {
+      refused = true;
+    }
+    const reported = (await invoke("hotkey_status")).pause || null;
+    const before = state.pauseHotkey;
+    state.pauseHotkey = same;
+    await refreshHotkeyStatus();
+    const chip = document.getElementById("pause-hotkey-btn");
+    const note = document.getElementById("pause-hotkey-note");
+    const look = {
+      warn: chip.classList.contains("warn"),
+      text: chip.textContent.trim(),
+      note: note.textContent.trim(),
+      title: chip.title,
+    };
+    // Put everything back: a check that leaves two bindings on one combination
+    // has broken the thing it was measuring.
+    state.pauseHotkey = before;
+    await invoke("set_pause_hotkey", { hotkey: "" });
+    await refreshHotkeyStatus();
+    const restored = (await invoke("hotkey_status")).pause || null;
+    return JSON.stringify({ same, refused, reported, ...look, restored });
+  })()`,
+  {},
+);
+record(
+  "hotkey/a-refused-key-is-reported",
+  hotkeyReport.refused === true && Boolean(hotkeyReport.reported),
+  `combination=${hotkeyReport.same} refused=${hotkeyReport.refused} reported=${hotkeyReport.reported}`,
+);
+record(
+  "hotkey/the-card-shows-a-refused-key",
+  hotkeyReport.warn === true &&
+    hotkeyReport.note.length > 0 &&
+    hotkeyReport.title.length > 0 &&
+    hotkeyReport.restored === null,
+  `chip-warn=${hotkeyReport.warn} text="${hotkeyReport.text}" note="${hotkeyReport.note}" title="${hotkeyReport.title}" restored=${hotkeyReport.restored}`,
+);
 
 if (worst.cr < 99) say(`\nworst contrast: ${worst.cr} on ${worst.el} "${worst.text}" at ${worst.where}`);
 ws.close();

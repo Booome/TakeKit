@@ -155,6 +155,10 @@ struct WindowItem {
     /// would exist everywhere except the one door real users come through.
     pid: u32,
     title: String,
+    /// The app's name as a file stem (`chrome`, `code`, `win`). A source taken
+    /// from this window is called this, so this is what its file is called —
+    /// the picker shows it and `uniqueId` builds the id from it (2026-10-27).
+    app: String,
     x: i32,
     y: i32,
     w: u32,
@@ -175,6 +179,7 @@ async fn list_windows(filter: String) -> Vec<WindowItem> {
                 hwnd: w.hwnd,
                 pid: w.pid,
                 title: w.title,
+                app: w.app,
                 x: w.rect.x,
                 y: w.rect.y,
                 w: w.rect.w,
@@ -656,6 +661,15 @@ async fn overlay_cancel(app: tauri::AppHandle) {
     }
 }
 
+/// Leave the stop screen: a click on it, or the page deciding it has been up
+/// long enough. Rust owns the minute (so a throttled page cannot strand the
+/// panel); this is the early way out. Idempotent — a click landing in the same
+/// instant as the watchdog must not move windows twice.
+#[tauri::command]
+fn overlay_dismiss(app: tauri::AppHandle) {
+    take::dismiss_stop_screen(&app, true);
+}
+
 /// Replace the global hotkey. `take::install_hotkey` re-registers the previous
 /// one when this one is rejected, so a failed change never leaves the panel
 /// without a way to start or stop. Returns the normalised form to display.
@@ -666,6 +680,50 @@ async fn set_hotkey(app: tauri::AppHandle, hotkey: String) -> Result<String, UiE
         config::Config::update(|cfg| cfg.hotkey = normalized.clone())
             .map_err(|e| UiError::with_detail("err.save", e))?;
         Ok(normalized)
+    })
+    .await
+    .map_err(|e| UiError::with_detail("err.internal", e))?
+}
+
+/// Did the OS actually give us these keys?
+///
+/// The config says what the user *asked for*; this says what is *in force*.
+/// They differ whenever a combination was taken between sessions — the config
+/// was written weeks ago and another program has owned the key ever since — and
+/// the panel cannot tell the two apart on its own. Written by the two
+/// `install_*` functions (including on failure) and read by the settings card.
+#[tauri::command]
+fn hotkey_status(app: tauri::AppHandle) -> proto::HotkeyStatus {
+    app.state::<take::AppState>()
+        .hotkey_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Replace the pause hotkey, or switch it off with an empty string.
+///
+/// Off is a real state (`config.pause_hotkey` empty): no key is registered, and
+/// the button and the popover still pause. Same register-before-drop order as
+/// `set_hotkey`, so a rejected combination leaves the previous key working.
+#[tauri::command]
+async fn set_pause_hotkey(
+    app: tauri::AppHandle,
+    hotkey: String,
+) -> Result<Option<String>, UiError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let spec = hotkey.trim();
+        let spec = if spec.is_empty() {
+            None
+        } else {
+            Some(spec.to_string())
+        };
+        let normalized = take::install_pause_hotkey(&app, spec.as_deref())?;
+        config::Config::update(|cfg| {
+            cfg.pause_hotkey = normalized.clone().unwrap_or_default();
+        })
+        .map_err(|e| UiError::with_detail("err.save", e))?;
+        Ok::<_, UiError>(normalized)
     })
     .await
     .map_err(|e| UiError::with_detail("err.internal", e))?
@@ -865,6 +923,15 @@ async fn save_session(session: proto::SessionConfig) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
+/// The panel's answer to `app:quitting`: the session is on disk, so the
+/// process may go. Exiting from here rather than from the close handler is the
+/// whole point — the handler has no way of knowing whether the panel's last
+/// edit had been written when it asked.
+#[tauri::command]
+fn quit_now(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 // Async even though the snapshot itself is cheap: `start_recording` holds the
 // lock for the length of a prepare, and a synchronous status would block the
 // main thread on it.
@@ -979,6 +1046,20 @@ fn hide_tray(app: tauri::AppHandle) {
     hide_tray_window(&app);
 }
 
+/// The popover's page sizing itself to its own card.
+///
+/// A window is not a CSS box: the height the card needs is only knowable inside
+/// the page, and the page cannot resize its window. So it measures and calls
+/// this; `tray_panel::fit` does the rest. Without it the card is whatever the
+/// window was built at, and content that does not fit is clipped — not
+/// scrolled, because the window has no scrollbar of its own.
+#[tauri::command]
+fn size_tray(app: tauri::AppHandle, height: f64) {
+    if let Err(e) = tray_panel::fit(&app, height) {
+        probe(&format!("tray:fit-failed {e}"));
+    }
+}
+
 fn main() {
     // Before any window exists: WebView2 reads
     // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS when each environment is
@@ -1045,6 +1126,15 @@ fn main() {
                 Ok(spec) => probe(&format!("hotkey:ready {spec}")),
                 Err(reason) => probe(&format!("hotkey:unavailable: {reason}")),
             }
+            // The pause key is optional (`None` = switched off in the config),
+            // and a failure to claim it is equally not fatal: the panel's
+            // button and the tray popover both still pause a take.
+            let pause_key = cfg.effective_pause_hotkey();
+            match take::install_pause_hotkey(app.handle(), pause_key.as_deref()) {
+                Ok(Some(spec)) => probe(&format!("pause-hotkey:ready {spec}")),
+                Ok(None) => probe("pause-hotkey:off"),
+                Err(reason) => probe(&format!("pause-hotkey:unavailable: {reason}")),
+            }
 
             // The tray is the only way back to a stopped take once the main
             // window hides itself during recording.
@@ -1059,6 +1149,23 @@ fn main() {
                 &cfg.effective_theme(),
             )?;
             probe("tray:panel-ready");
+
+            // TAKEKIT_TRAY_DEMO opens the popover at startup, the way
+            // TAKEKIT_OVERLAY_DEMO opens the veil. A window that only appears
+            // after a click on the tray icon cannot be measured, screenshotted
+            // or asserted on — and its layout is not something a screenshot of
+            // the panel can stand in for (2026-10-27: the second row of keys
+            // was cut off by the taskbar and no check noticed).
+            if std::env::var("TAKEKIT_TRAY_DEMO").is_ok() {
+                // Delayed: the popover closes itself when it loses focus, and
+                // the panel's own show would be exactly that focus loss.
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    probe("tray:demo");
+                    tray_panel::raise(&handle);
+                });
+            }
 
             // The prompt layer: built hidden so its page is ready the moment a
             // take starts (see overlay.rs). TAKEKIT_OVERLAY_DEMO shows it at
@@ -1182,7 +1289,20 @@ fn main() {
                             }
                             probe("main:close-hidden");
                         } else {
-                            app.exit(0);
+                            // The last thing the user changed may still be in
+                            // the panel's save timer, and `exit` does not wait
+                            // for it — so ask for the flush and let the panel
+                            // answer with `quit_now`. The fallback thread is
+                            // not redundancy for its own sake: a webview that
+                            // is already wedged never answers, and a close
+                            // that refuses to close is worse than a lost
+                            // setting.
+                            let _ = app.emit_to("main", "app:quitting", ());
+                            let handle = app.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(400));
+                                handle.exit(0);
+                            });
                         }
                     }
                 }
@@ -1239,6 +1359,7 @@ fn main() {
             start_recording,
             overlay_finish,
             overlay_cancel,
+            overlay_dismiss,
             status,
             stop_recording,
             pause_recording,
@@ -1248,7 +1369,10 @@ fn main() {
             show_main,
             add_source_from_tray,
             hide_tray,
+            size_tray,
             set_hotkey,
+            set_pause_hotkey,
+            hotkey_status,
             set_countdown,
             set_finalize_panel,
             set_ffmpeg_path,
@@ -1259,6 +1383,7 @@ fn main() {
             set_theme,
             set_active_tab,
             save_session,
+            quit_now,
             journal_get,
             journal_seen,
             journal_clear,

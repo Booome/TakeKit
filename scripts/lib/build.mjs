@@ -62,9 +62,11 @@ export function pickBinary(root, exeName, envVar) {
   const candidates = override
     ? [path.resolve(root, override)]
     : ["release", "debug"].map((p) => path.join(root, "target", p, exeName)).filter(existsSync);
-  if (!candidates.length) {
+  if (!candidates.length || !candidates.every(existsSync)) {
+    const missing = candidates.filter((file) => !existsSync(file));
     console.error(
-      `no ${exeName} to run: build one first\n` +
+      (missing.length ? `${envVar} points at ${missing[0]}, which does not exist\n` : `no ${exeName} to run\n`) +
+        `build one first\n` +
         `  cargo build --release -p takekit -p takekit-gui\n` +
         `  (or point ${envVar} at an existing one)`,
     );

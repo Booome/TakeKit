@@ -186,7 +186,7 @@ const I18N = {
     "notice.noFfmpegDetail": "安装 ffmpeg 并加入 PATH，重启面板后生效。",
     "notice.takePartial": "录制完成，但 {n} 路没有录到（已保存 {secs} · {mb} MB）",
     "notice.lenMismatch": "{n} 个文件的实测长度与 take.json 不符（文件可用，记录已标注）",
-    "warn.len-mismatch": "容器时长与清单记录对不上",
+    "warn.len.mismatch": "容器时长与清单记录对不上",
 
     "settings.interface": "界面",
     "settings.capture": "采集与编码",
@@ -245,6 +245,8 @@ const I18N = {
     "err.device-gone": "找不到设备 {detail}——可能已被拔出或改名，请重新选择",
     "err.cam-open": "{detail} 打不开——如果是虚拟摄像头，请先启动它的宿主程序（如 Mikey 客户端）；否则可能正被其他程序占用",
     "err.ffmpeg-died": "录制进程没有写出任何画面",
+    "err.restore-not-a-window": "只有窗口类源能还原最小化",
+    "err.restore-failed": "还原窗口失败：{detail}",
   },
 
   en: {
@@ -420,7 +422,7 @@ const I18N = {
     "notice.noFfmpegDetail": "Install ffmpeg and add it to PATH, then restart the panel.",
     "notice.takePartial": "Take finished, but {n} source(s) recorded nothing (saved {secs} · {mb} MB)",
     "notice.lenMismatch": "{n} file(s) are not the length take.json says (usable, but flagged)",
-    "warn.len-mismatch": "the container's length disagrees with the manifest",
+    "warn.len.mismatch": "the container's length disagrees with the manifest",
 
     "settings.interface": "Interface",
     "settings.capture": "Capture & encoding",
@@ -479,6 +481,8 @@ const I18N = {
     "err.device-gone": "No device named {detail} — it may be unplugged or renamed; pick it again",
     "err.cam-open": "{detail} could not be opened — if it is a virtual camera, start its host app (e.g. the Mikey client); otherwise it may be in use by another app",
     "err.ffmpeg-died": "the recording process wrote no frames",
+    "err.restore-not-a-window": "Only window sources can be restored",
+    "err.restore-failed": "Could not restore the window: {detail}",
   },
 };
 
@@ -545,7 +549,10 @@ function codeText(raw) {
     const code = s.slice(0, at);
     if (/^err\.[a-z-]+$/.test(code)) return t(code, { detail: s.slice(at + 1) });
   }
-  return s;
+  // `Outcome.warning` carries a code and nothing else (`len.mismatch`, see
+  // core::session). Without this branch the panel printed the code itself.
+  const warn = t(`warn.${s}`);
+  return warn === `warn.${s}` ? s : warn;
 }
 
 /// How a shortcut is shown to a person: `control+alt+KeyR` (what the plugin

@@ -172,8 +172,17 @@ def dictionaries() -> tuple[set[str], set[str]]:
         # traceback from three frames down.
         fail("i18n: could not find the zh:/en: dictionary blocks in i18n.js")
         return set(), set()
-    key = re.compile(r"[\"']([A-Za-z0-9_.]+)[\"']\s*:")
+    # `-` 也是键名字符：`warn.len-mismatch` 这类键含连字符，旧正则把它们整条漏掉，
+    # 「zh/en 对等」与「有人问过」两道断言对它们完全无效。
+    key = re.compile(r"[\"']([A-Za-z0-9_.\-]+)[\"']\s*:")
     return set(key.findall(zh_block)), set(key.findall(en_block))
+
+
+# Keys the UI asks for through a name built at run time, where the interpolated
+# part comes *first* — `t(`${pane}.clearArmed`)` — so there is no literal prefix
+# to match on. Listed by hand: adding one is a deliberate act, and the list is
+# short on purpose.
+ASKED_BY_VARIABLE = {"history.clearArmed", "log.clearArmed"}
 
 
 def check_i18n() -> None:
@@ -194,7 +203,7 @@ def check_i18n() -> None:
     # …or by name from Rust (UiError codes the UI translates on arrival)…
     for path in rust_sources():
         text = read_cached(path)
-        asked |= set(re.findall(r"UiError::(?:new|with_detail)\(\s*\"([\w.]+)\"", text))
+        asked |= set(re.findall(r"UiError::(?:new|with_detail)\(\s*\"([\w.\-]+)\"", text))
     # …or through a template: `t(`crop.handle.${id}`)` covers every
     # `crop.handle.*` key, so a key is used when one of those prefixes
     # starts it.
@@ -202,10 +211,29 @@ def check_i18n() -> None:
     for path in js_sources():
         text = path.read_text(encoding="utf-8")
         for body in re.findall(r"\bt\(\s*`([^`]*)`", text):
-            prefixes.add(body.split("${")[0])
+            prefix = body.split("${")[0]
+            # 模板一开头就插值（`t(`${pane}.clearArmed`)`）时前缀是空串，而任何字符串
+            # 都以空串开头 —— 收进来就等于让「没人问过」这条断言永远通过。
+            if prefix:
+                prefixes.add(prefix)
+
+    # Every quoted string in the UI and Rust, minus the dictionary itself.
+    mentioned = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in html_sources() + js_sources() + rust_sources()
+        if p.name != "i18n.js"
+    )
 
     def is_asked(key: str) -> bool:
-        return key in asked or any(key.startswith(p) for p in prefixes)
+        if key in asked or key in ASKED_BY_VARIABLE:
+            return True
+        if any(key.startswith(p) for p in prefixes):
+            return True
+        # …or handed to `t()` through a variable (`const k = on ? "row.soundOn" :
+        # "row.soundOff"; t(k)`). A static reader cannot follow that, but a key
+        # that appears as a quoted string anywhere in the UI or Rust is clearly
+        # not orphaned — only keys nothing mentions at all get reported.
+        return bool(re.search(r"[\"']%s[\"']" % re.escape(key), mentioned))
 
     for key in sorted(asked - zh):
         # A key asked for but absent everywhere would render as the key

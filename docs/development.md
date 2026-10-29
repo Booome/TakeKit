@@ -39,7 +39,7 @@ cargo fmt --all                                     # 改完直接跑，全仓 0
 - `takekit-core` 有 8 个 `#[ignore]` 实机测试（会开真窗口），`cargo test -p takekit-core -- --ignored` 才跑——**别在用户正用机器时跑**。
 - `mouseshow` 的 `tests/gdi_leak.rs` 同样是 `#[ignore = "needs an interactive desktop"]`：**改过 overlay 创建/销毁就手动跑一次** `cargo test --test gdi_leak -- --ignored`（在 `mouseshow/` 里）。
   这条测试确实抓到过「同进程第二次录制报 `Class already exists`」（2026-10-26）——ignore 的测试没有固定运行场合，等于没有。
-- 基线（2026-10-28 实测）：cli 9 / core 66（+8 ignored）/ gui 94 / media 37。以 `cargo test` 实际输出为准。
+- 基线（2026-10-30 实测）：cli 9 / core 66（+8 ignored）/ gui 94 / media 40。以 `cargo test` 实际输出为准。
 - `docs/tools/check-contracts.py` 四方核对（命令 / 事件 / i18n / **控制面端点↔MCP 工具↔CLI 子命令**），CI 有门禁；改动任何一层的名字前先看它。
 - **功能级三端一致性**：`node scripts/check-three-surface.mjs`——真跑 MCP（schema → stdio 调用 → 面板 → 配置）和 CLI 参数。名字对了不等于字段通了：`sound` 曾在 schema 里声明、在 HTTP 转发前被白名单丢掉，`check-contracts.py` 看不见这种漂移。
 - 🔴 **每个 GUI 检查跑的是哪个二进制，开局就印出来**（`scripts/lib/build.mjs`，2026-10-28）：
@@ -479,3 +479,52 @@ bug 更糟。判据必须是**相对首个可测量偏差的变化量**。这条
 `offer()`（满则丢帧、writer 断开才停采集），视频队深 3、音频队深 64
 （`takekit-media/src/frame.rs`）；KeepLatest 采样顺修积压时取最新帧而非队头帧（`newest_of_burst`）。
 其余热点（250ms tick 链、`spare` 复用、`copy_frame`）已是优化后形态，无改动。
+
+### 2026-10-29 系统声音录出 0.09 秒（旧单位错误被 11.2 的守卫放大）
+
+用户报「加系统声音源录几秒，文件长度还是 0」。现场 `take.json` 自相矛盾：`frames: 776`（音频源的
+这个数是**包数**，776 个 10ms 包 = 7.8 秒）但 `duration: 0.09`、文件 3289 字节。
+
+根因：`loopback.rs` 的 `GetBuffer` 有**两个**时间出参 —— 第 4 个 `pu64DevicePosition` 是音频帧计数，
+第 5 个 `pu64QPCPosition` 才是 100ns。代码取了第 4 个当 100ns、第 5 个传 `None`，48kHz 下时间轴被压
+**1/208**。10-27 之前不会炸（时间戳只在首包读一次）；11.2 的 `Skip` 守卫上线后，偏差每包累积 10ms，
+4 个包就超 40ms 容差，之后全部当"重投"丢掉 —— **守卫没错，错的是喂给它的数**。
+
+修法：改用 QPC 出参；驱动不答 QPC 时退回 `stamp_of()` 帧数换算。详见 `docs/api-recording.md` §11.4。
+
+| 验证 | 结果 |
+|---|---|
+| `media --system-audio -d 5`（有声音） | 5.034s / 501 包 |
+| `media --system-audio -d 3`（静默桌面） | 3.029s / 300 包 —— **静默也发包**，与"没声音就没数据"的猜测相反 |
+| GUI 控制面 `POST /record/{start,stop}` | manifest 4.93s · probed 4.949s · 493 包 |
+| `cargo test --workspace` | 9 / 66(+8) / 94 / 39 |
+
+🔴 **教训**：那句 "WASAPI's device time is in 100 ns units" 是注释里的**假设**，从来没有被验证过，
+而它决定了整条音频时间轴的尺度。**同一个 API 给两个时间出参时，先弄清是哪一个**
+（QPC = 绝对时刻，device position = 已经流过的帧数）。另外：`frames` 字段对音频是包数不是帧数，
+排查时差一步就会把它当 30fps 去算时长。
+
+### 2026-10-29 窗口音轨变成噪声（补的静音切在半个采样上）
+
+用户报「录制 windows 声音也有问题」。`草稿/2026-10-29-17-41-29/ego.mp4`：时长对、音轨在，
+但内容是一阶差分/幅度 **1.63**、L/R 相关 **0.03**、2.84% 采样满刻度 —— 宽带噪声。
+
+根因在 `writer.rs::write_silence`：静音字节数由时间换算后**没按帧取整**。
+17.16 ms 的前导静音算出 3295 字节，而一帧 4 字节 —— PCM 是一条连续流，多出的 3 字节让之后每个
+采样都由自己和邻居各半个拼成（字节序反、声道也反）。断帧概率 3/4，所以**时好时坏**。
+
+定位靠转储编码前的字节：干净 440Hz 正弦进、噪声 mp4 出，一步把范围切到"写入"侧。
+
+| 验证 | 结果 |
+|---|---|
+| CLI `--system-audio` × 6（修复前，均补了未对齐静音） | 6/6 噪声 -5.2 dB / `diff/abs` ≈1.63 |
+| 同一命令 × 6（修复后） | 6/6 干净 `diff/abs` 0.058 / `align4=0` |
+| 进程内 loopback 单独录（`--window-audio`） | 干净 0.058 / 相关 0.998 |
+| GUI 桌面源 + 系统声音（MuxSink，一文件两流） | 干净 0.058 / 相关 1.000 |
+| `cargo test --workspace` | 9 / 66(+8) / 94 / **40** |
+| `check-midtake` | 15/15 |
+
+🔴 **教训**：往 PCM 流里垫字节**必须按帧对齐** —— "补几个零"改的是整条流的相位。
+🔴 **教训**：用户报"声音有问题"时**只量时长不够**，这次时长完全正确；要同时看
+`diff/abs`（是不是噪声）、L/R 相关度（声道是否错位）、满刻度占比（是否过载）。
+数字静音经 AAC 后也有本底噪声，只看电平会把静音误判成噪声。

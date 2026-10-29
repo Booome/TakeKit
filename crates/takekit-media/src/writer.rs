@@ -282,6 +282,10 @@ pub struct AudioWriter {
     writer: IMFSinkWriter,
     stream: u32,
     bytes_per_second: u32,
+    /// One frame: every channel's sample, side by side. Written silence is
+    /// rounded to this, because a partial frame shifts the whole stream that
+    /// follows (`write_silence`).
+    bytes_per_frame: u32,
     /// Where the next chunk starts.
     next: Option<i64>,
     /// Whether any chunk has been written yet, so the lead-in silence the
@@ -320,6 +324,7 @@ impl AudioWriter {
             writer: writer.clone(),
             stream,
             bytes_per_second: sample_rate * channels * 2,
+            bytes_per_frame: channels * 2,
             next: None,
             started: false,
             origin: 0,
@@ -373,13 +378,13 @@ impl AudioWriter {
         // pinned to zero rather than written at a negative time, which MP4
         // cannot express.
         let arrival = (chunk.time - self.origin).max(0);
-        let start = match self.next {
+        let mut start = match self.next {
             None => arrival,
             Some(next) => match place(arrival, next, &mut self.skew_base) {
                 Placement::Skip => return Ok(()),
                 Placement::AfterHole => {
-                    self.write_silence(next, arrival)?;
-                    arrival
+                    let filled = self.write_silence(next, arrival)?;
+                    if filled > next { filled } else { arrival }
                 }
                 Placement::Chain => next,
             },
@@ -388,7 +393,10 @@ impl AudioWriter {
             // The microphone woke up after the take did: fill the gap with
             // silence so the file's timeline keeps the shared origin, exactly
             // like the video writer's black lead-in.
-            self.write_silence(0, start)?;
+            let filled = self.write_silence(0, start)?;
+            if filled > 0 {
+                start = filled;
+            }
         }
         self.started = true;
         // SAFETY: the chunk is borrowed for the duration of the call, which
@@ -401,22 +409,38 @@ impl AudioWriter {
         Ok(())
     }
 
-    /// Zeroes on this stream, from `from` to `to`.
+    /// Zeroes on this stream, from `from` up to `to`.
     ///
     /// One shape for two callers: the lead-in (0 → the first sample) and a hole
     /// in the middle (0 → the first sample is the same operation, and so is
     /// next → arrival after a stall).
-    fn write_silence(&self, from: i64, to: i64) -> Result<()> {
+    ///
+    /// The byte count is rounded to a whole number of frames, and that is not
+    /// cosmetic (2026-10-29). PCM handed to the sink is one continuous stream:
+    /// a single frame's worth of stray bytes shifts every byte after it by one
+    /// or two, so each 16-bit sample ends up assembled from half of itself and
+    /// half of its neighbour — byte-swapped, channel-swapped, and loud. A take
+    /// whose sound arrived 17 ms after its picture was inserted as 3295 bytes,
+    /// and all 6 runs that did so wrote a track that measured `-5.2 dB` of
+    /// broadband noise at `diff/abs 1.63`; the runs whose silence happened to
+    /// land on a frame boundary were clean. The take's own audio was never at
+    /// fault — the padding in front of it was.
+    ///
+    /// Returns where the silence actually ends, so the caller can put the next
+    /// chunk against it instead of against the time it asked for.
+    fn write_silence(&self, from: i64, to: i64) -> Result<i64> {
         if to <= from {
-            return Ok(());
+            return Ok(from);
         }
-        let bytes = ((to - from) as u128 * self.bytes_per_second as u128 / 10_000_000) as usize;
+        let bytes = silence_bytes(to - from, self.bytes_per_second, self.bytes_per_frame);
         if bytes == 0 {
-            return Ok(());
+            return Ok(from);
         }
+        let duration = duration_of(bytes, self.bytes_per_second);
         let silence = vec![0u8; bytes];
         // SAFETY: owned zeros; the call copies them out.
-        unsafe { write_sample(&self.writer, self.stream, &silence, from, to - from) }
+        unsafe { write_sample(&self.writer, self.stream, &silence, from, duration)? };
+        Ok(from + duration)
     }
 
     /// Close the file and report how far its timeline reached, in 100 ns units
@@ -728,6 +752,21 @@ pub fn even_frame(frame: VideoFrame) -> VideoFrame {
         data: out,
         time: frame.time,
     }
+}
+
+/// How many bytes of silence cover `span` (100 ns units) without cutting a
+/// frame in half.
+///
+/// Rounded to the nearest whole frame rather than truncated: PCM handed to the
+/// sink is one stream, so half a frame of padding re-assembles every sample
+/// after it out of two neighbours. `write_silence` has the story.
+fn silence_bytes(span: i64, bytes_per_second: u32, bytes_per_frame: u32) -> usize {
+    let align = u128::from(bytes_per_frame);
+    if align == 0 || span <= 0 || bytes_per_second == 0 {
+        return 0;
+    }
+    let wanted = span as u128 * u128::from(bytes_per_second) / 10_000_000;
+    (((wanted + align / 2) / align) * align) as usize
 }
 
 /// How long a PCM chunk lasts, in 100 ns units.
@@ -1354,6 +1393,36 @@ mod tests {
             ),
             Placement::Skip
         );
+    }
+
+    /// Padding must be a whole number of frames, always.
+    ///
+    /// A take whose sound woke up 17.16 ms after its picture inserted 3295
+    /// bytes of silence — three bytes into a four-byte stereo frame — and every
+    /// sample behind it was then assembled from two neighbours. The track
+    /// measured -5.2 dB of broadband noise in all six runs that landed on that
+    /// offset, and was clean whenever the same sum happened to be divisible by
+    /// four (2026-10-29).
+    #[test]
+    fn inserted_silence_never_cuts_a_frame_in_half() {
+        // The exact span that started this: 48 kHz stereo, 17.16 ms late.
+        assert_eq!(silence_bytes(171_616, 192_000, 4), 3_296);
+        assert_eq!(3295 % 4, 3, "this is the figure that used to be written");
+
+        // Whatever the span and whatever the format, whole frames only.
+        for span in [1, 7, 999, 171_616, 216_643, 182_598] {
+            for (rate, channels) in [(48_000u32, 2u32), (48_000, 1), (96_000, 2)] {
+                let bytes = silence_bytes(span, rate * channels * 2, channels * 2);
+                assert_eq!(
+                    bytes % (channels as usize * 2),
+                    0,
+                    "span {span}, {rate} Hz, {channels} ch"
+                );
+            }
+        }
+        // Nothing to fill is nothing written.
+        assert_eq!(silence_bytes(0, 192_000, 4), 0);
+        assert_eq!(silence_bytes(-5, 192_000, 4), 0);
     }
 
     /// A pause names its files `-part2`, never `-2`: a bare number is already

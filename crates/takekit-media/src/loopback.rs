@@ -253,13 +253,14 @@ fn pump(client: &IAudioClient, capture: &IAudioCaptureClient, ctx: CaptureCtx) -
             let mut data = std::ptr::null_mut::<u8>();
             let mut frames = 0u32;
             let mut flags = 0u32;
-            let mut device_time = 0u64;
+            let mut device_position = 0u64;
+            let mut qpc = 0u64;
             capture.GetBuffer(
                 &mut data,
                 &mut frames,
                 &mut flags,
-                Some(&mut device_time),
-                None,
+                Some(&mut device_position),
+                Some(&mut qpc),
             )?;
             let bytes = frames as usize * bytes_per_frame;
             let mut chunk = vec![0u8; bytes];
@@ -268,14 +269,13 @@ fn pump(client: &IAudioClient, capture: &IAudioCaptureClient, ctx: CaptureCtx) -
             }
             capture.ReleaseBuffer(frames)?;
 
-            // WASAPI's device time is in 100 ns units, the take's timeline too.
-            let device_time = device_time as i64;
-            let anchor = *anchor.get_or_insert_with(|| ctx.clock.device_anchor(device_time));
+            let stamp = stamp_of(qpc, device_position);
+            let anchor = *anchor.get_or_insert_with(|| ctx.clock.device_anchor(stamp));
             if !crate::frame::offer(
                 &ctx.out,
                 MediaFrame::Audio(AudioChunk {
                     data: chunk,
-                    time: device_time - anchor,
+                    time: stamp - anchor,
                 }),
             ) {
                 break;
@@ -287,6 +287,29 @@ fn pump(client: &IAudioClient, capture: &IAudioCaptureClient, ctx: CaptureCtx) -
         let _ = client.Stop();
     }
     Ok(())
+}
+
+/// A packet's instant, in the take's own units (100 ns).
+///
+/// `pu64QPCPosition` is already in that domain — the take clock is QPC-derived
+/// too — so it is what a packet should be stamped with.
+///
+/// `pu64DevicePosition` is **not**: it counts audio frames. Reading it as
+/// 100 ns compresses the timeline by the sample rate, and since 15.52 s of
+/// sound is 744 960 frames, the whole take lands inside 0.074 s (2026-10-29:
+/// a "few seconds" of system sound came out as a 0.09 s file, and the writer's
+/// re-delivery guard then dropped every packet after the fourth as a repeat).
+///
+/// A driver that reports no QPC still has to yield a usable timeline, so the
+/// frame count is converted instead: right in length, and only as wrong as the
+/// endpoint's own rate — the same clock those frames were counted with.
+fn stamp_of(qpc: u64, device_position: u64) -> i64 {
+    if qpc != 0 {
+        return qpc as i64;
+    }
+    // i128 first: a machine up for thirty days has ~1.3e11 frames, and the
+    // multiply goes past i64 after about nine hours of sound.
+    (device_position as i128 * 10_000_000 / SAMPLE_RATE as i128) as i64
 }
 
 /// The process that owns `hwnd` — what a window handle turns into before the
@@ -303,5 +326,32 @@ pub fn window_pid(hwnd: isize) -> Option<u32> {
         } else {
             Some(pid)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The units a packet is stamped with, pinned to numbers measured on a
+    /// real device.
+    ///
+    /// 744 960 frames is 15.52 s of 48 kHz sound. Read as 100 ns units it is
+    /// 0.074 s — and the writer's re-delivery guard then throws away every
+    /// packet after the fourth, which is exactly how a "few seconds" take
+    /// produced a 0.09 s file (2026-10-29).
+    #[test]
+    fn a_device_position_counts_frames_not_hundred_nanosecond_units() {
+        assert_eq!(stamp_of(0, 744_960), 155_200_000);
+        // Ten milliseconds of sound, the packet size this machine delivers:
+        // 480 frames, not 100 000 units.
+        assert_eq!(stamp_of(0, 480), 100_000);
+    }
+
+    /// The QPC answer is already in the take's domain and must win outright —
+    /// converting it would shift every packet by the sample rate.
+    #[test]
+    fn a_qpc_position_is_taken_as_it_comes() {
+        assert_eq!(stamp_of(123_456_789, 744_960), 123_456_789);
     }
 }

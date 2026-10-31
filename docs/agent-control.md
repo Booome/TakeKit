@@ -25,7 +25,7 @@
 | 枚举 | `list_windows` / `list_mics` / `list_devices` / `env_info` / `source_preview` / `source_titles` |
 | Source 管理 | `save_session`（整表写入）/ `check_sources` / `enter_crop_mode` / `exit_crop_mode` / `restore_window` / `add_live_source`（录制中加源）/ `add_source_from_tray`（托盘唤回面板并开选择器） |
 | 录制 | `start_recording`（`StartRequest`）/ `stop_recording`（返回 `StopResult`，含落盘目录）/ `pause_recording` / `resume_recording` / `stop_source` / `overlay_finish` / `overlay_cancel` / `overlay_dismiss`（点击收尾面板退出）/ `preheat_engine` |
-| 状态 | `status`（`StatusInfo`：recording/elapsed/paused/live/error）/ `config_get` / `journal_get` |
+| 状态 | `status`（`StatusInfo`：recording / elapsed / paused / pause_len / sources / error）/ `config_get` / `journal_get` |
 | 设置 | `set_hotkey` / `set_pause_hotkey` / `hotkey_status`（两颗热键的注册结果）/ `set_countdown` / `set_finalize_panel` / `set_ffmpeg_path` / `set_control`（控制面开关）/ `set_language` / `set_theme` / `set_active_tab` / `pick_folder` / `pick_file` |
 | 历史 | `journal_seen` / `journal_clear` / `log_delete`（单条删日志）/ `log_push` / `take_delete` / `open_take` |
 | 面板自身 | `show_main` / `hide_tray` / `size_tray` / `ui_ping` / `ui_settings` / `quit_now` |
@@ -167,6 +167,10 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
   }
 }
 ```
+
+📌 `status.live` 就是 `StatusInfo.sources`（`id` / `alive` / `usable` / `bytes` / `start`）：控制面
+把这个数组改名叫 `live` 是为了和顶层那个 `sources`（配置表，带 `index`）区分开。**同一个数组两个名字**
+是本项目唯一的一处别名 —— Tauri 命令 `status` 返回的仍是 `sources`，写面板侧代码时别照这里的 `live` 抄。
 
 ### 5.3 MCP 工具（v1 起 13 个，暂停/分段与录制中加源补 3 个 → 现 **16 个**）
 

@@ -10,6 +10,23 @@
 // polling below cannot re-enable the key mid-finalise.
 let stopping = false;
 
+// A failed command's word, held for a few seconds. `tick` rewrites the state
+// line every 250 ms, so a failure written straight into it survived one frame:
+// the popover showed 录制中 again before anyone could read 停止失败, and the
+// take looked like it was still going with no word about why.
+let flash = null;
+
+function say(text) {
+  flash = { text, until: Date.now() + 4000 };
+}
+
+function stateWord(status, paused) {
+  if (stopping) return t("tray.stateStopping");
+  if (flash && Date.now() < flash.until) return flash.text;
+  if (paused) return t("tray.statePaused");
+  return status.recording ? t("tray.stateRecording") : t("tray.stateIdle");
+}
+
 function row(source) {
   const el = document.createElement("div");
   el.className = "row";
@@ -86,15 +103,10 @@ async function tick() {
   document.body.classList.toggle("live", status.recording && !paused);
   document.body.classList.toggle("paused", paused);
   $("clock").textContent = clock(status.elapsed);
-  // `stopping` first: during finalise the encoder is already out of the
-  // session state, so `recording` is false while the take is still writing.
-  $("state").textContent = stopping
-    ? t("tray.stateStopping")
-    : paused
-      ? t("tray.statePaused")
-      : status.recording
-        ? t("tray.stateRecording")
-        : t("tray.stateIdle");
+  // `stateWord` puts `stopping` first: during finalise the encoder is already
+  // out of the session state, so `recording` is false while the take is still
+  // writing.
+  $("state").textContent = stateWord(status, paused);
   // The one number a 220px card otherwise cannot show: a frozen clock says the
   // counting stopped, only this says for how long — and that the stretch is not
   // in the file, which is the question a pause raises.
@@ -130,7 +142,7 @@ $("stop").addEventListener("click", async () => {
   } catch (e) {
     // A 220px card has no room for the engine's error text; the log has it.
     console.error("stop_recording", e);
-    $("state").textContent = t("tray.stopFailed");
+    say(t("tray.stopFailed"));
   }
   stopping = false;
   await tick();
@@ -151,7 +163,7 @@ $("pause").addEventListener("click", async () => {
   } catch (e) {
     // A 220px card has no room for the engine's error text; the log has it.
     console.error("pause", e);
-    $("state").textContent = t("tray.pauseFailed");
+    say(t("tray.pauseFailed"));
   }
   await tick();
 });

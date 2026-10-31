@@ -671,7 +671,10 @@ fn status_of(recording: Option<&mut Recording>, last_error: Option<String>) -> S
 /// ended — nothing to find on a timeline afterwards.
 pub fn pause_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
     let state = app.state::<AppState>();
-    let mut guard = state.recording.lock().unwrap();
+    // Poison recovered, like every other lock in this file: the guard is the
+    // only handle on a take that is still writing, and a panic here would end
+    // the process mid-record instead of reporting "not recording".
+    let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     let Some(rec) = guard.as_mut() else {
         return Err(UiError::new("err.not-recording"));
     };
@@ -694,7 +697,7 @@ pub fn pause_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
 /// Start the clock again; every source opens its next file on its next sample.
 pub fn resume_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
     let state = app.state::<AppState>();
-    let mut guard = state.recording.lock().unwrap();
+    let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     let Some(rec) = guard.as_mut() else {
         return Err(UiError::new("err.not-recording"));
     };
@@ -715,7 +718,7 @@ pub fn resume_recording(app: &tauri::AppHandle) -> Result<(), UiError> {
 /// actually being written.
 pub fn live_sources(app: &tauri::AppHandle) -> Option<Vec<Source>> {
     let state = app.state::<AppState>();
-    let guard = state.recording.lock().unwrap();
+    let guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().map(|r| r.sources())
 }
 
@@ -732,7 +735,7 @@ pub fn live_sources(app: &tauri::AppHandle) -> Option<Vec<Source>> {
 /// clock. Returns once the file knows where it begins.
 pub fn add_live_source(app: &tauri::AppHandle, source: Source) -> Result<AddSourceResult, UiError> {
     let state = app.state::<AppState>();
-    let mut guard = state.recording.lock().unwrap();
+    let mut guard = state.recording.lock().unwrap_or_else(|e| e.into_inner());
     let Some(recording) = guard.as_mut() else {
         return Err(UiError::new("err.not-recording"));
     };
@@ -802,7 +805,7 @@ pub fn stop(app: &tauri::AppHandle, announce: bool) -> Result<StopResult, UiErro
     let recording = state
         .recording
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .take()
         .ok_or_else(|| UiError::new("err.not-recording"))?;
 

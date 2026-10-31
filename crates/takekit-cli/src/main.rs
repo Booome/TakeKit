@@ -56,8 +56,9 @@ enum Command {
 
 #[derive(clap::Args)]
 struct RecordArgs {
-    /// Record a window, matched by a substring of its title
-    #[arg(long, value_name = "TITLE")]
+    /// Record a window: a substring of its title, or "#12345" for a window
+    /// handle (which survives two windows sharing a title)
+    #[arg(long, value_name = "TITLE_OR_#HWND")]
     window: Option<String>,
 
     /// Record the whole desktop instead of a window

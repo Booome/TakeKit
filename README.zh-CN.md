@@ -138,11 +138,13 @@ takes/2026-10-18-11-31-33/
   "start_clock": "frames",
   "sources": [
     { "id": "win", "file": "win.mkv", "start": 0.0, "duration": 60.0,
+      "segments": [ { "file": "win.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
       "source": { "id": "win", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
                                            "title": "VirtualBox",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } },
     { "id": "cam", "file": "cam.mkv", "start": 0.0, "duration": 60.0,
+      "segments": [ { "file": "cam.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
       "source": { "id": "cam", "capture": { "Camera": { "device": "My Camera",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } }
@@ -152,6 +154,10 @@ takes/2026-10-18-11-31-33/
 
 `start_clock` 说明这些偏移是拿什么当原点的（`frames` = 文件自己第一帧，精确；`spawn` = 编码器启动时刻，
 ffmpeg 后端能看到的最好水平）；`paused` 只在暂停过的 take 里出现，源上的 `frames` 只有 Windows 后端才有。
+
+每个源还带 `segments`：它实际产出的文件，按顺序。通常只有一项 —— 一次暂停会关掉当前文件、继续后的第一帧
+再开下一个，所以暂停过的 take 会有多项。它们在 take 时间轴上首尾相接（前一项 `start` + `duration` = 后一项
+`start`），源顶层的 `file` 永远是其中第一个。
 
 清单记下用了哪个编码器、每个文件各自的时长 —— 对不上是看得见的，不用等进了剪辑软件才发现。
 容器跟后端走：Windows API 后端是 `.mp4`，ffmpeg 后端是 `.mkv`；纯音频源一律是 `.mp4`，即使所在的 take 是 `.mkv`。

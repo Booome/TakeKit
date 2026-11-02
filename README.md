@@ -177,11 +177,13 @@ takes/2026-10-18-11-31-33/
   "start_clock": "frames",
   "sources": [
     { "id": "virtualbox", "file": "virtualbox.mkv", "start": 0.0, "duration": 60.0,
+      "segments": [ { "file": "virtualbox.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
       "source": { "id": "virtualbox", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
                                            "title": "VirtualBox",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } },
     { "id": "cam", "file": "cam.mkv", "start": 0.0, "duration": 60.0,
+      "segments": [ { "file": "cam.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
       "source": { "id": "cam", "capture": { "Camera": { "device": "My Camera",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } }
@@ -192,6 +194,11 @@ takes/2026-10-18-11-31-33/
 `start_clock` says what the offsets were measured against (`frames` = the file's own first sample,
 exact; `spawn` = encoder launch, the ffmpeg backend's best look); `paused` appears only for a take
 that was paused, `frames` on a source only on the Windows backend.
+
+Every source also carries `segments`: the files it actually produced, in order. One entry normally —
+a pause closes the current file and the next sample opens the next, so a paused take has more. They
+sit contiguously on the take's timeline (`start` of one + its `duration` = `start` of the next), and
+the source's top-level `file` is always the first of them.
 
 The manifest records which encoder ran and each file's own duration, so a mismatch is visible instead
 of being discovered in the editor. The container follows the backend — `.mp4` on the Windows APIs,

@@ -163,7 +163,7 @@ writes to `%APPDATA%\TakeKit\control.json`.
 
 ```
 takes/2026-10-18-11-31-33/
-├─ win.mkv
+├─ virtualbox.mkv
 ├─ cam.mkv
 └─ take.json
 ```
@@ -230,6 +230,7 @@ crates/
 | Development notes: architecture map, implementation contracts, probes, trap list | [`docs/development.md`](docs/development.md) *(Chinese)* |
 | The Windows-API capture backend in detail | [`docs/api-recording.md`](docs/api-recording.md) *(Chinese)* |
 | The agent control surface: HTTP routes ↔ MCP tools ↔ CLI | [`docs/agent-control.md`](docs/agent-control.md) *(Chinese)* |
+| Why the panel will not start in an agent sandbox, and the two WebView2 mitigations | [`docs/webview2-agent-sandbox.md`](docs/webview2-agent-sandbox.md) *(Chinese)* |
 
 ## Limitations
 

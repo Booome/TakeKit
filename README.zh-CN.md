@@ -124,7 +124,7 @@ takekit ctl stop
 
 ```
 takes/2026-10-18-11-31-33/
-├─ win.mkv
+├─ virtualbox.mkv
 ├─ cam.mkv
 └─ take.json
 ```
@@ -137,9 +137,9 @@ takes/2026-10-18-11-31-33/
   "duration": 60.0,
   "start_clock": "frames",
   "sources": [
-    { "id": "win", "file": "win.mkv", "start": 0.0, "duration": 60.0,
-      "segments": [ { "file": "win.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
-      "source": { "id": "win", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
+    { "id": "virtualbox", "file": "virtualbox.mkv", "start": 0.0, "duration": 60.0,
+      "segments": [ { "file": "virtualbox.mkv", "start": 0.0, "duration": 60.0, "frames": 1800 } ],
+      "source": { "id": "virtualbox", "capture": { "Window": { "hwnd": 133890, "pid": 4321,
                                            "title": "VirtualBox",
                                            "crop": { "top": 0, "bottom": 0, "left": 0, "right": 0 } } },
                   "fps": 30, "quality": null, "audio": false } },
@@ -185,6 +185,7 @@ crates/
 | 开发笔记：架构地图、实现契约、探针与验证、陷阱清单 | [`docs/development.md`](docs/development.md) |
 | Windows API 采集后端详解 | [`docs/api-recording.md`](docs/api-recording.md) |
 | Agent 控制面：HTTP 路由 ↔ MCP 工具 ↔ CLI | [`docs/agent-control.md`](docs/agent-control.md) |
+| 面板在 agent 沙箱里为什么会起不来：WebView2 的两个必需缓解 | [`docs/webview2-agent-sandbox.md`](docs/webview2-agent-sandbox.md) |
 
 ## 已知限制
 

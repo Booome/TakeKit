@@ -85,7 +85,7 @@ Tauri 命令只能被面板自己的 WebView 用 `invoke()` 调用——这就�
 - 启动即写 `%APPDATA%\TakeKit\control.json`：`{ "port": …, "token": …, "pid": …, "version": … }`；退出时删除。
 - 客户端（CLI/MCP）先读这个文件：**文件不在 = 面板没开（或控制开关关着）**；文件在但 pid 已死 = 崩溃留下的过期文件，同样报「面板未运行」（v1 起就查 pid，见 `takekit_core::proc::alive`）。都不重试乱连。
 
-### 5.1 端点表（v1）
+### 5.1 端点表（16 条 = v1 的 13 条 + 暂停/恢复/录制中加源 3 条）
 
 鉴权：所有请求带 `Authorization: Bearer <token>`。错误统一 `{ "code": "...", "message": "..." }`（HTTP 状态码语义化：400/401/404/409/500）。
 
@@ -315,7 +315,7 @@ curl -H "Authorization: Bearer $($d.token)" "http://127.0.0.1:$($d.port)/state"
 
 | 期 | 内容 | 规模 |
 |---|---|---|
-| **v1 ✅** | §5 全部 13 端点 + token/control.json + `ctl:changed` 镜像 + 失败留痕 + 设置开关 + `takekit ctl` + `takekit mcp` + 守卫（409/confirm） | gui +`control.rs`、cli +`client.rs`/`ctl.rs`/`mcp.rs`、新增依赖 tiny_http+getrandom（gui）/ ureq（cli） |
+| **v1 ✅** | §5 端点（v1 交付时 13 条，现表 16 条）+ token/control.json + `ctl:changed` 镜像 + 失败留痕 + 设置开关 + `takekit ctl` + `takekit mcp` + 守卫（409/confirm） | gui +`control.rs`、cli +`client.rs`/`ctl.rs`/`mcp.rs`、新增依赖 tiny_http+getrandom（gui）/ ureq（cli） |
 | **v2** | SSE 事件流（`take:done` 推送，Agent 不必轮询）；`open_take`/资源管理器 Reveal；面板未运行时自动拉起；crop 编辑 API | |
 | **v3** | `takekit://` 深链做一键触发（手机快捷指令、定时器）；录制中逐源状态推送 | |
 

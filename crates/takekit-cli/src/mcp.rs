@@ -1,6 +1,6 @@
 //! `takekit mcp` — the Model Context Protocol face of the control surface
 //! (`docs/agent-control.md`): a stdio JSON-RPC server that hands agents
-//! thirteen typed tools instead of a URL and a token to remember.
+//! sixteen typed tools instead of a URL and a token to remember.
 //!
 //! Hand-rolled on purpose. The protocol over stdio is newline-delimited
 //! JSON-RPC with three methods worth serving (`initialize`, `tools/list`,
@@ -261,7 +261,7 @@ fn tools_call(params: &Value) -> Result<Value, String> {
     }
 }
 
-/// The thirteen tools, with the shapes an agent fills in. Names and descriptions
+/// The sixteen tools, with the shapes an agent fills in. Names and descriptions
 /// are what the model reads to pick one, so they say the action, not the
 /// endpoint.
 fn tool_list() -> Vec<Value> {

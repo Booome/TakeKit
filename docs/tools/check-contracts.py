@@ -170,7 +170,7 @@ def dictionaries() -> tuple[set[str], set[str]]:
     except (StopIteration, ValueError):
         # A restructured dictionary is a loud failure with a sentence, not a
         # traceback from three frames down.
-        fail("i18n: could not find the zh:/en: dictionary blocks in i18n.js")
+        fail("i18n: could not find the zh / en dictionary blocks in i18n.js")
         return set(), set()
     # `-` 也是键名字符：`warn.len-mismatch` 这类键含连字符，旧正则把它们整条漏掉，
     # 「zh/en 对等」与「有人问过」两道断言对它们完全无效。

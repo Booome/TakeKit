@@ -84,23 +84,6 @@ if (!control?.port || control.pid !== guiPid) {
   process.exit(1);
 }
 
-// A real window title fragment for kind=window. The panel's own window is on
-// that list and is not recordable, so pick the first one that is not ours.
-const listed = execFileSync(TK, ["list"], { encoding: "utf8" });
-const windows = listed.split("\n")
-  .map((l) => l.match(/^\s*\[(\d+)\]\s*(.*?)\s*\[[\d x, at]+\]\s*$/))
-  .filter(Boolean)
-  .map((m) => ({ hwnd: Number(m[1]), title: m[2] }))
-  .filter((w) => w.hwnd && !/takekit/i.test(w.title));
-const winTitle = windows[0]?.title || "";
-record("window-available", Boolean(winTitle), JSON.stringify(winTitle));
-if (!winTitle) {
-  say("no recordable window on screen — open any app and rerun");
-  try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
-  process.exit(2);
-}
-const fragment = winTitle.split(/[-—|·]/)[0].trim().slice(0, 24);
-
 const mcp = spawn(TK, ["mcp"], { env: { ...process.env, APPDATA }, stdio: ["pipe", "pipe", "pipe"] });
 const rl = createInterface({ input: mcp.stdout });
 const pending = [];
@@ -118,10 +101,38 @@ const call = async (name, args) => {
   return { error: reply.result?.isError === true, text: reply.result?.content?.[0]?.text ?? "" };
 };
 
-try {
-  const init = await rpc({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: { protocolVersion: "2024-11-05" } });
-  record("mcp-initialize", init.result?.serverInfo?.name === "takekit", JSON.stringify(init.result?.serverInfo));
+const init = await rpc({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: { protocolVersion: "2024-11-05" } });
+record("mcp-initialize", init.result?.serverInfo?.name === "takekit", JSON.stringify(init.result?.serverInfo));
 
+// The window every assertion below points at comes from the panel's own list,
+// not from `takekit list`: the CLI can see a window that is gone a second
+// later (a transient dialog), and then each `add_source` reports "no window
+// title contains …" while the check itself looks broken (2026-11-12).
+// `/devices?kind=window` already drops the panel's own windows, so this is
+// exactly the set the assertions run against.
+async function panelWindows() {
+  const r = await call("takekit_list_devices", { kind: "window" });
+  if (r.error) return [];
+  try {
+    return JSON.parse(r.text)
+      .map((w) => w.title)
+      .filter((t) => typeof t === "string" && t && !/takekit/i.test(t));
+  } catch {
+    return [];
+  }
+}
+
+const winTitle = (await panelWindows())[0] || "";
+record("window-available", Boolean(winTitle), JSON.stringify(winTitle));
+if (!winTitle) {
+  say("no recordable window on screen — open any app and rerun");
+  mcp.kill();
+  try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+  process.exit(2);
+}
+const fragment = winTitle.split(/[-—|·]/)[0].trim().slice(0, 24);
+
+try {
   const list = await rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list" });
   const tools = list.result?.tools || [];
   const addTool = tools.find((t) => t.name === "takekit_add_source");

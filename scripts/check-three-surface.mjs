@@ -130,7 +130,11 @@ if (!winTitle) {
   try { execFileSync("taskkill", ["/PID", String(guiPid), "/T", "/F"], { stdio: "ignore" }); } catch {}
   process.exit(2);
 }
-const fragment = winTitle.split(/[-—|·]/)[0].trim().slice(0, 24);
+// Split on the usual title separators to get a distinctive fragment, but never
+// hand an empty string to `add_source`: a title that *starts* with a separator
+// (`— Untitled`) would otherwise yield "" and match any window.
+const fragment =
+  winTitle.split(/[-—|·]/)[0].trim().slice(0, 24) || winTitle.slice(0, 24);
 
 try {
   const list = await rpc({ jsonrpc: "2.0", id: nextId++, method: "tools/list" });

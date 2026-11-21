@@ -990,19 +990,17 @@ fn patch_config(app: &tauri::AppHandle, body: Value) -> Result<Value, Fail> {
             return Err(bad("backend must be \"windows\" or \"ffmpeg\""));
         }
     }
-    for key in ["countdown_secs"] {
-        if let Some(v) = obj.get(key) {
-            // The whole domain the config file and `set_countdown` hold is a
-            // u8. Out of range is a refusal, never a clamp into 255: a
-            // coerced value is a setting that changed without anyone
-            // asking, which is the failure this ordering exists to prevent.
-            match v.as_u64() {
-                Some(n) if n <= u8::MAX as u64 => {}
-                _ => {
-                    return Err(bad(format!(
-                        "{key} must be a whole number of seconds from 0 to 255 (0 = off)"
-                    )));
-                }
+    if let Some(v) = obj.get("countdown_secs") {
+        // The whole domain the config file and `set_countdown` hold is a
+        // u8. Out of range is a refusal, never a clamp into 255: a
+        // coerced value is a setting that changed without anyone
+        // asking, which is the failure this ordering exists to prevent.
+        match v.as_u64() {
+            Some(n) if n <= u8::MAX as u64 => {}
+            _ => {
+                return Err(bad(
+                    "countdown_secs must be a whole number of seconds from 0 to 255 (0 = off)",
+                ));
             }
         }
     }

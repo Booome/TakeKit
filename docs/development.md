@@ -13,7 +13,7 @@
 
 | 项 | 值 |
 |---|---|
-| 仓库路径 | 含中文（`…/20-方向/短视频/tools/TakeKit`），见 §7 第 10 条 |
+| 仓库路径 | **纯 ASCII**（`…/20-ventures/short-video/tools/TakeKit`，2026-11-24 主仓目录改英文后成立）；若克隆到含中文的路径，见 §7 第 10 条 |
 | 平台 | 仅 Windows（大量 Win32 调用），rustc edition **2024** 工作区 |
 | crate | `takekit-core`（采集/编码/会话）、`takekit-cli`（bin 名 **`takekit`**）、`takekit-gui`（Tauri 2 面板）、`takekit-media`（WGC + Media Foundation 采集） |
 | 依赖 | ffmpeg 需在 PATH（ffmpeg 后端用；Windows API 后端不需要）；GUI 用 Tauri 2 + WebView2；`mouseshow` 是 git submodule（以库形式链接，提供鼠标点击波纹） |
@@ -377,7 +377,8 @@ js-error:<msg>
 7. **P/Invoke 的 `StringBuilder` 必须 `CharSet = CharSet.Unicode`**，否则 `GetClassNameW` 只读到首字符。
 8. **`Add-Type` 里的方法不能叫 `Main`**（撞 C# 入口点，warning-as-error 直接失败）。
 9. **`explorer.exe` 的退出码没有意义**：spawn 出去就不管，别 `wait()` 判成功。
-10. **仓库路径含中文**：`powershell -File <中文路径>` 会按 ANSI 读坏路径。脚本放仓库内、从仓库根调用；或用 `-Command` 传。
+10. **仓库路径含中文时**：`powershell -File <中文路径>` 会按 ANSI 读坏路径。脚本放仓库内、从仓库根调用；或用 `-Command` 传。
+    ⚠️ 2026-11-24 起本仓挂载点是纯 ASCII（`20-ventures/short-video/tools/TakeKit`），当前踩不到；**换到含中文的克隆路径就会复发**（历史上踩过一次）。
 11. **每次 shell 调用都是新的 PowerShell 会话**：`Add-Type` 不跨调用，脚本要么一个文件跑完，要么每次重新 `Add-Type`。
 12. **`Start-Process cargo ... -Wait` 读不到 EOF** 时用 `-RedirectStandardOutput <file>` 再读文件；但 **`Start-Process -RedirectStandardOutput/Error` 在本沙箱必失败**（注入的双大小写 `HTTPS_PROXY` 键撞 PowerShell 已知缺陷）——要捕获输出就让命令写文件再读。
 13. **`$host` / `$pid` 是 PowerShell 自动变量**，不要拿来当自己的变量名。
